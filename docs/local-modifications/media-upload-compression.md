@@ -91,6 +91,19 @@ Changing the persisted capability model raised the shared Realm schema version
 to 91. Run the main app once after installing the build before invoking the
 share extension so the main app can migrate the shared Realm.
 
+## Branded login
+
+SumbaChat locks login to `https://cloud.example.com` via `forceDomain` in
+`NCAppBranding.m`. The server-address screen is skipped and authentication
+opens directly. Nextcloud's "Grant access" step remains required to create a
+per-device app password and cannot be removed client-side.
+
+## Preparing media HUD
+
+While photos/videos are compressed before upload, `ShareConfirmationViewController`
+shows an indeterminate "Preparing…" HUD and disables Send until preparation
+finishes.
+
 ## Revert this feature only
 
 ```bash

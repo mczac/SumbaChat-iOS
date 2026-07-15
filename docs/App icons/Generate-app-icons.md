@@ -1,32 +1,34 @@
-# Generate app icons from SVG
+# Generate SumbaChat app icons
 
-## Install Inkscape (macOS Mojave or higher)
+Source icon: `sumbachat-icon-source.png` (or any square PNG, ideally 1024×1024 or larger).
 
-```
-$ brew tap homebrew/cask
-$ brew cask install inkscape
-```
+## App Store / iOS asset catalog
 
-## Run next commands (using Inkscape 1.0 or higher)
+Modern Xcode only needs one 1024×1024 PNG in the asset catalog:
 
-```
-$ ruby -e '[20,29,57,40,50,72,76,1024].each { |x| `inkscape --export-type=png --export-file=talk-icon#{x}@1x.png -w #{x} icon-talk-ios.svg` }'
-$ ruby -e '[40,58,80,114,120,80,100,144,152,167].each { |x| `inkscape --export-type=png --export-file=talk-icon#{x}@2x.png -w #{x} icon-talk-ios.svg` }'
-$ ruby -e '[60,87,120,180].each { |x| `inkscape --export-type=png --export-file=talk-icon#{x}@3x.png -w #{x} icon-talk-ios.svg` }'
+```bash
+sips -z 1024 1024 sumbachat-icon-source.png \
+  --out ../NextcloudTalk/Images.xcassets/AppIcon.appiconset/talk-icon1024@1x.png
 ```
 
-Note: Use `--export-filename` instead of `--export-file` when using Inkscape 1.0.1.
+`AppIcon.appiconset/Contents.json` already references `talk-icon1024@1x.png`.
 
-## Install Inkscape (old)
+## iOS 26 Icon Composer (liquid glass)
 
-```
-$ brew install caskformula/caskformula/inkscape
+Copy the same source into the icon composer bundle:
+
+```bash
+cp sumbachat-icon-source.png ../NextcloudTalk/AppIcon.icon/Assets/SumbaChat-icon.png
 ```
 
-## Run next commands (old)
+`AppIcon.icon/icon.json` references `SumbaChat-icon.png`.
 
+## Optional legacy size exports
+
+```bash
+for size in 20 29 40 58 60 76 80 87 120 152 167 180 1024; do
+  sips -z $size $size sumbachat-icon-source.png --out generated/sumbachat-icon-${size}.png
+done
 ```
-$ ruby -e '[20,29,57,40,50,72,76,1024].each { |x| `inkscape --export-png talk-icon#{x}@1x.png -w #{x} icon-talk-ios.svg` }'
-$ ruby -e '[40,58,80,114,120,80,100,144,152,167].each { |x| `inkscape --export-png talk-icon#{x}@2x.png -w #{x} icon-talk-ios.svg` }'
-$ ruby -e '[60,87,120,180].each { |x| `inkscape --export-png talk-icon#{x}@3x.png -w #{x} icon-talk-ios.svg` }'
-```
+
+These are kept under `generated/` for reference; the Xcode project does not require them when using a single 1024×1024 app icon set entry.

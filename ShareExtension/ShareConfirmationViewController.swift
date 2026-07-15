@@ -51,6 +51,7 @@ import MBProgressHUD
     private var shareSilently = false
     private var imagePicker: UIImagePickerController?
     private var hud: MBProgressHUD?
+    private var preparingHUD: MBProgressHUD?
     private var objectShareMessage: NCChatMessage?
     private var uploadGroup = DispatchGroup()
     private var uploadFailed = false
@@ -430,8 +431,8 @@ import MBProgressHUD
     }
 
     public override func canPressRightButton() -> Bool {
-        // We want to allow sending pictures even when no text is entered
-        return !self.shareItemController.shareItems.isEmpty
+        // Allow sending media without caption text, but not while preparation is running.
+        return !self.shareItemController.shareItems.isEmpty && self.shareItemController.preparingItemCount == 0
     }
 
     // MARK: - Button Actions
@@ -1012,25 +1013,55 @@ import MBProgressHUD
 
     public func shareItemControllerItemsChanged(_ shareItemController: ShareItemController) {
         DispatchQueue.main.async {
-            if shareItemController.shareItems.isEmpty {
+            if shareItemController.shareItems.isEmpty && shareItemController.preparingItemCount == 0 {
                 if let extensionContext = self.extensionContext {
                     let error = NSError(domain: NSCocoaErrorDomain, code: 0)
                     extensionContext.cancelRequest(withError: error)
                 } else {
                     self.dismiss(animated: true)
                 }
-            } else {
+            } else if !shareItemController.shareItems.isEmpty {
                 self.shareCollectionView.reloadData()
 
                 // Make sure all changes are fully populated before we update our UI elements
                 self.shareCollectionView.layoutIfNeeded()
                 self.updateToolbarForCurrentItem()
                 self.pageControl.numberOfPages = shareItemController.shareItems.count
+                self.collectionViewScrollToEnd()
 
                 // Update the text input to check if sending is (not-)possible
                 self.textDidUpdate(false)
+                self.updateSendButtonEnabledState()
             }
+
+            self.updatePreparingHUD()
         }
+    }
+
+    public func shareItemControllerPreparingItemsChanged(_ shareItemController: ShareItemController) {
+        DispatchQueue.main.async {
+            self.updatePreparingHUD()
+            self.updateSendButtonEnabledState()
+            self.textDidUpdate(false)
+        }
+    }
+
+    private func updatePreparingHUD() {
+        if self.shareItemController.preparingItemCount > 0 {
+            if self.preparingHUD == nil {
+                let hud = MBProgressHUD.showAdded(to: self.view, animated: true)
+                hud.mode = .indeterminate
+                hud.label.text = NSLocalizedString("Preparing…", comment: "Shown while media is compressed before upload")
+                self.preparingHUD = hud
+            }
+        } else {
+            self.preparingHUD?.hide(animated: true)
+            self.preparingHUD = nil
+        }
+    }
+
+    private func updateSendButtonEnabledState() {
+        self.sendButton.isEnabled = self.canPressRightButton()
     }
 
     // MARK: - TOCropViewController Delegate

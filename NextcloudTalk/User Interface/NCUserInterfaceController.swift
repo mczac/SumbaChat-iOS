@@ -49,10 +49,21 @@ public typealias PresentCallControllerCompletionBlock = () -> Void
 
     func presentLoginViewController(forServerURL serverURL: String?, withUser user: String?) {
         if forceDomain.boolValue, let authViewController = AuthenticationViewController(serverUrl: domain) {
+            // Don't open a login if we're in a call
+            if NCRoomsManager.shared.callViewController != nil {
+                return
+            }
+
+            // Leave chat if we're currently in one
+            if NCRoomsManager.shared.chatViewController != nil {
+                presentConversationsList()
+            }
+
             authViewController.delegate = self
-            authViewController.modalPresentationStyle = NCDatabaseManager.sharedInstance().numberOfAccounts() == 0 ? .fullScreen : .automatic
+            let authenticationNC = UINavigationController(rootViewController: authViewController)
+            authenticationNC.modalPresentationStyle = NCDatabaseManager.sharedInstance().numberOfAccounts() == 0 ? .fullScreen : .automatic
             self.authViewController = authViewController
-            mainViewController.present(authViewController, animated: true)
+            mainViewController.present(authenticationNC, animated: true)
         } else {
             // Don't open a login if we're in a call
             if NCRoomsManager.shared.callViewController != nil {

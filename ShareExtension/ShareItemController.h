@@ -14,6 +14,7 @@ NS_ASSUME_NONNULL_BEGIN
 @protocol ShareItemControllerDelegate <NSObject>
 
 - (void)shareItemControllerItemsChanged:(ShareItemController *)shareItemController;
+- (void)shareItemControllerPreparingItemsChanged:(ShareItemController *)shareItemController;
 
 @end
 
@@ -22,6 +23,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, weak) id<ShareItemControllerDelegate> delegate;
 @property (strong, nonatomic) NSArray<ShareItem *> *shareItems;
+@property (nonatomic, readonly) NSInteger preparingItemCount;
 
 - (instancetype)initWithMediaUploadCompressionSettings:(MediaUploadCompressionSettings *)settings NS_DESIGNATED_INITIALIZER;
 - (instancetype)init;

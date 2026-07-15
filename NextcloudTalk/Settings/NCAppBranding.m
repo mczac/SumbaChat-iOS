@@ -29,11 +29,11 @@ NSString * const groupIdentifier = @"group.com.spl.SumbaChat";
 NSString * const appsGroupIdentifier = @"group.com.spl.apps";
 NSString * const pushNotificationServer = @"https://push-notifications.nextcloud.com";
 NSString * const privacyURL = @"https://nextcloud.com/privacy";
-BOOL const isBrandedApp = NO;
+BOOL const isBrandedApp = YES;
 BOOL const multiAccountEnabled = YES;
 BOOL const useAppsGroup = NO;
-BOOL const forceDomain = NO;
-NSString * const domain = nil;
+BOOL const forceDomain = YES;
+NSString * const domain = @"https://cloud.example.com";
 NSString * const appAlternateVersion = @"";
 
 + (NSString *)getAppVersionString

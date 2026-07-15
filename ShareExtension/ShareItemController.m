@@ -14,6 +14,8 @@
 @property (nonatomic, strong) NSURL *tempDirectoryURL;
 @property (nonatomic, strong) NSMutableArray *internalShareItems;
 @property (nonatomic, strong) MediaUploadCompressionSettings *mediaUploadCompressionSettings;
+@property (nonatomic, strong) dispatch_queue_t preparationQueue;
+@property (nonatomic, assign, readwrite) NSInteger preparingItemCount;
 
 @end
 
@@ -30,6 +32,7 @@
     if (self) {
         self.mediaUploadCompressionSettings = settings;
         self.internalShareItems = [[NSMutableArray alloc] init];
+        self.preparationQueue = dispatch_queue_create("com.spl.SumbaChat.media-upload-preparation", DISPATCH_QUEUE_SERIAL);
         [self initTempDirectory];
     }
     return self;
@@ -57,6 +60,24 @@
     }
     
     self.tempDirectoryURL = [NSURL fileURLWithPath:self.tempDirectoryPath isDirectory:YES];
+}
+
+- (void)beginPreparingItem
+{
+    NSAssert(NSThread.isMainThread, @"Preparing item count must be updated on the main thread");
+    self.preparingItemCount += 1;
+    [self.delegate shareItemControllerPreparingItemsChanged:self];
+}
+
+- (void)endPreparingItem
+{
+    NSAssert(NSThread.isMainThread, @"Preparing item count must be updated on the main thread");
+    if (self.preparingItemCount <= 0) {
+        return;
+    }
+
+    self.preparingItemCount -= 1;
+    [self.delegate shareItemControllerPreparingItemsChanged:self];
 }
 
 - (NSURL *)getFileLocalURL:(NSString *)fileName
@@ -111,16 +132,31 @@
 {
     NSString *jpegName = [[fileName stringByDeletingPathExtension] stringByAppendingPathExtension:@"jpg"];
     NSURL *jpegURL = [self getFileLocalURL:jpegName];
+    MediaUploadCompressionSettings *settings = self.mediaUploadCompressionSettings;
 
-    if ([MediaUploadPreprocessor compressImageAtURL:fileLocalURL
-                                   toDestinationURL:jpegURL
-                                           settings:self.mediaUploadCompressionSettings]) {
-        [NSFileManager.defaultManager removeItemAtURL:fileLocalURL error:nil];
-        fileLocalURL = jpegURL;
-        fileName = jpegName;
-    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.preparationQueue, ^{
+        NSURL *finalURL = fileLocalURL;
+        NSString *finalName = fileName;
 
-    [self addShareItemWithLocalURL:fileLocalURL fileName:fileName isImage:YES];
+        if ([MediaUploadPreprocessor compressImageAtURL:fileLocalURL
+                                       toDestinationURL:jpegURL
+                                               settings:settings]) {
+            [NSFileManager.defaultManager removeItemAtURL:fileLocalURL error:nil];
+            finalURL = jpegURL;
+            finalName = jpegName;
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ShareItemController *strongSelf = weakSelf;
+            if (!strongSelf) {
+                return;
+            }
+
+            [strongSelf addShareItemWithLocalURL:finalURL fileName:finalName isImage:YES];
+            [strongSelf endPreparingItem];
+        });
+    });
 }
 
 - (void)finalizeVideoItemFromLocalURL:(NSURL *)fileLocalURL fileName:(NSString *)fileName
@@ -152,12 +188,15 @@
             }
 
             [strongSelf addShareItemWithLocalURL:finalURL fileName:finalName isImage:NO];
+            [strongSelf endPreparingItem];
         });
     }];
 }
 
 - (void)addItemWithURLAndName:(NSURL *)fileURL withName:(NSString *)fileName
 {
+    [self beginPreparingItem];
+
     NSURL *fileLocalURL = [self getFileLocalURL:fileName];
 
     // First try to prepare the file with NSFileCoordinatorReadingForUploading
@@ -169,6 +208,7 @@
 
         if (!preparedSuccessfully) {
             NSLog(@"Failed to prepare file for sharing");
+            [self endPreparingItem];
             return;
         }
     }
@@ -187,6 +227,7 @@
     }
 
     [self addShareItemWithLocalURL:fileLocalURL fileName:fileName isImage:fileIsImage];
+    [self endPreparingItem];
 }
 
 - (void)addItemWithImage:(UIImage *)image
@@ -197,14 +238,30 @@
 
 - (void)addItemWithImageAndName:(UIImage *)image withName:(NSString *)imageName
 {
-    NSData *jpegData = [MediaUploadPreprocessor compressedJPEGDataFromImage:image settings:self.mediaUploadCompressionSettings];
-    if (!jpegData) {
-        NSLog(@"Failed to compress image for upload");
-        return;
-    }
+    [self beginPreparingItem];
 
-    NSString *jpegName = [[imageName stringByDeletingPathExtension] stringByAppendingPathExtension:@"jpg"];
-    [self addItemWithImageDataAndName:jpegData withName:jpegName];
+    MediaUploadCompressionSettings *settings = self.mediaUploadCompressionSettings;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.preparationQueue, ^{
+        NSData *jpegData = [MediaUploadPreprocessor compressedJPEGDataFromImage:image settings:settings];
+        NSString *jpegName = [[imageName stringByDeletingPathExtension] stringByAppendingPathExtension:@"jpg"];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ShareItemController *strongSelf = weakSelf;
+            if (!strongSelf) {
+                return;
+            }
+
+            if (!jpegData) {
+                NSLog(@"Failed to compress image for upload");
+                [strongSelf endPreparingItem];
+                return;
+            }
+
+            [strongSelf addItemWithImageDataAndName:jpegData withName:jpegName];
+            [strongSelf endPreparingItem];
+        });
+    });
 }
 
 - (void)addItemWithImageDataAndName:(NSData *)data withName:(NSString *)imageName
