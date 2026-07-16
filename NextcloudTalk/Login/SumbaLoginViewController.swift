@@ -43,6 +43,14 @@ import UIKit
         return imageView
     }()
 
+    /// Keeps the logo a fixed square while the form stack uses `.fill` for fields/buttons.
+    private lazy var logoContainer: UIView = {
+        let container = UIView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(logoImageView)
+        return container
+    }()
+
     private lazy var titleLabel: UILabel = {
         let label = UILabel()
         label.font = .systemFont(ofSize: 32, weight: .heavy)
@@ -146,7 +154,7 @@ import UIKit
 
     private lazy var formStack: UIStackView = {
         let stack = UIStackView(arrangedSubviews: [
-            logoImageView,
+            logoContainer,
             makeGap(20),
             titleLabel,
             makeGap(6),
@@ -208,8 +216,9 @@ import UIKit
         let frameGuide = scrollView.frameLayoutGuide
         let contentGuide = scrollView.contentLayoutGuide
 
-        // A fixed-size layout inside a scroll view: the keyboard only adjusts the
-        // content inset, so nothing resizes or jumps when moving between fields.
+        // Pin leading/trailing to the content guide (not just centerX) so the
+        // scroll view's content size stays aligned with the screen width.
+        // Keyboard only adjusts contentInset — no logo/spacer compression jump.
         NSLayoutConstraint.activate([
             scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             scrollView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
@@ -218,12 +227,15 @@ import UIKit
 
             formStack.topAnchor.constraint(equalTo: contentGuide.topAnchor, constant: 32),
             formStack.bottomAnchor.constraint(equalTo: contentGuide.bottomAnchor, constant: -24),
-            formStack.centerXAnchor.constraint(equalTo: contentGuide.centerXAnchor),
+            formStack.leadingAnchor.constraint(equalTo: contentGuide.leadingAnchor, constant: 20),
+            formStack.trailingAnchor.constraint(equalTo: contentGuide.trailingAnchor, constant: -20),
             formStack.widthAnchor.constraint(equalTo: frameGuide.widthAnchor, constant: -40),
-            formStack.widthAnchor.constraint(lessThanOrEqualToConstant: 480),
 
+            logoContainer.heightAnchor.constraint(equalToConstant: 96),
             logoImageView.heightAnchor.constraint(equalToConstant: 96),
             logoImageView.widthAnchor.constraint(equalTo: logoImageView.heightAnchor),
+            logoImageView.centerXAnchor.constraint(equalTo: logoContainer.centerXAnchor),
+            logoImageView.centerYAnchor.constraint(equalTo: logoContainer.centerYAnchor),
 
             usernameTextField.heightAnchor.constraint(equalToConstant: 52),
             passwordTextField.heightAnchor.constraint(equalToConstant: 52),

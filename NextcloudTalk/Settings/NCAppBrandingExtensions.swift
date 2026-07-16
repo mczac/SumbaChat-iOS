@@ -32,9 +32,28 @@ extension NCAppBranding {
     @objc
     static func userAgentForLogin() -> String {
         let appDisplayName = Bundle.main.infoDictionary?["CFBundleDisplayName"] ?? "Unknown app"
-        let deviceName = UIDevice.current.name
+        let device = UIDevice.current
+        let deviceModel = hardwareModelIdentifier()
 
-        return "\(deviceName) (\(appDisplayName))"
+        return "\(deviceModel) - \(device.systemName) \(device.systemVersion) (\(appDisplayName))"
+    }
+
+    private static func hardwareModelIdentifier() -> String {
+#if targetEnvironment(simulator)
+        if let simulatedModel = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"],
+           !simulatedModel.isEmpty {
+            return simulatedModel
+        }
+#endif
+
+        var systemInfo = utsname()
+        uname(&systemInfo)
+
+        return withUnsafePointer(to: &systemInfo.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+                String(cString: $0)
+            }
+        }
     }
 
 }

@@ -154,6 +154,9 @@ import SDWebImage
         if actorId == "changelog" || actorId == "sample" {
             let traitCollection = UITraitCollection(userInterfaceStyle: style)
             completionBlock(UIImage(named: "changelog-avatar", in: nil, compatibleWith: traitCollection))
+        } else if actorId.hasPrefix("bot-"), let mika = UIImage(named: "mika-avatar") {
+            // Custom Talk bots (e.g. Mika) — show branded avatar instead of generic ">"
+            completionBlock(mika)
         } else {
             let image = NCUtils.getImage(withString: ">", withBackgroundColor: .systemGray3, withBounds: self.avatarDefaultSize, isCircular: true)
             completionBlock(image)
