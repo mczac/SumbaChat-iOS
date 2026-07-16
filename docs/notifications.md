@@ -25,6 +25,31 @@ again when APNs supplies its tokens. During testing, verify both
 `Subscribed to NC server successfully.` and
 `Subscribed to Push Notification server successfully.` in the app log.
 
+### Release / TestFlight push entitlement
+
+Debug builds use `NextcloudTalk/NextcloudTalk.entitlements` with
+`aps-environment = development` and the debug proxy
+(`push-dev.example.com`).
+
+Release / Archive / TestFlight builds use
+`NextcloudTalk/NextcloudTalkRelease.entitlements` with
+`aps-environment = production` and the release proxy
+(`push.example.com`). Release signing is set to
+**Apple Distribution** (Automatic) so Xcode can create App Store profiles
+with production push.
+
+After archiving in Xcode (Product → Archive → Distribute App →
+App Store Connect), confirm the exported app has production push:
+
+```bash
+codesign -d --entitlements :- path/to/SumbaChat.app | plutil -p -
+# expect: aps-environment = production
+# expect: application-groups includes group.com.spl.SumbaChat
+```
+
+The production push proxy must use Apple's **production** APNs endpoint
+(`NC_PUSH_PROXY_APNS_PRODUCTION=true`).
+
 ### App Group (`group.com.spl.SumbaChat`)
 
 The main app and every extension share Realm/keychain data through the App Group
