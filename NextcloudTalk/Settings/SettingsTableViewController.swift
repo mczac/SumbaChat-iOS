@@ -403,12 +403,12 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         let indexPath = self.getIndexPathForConfigurationOption(option: ConfigurationSectionOption.kConfigurationSectionOptionUploadMedia)
         let currentMode = MediaUploadMode(rawValue: Int(NCUserDefaults.mediaUploadMode())) ?? .automatic
 
-        let optionsActionSheet = UIAlertController(title: NSLocalizedString("Upload Media", comment: ""), message: nil, preferredStyle: .actionSheet)
+        let optionsActionSheet = UIAlertController(title: NSLocalizedString("Media Compression", comment: ""), message: nil, preferredStyle: .actionSheet)
 
         let modes: [(MediaUploadMode, String)] = [
-            (.noCompression, NSLocalizedString("No Compression", comment: "")),
-            (.automatic, NSLocalizedString("Automatic Compression", comment: "")),
-            (.chooseOnUpload, NSLocalizedString("Choose on upload", comment: ""))
+            (.noCompression, NSLocalizedString("None", comment: "No media compression")),
+            (.automatic, NSLocalizedString("Automatic", comment: "Automatic media compression")),
+            (.chooseOnUpload, NSLocalizedString("Manual", comment: "Choose compression level when uploading"))
         ]
 
         for (mode, title) in modes {
@@ -437,7 +437,7 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         let videoResolutions = NCSettingsController.sharedInstance().videoSettingsModel.availableVideoResolutions()
         let storedResolution = NCSettingsController.sharedInstance().videoSettingsModel.currentVideoResolutionSettingFromStore()
 
-        let optionsActionSheet = UIAlertController(title: NSLocalizedString("Call Video Quality", comment: ""), message: nil, preferredStyle: .actionSheet)
+        let optionsActionSheet = UIAlertController(title: NSLocalizedString("Video Call Quality", comment: ""), message: nil, preferredStyle: .actionSheet)
 
         for resolution in videoResolutions {
             let readableResolution = NCSettingsController.sharedInstance().videoSettingsModel.readableResolution(resolution)
@@ -938,7 +938,7 @@ extension SettingsTableViewController {
         switch option {
         case ConfigurationSectionOption.kConfigurationSectionOptionUploadMedia.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: configurationCellIdentifier, style: .default)
-            cell.textLabel?.text = NSLocalizedString("Upload Media", comment: "")
+            cell.textLabel?.text = NSLocalizedString("Media Compression", comment: "")
             cell.setSettingsImage(image: UIImage(systemName: "arrow.up.circle")?.applyingSymbolConfiguration(iconConfiguration))
 
             let modeLabel = UILabel()
@@ -951,7 +951,7 @@ extension SettingsTableViewController {
 
         case ConfigurationSectionOption.kConfigurationSectionOptionVideo.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: configurationCellIdentifier, style: .default)
-            cell.textLabel?.text = NSLocalizedString("Call Video Quality", comment: "")
+            cell.textLabel?.text = NSLocalizedString("Video Call Quality", comment: "")
             cell.setSettingsImage(image: UIImage(systemName: "video")?.applyingSymbolConfiguration(iconConfiguration))
 
             let resolution = NCSettingsController.sharedInstance().videoSettingsModel.currentVideoResolutionSettingFromStore()
@@ -971,11 +971,11 @@ extension SettingsTableViewController {
     func readableMediaUploadMode(_ mode: MediaUploadMode) -> String {
         switch mode {
         case .noCompression:
-            return NSLocalizedString("No Compression", comment: "")
+            return NSLocalizedString("None", comment: "No media compression")
         case .automatic:
-            return NSLocalizedString("Automatic", comment: "")
+            return NSLocalizedString("Automatic", comment: "Automatic media compression")
         case .chooseOnUpload:
-            return NSLocalizedString("Choose on upload", comment: "")
+            return NSLocalizedString("Manual", comment: "Choose compression level when uploading")
         @unknown default:
             return NSLocalizedString("Automatic", comment: "")
         }

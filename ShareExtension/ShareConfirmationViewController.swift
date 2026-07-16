@@ -58,8 +58,6 @@ import MBProgressHUD
     private var uploadSuccess: [ShareItem] = []
     private var chosenCompressionLevel: MediaUploadCompressionLevel = .moderate
     private var isPreparingForUpload = false
-    /// Bumps whenever share items change so stale background size estimates are ignored.
-    private var compressionEstimateGeneration: UInt = 0
     /// After a successful upload we clear staged items; don't treat that as user cancel in the share extension.
     private var finishingSuccessfulUpload = false
     /// Share of the annular ring reserved for compression prepare (often longer than upload).
@@ -655,9 +653,12 @@ import MBProgressHUD
 
     private func updateCompressionOptionsUI() {
         // Wait until at least one item is staged so we don't overlap the toolbar with empty Zero KB chips.
+        // Also wait until staging finishes — opening chips + JPEG estimates mid-staging jetsams the Share Extension.
+        let stagingDone = self.shareItemController.preparingItemCount == 0
         let showQuality = self.mediaUploadMode == .chooseOnUpload
             && self.shareType == .item
             && !self.shareItemController.shareItems.isEmpty
+            && stagingDone
 
         self.compressionSectionView.isHidden = !showQuality
         self.compressionSectionHeightConstraint?.constant = showQuality ? 82 : 0
@@ -667,9 +668,8 @@ import MBProgressHUD
             return
         }
 
-        // Show cheap on-disk sizes immediately (None). Moderate/High placeholders stay honest-ish
-        // from file size until the background estimate finishes — never JPEG-encode on the main
-        // thread while multi-select is still staging (that jetsams on iOS 18).
+        // Cheap on-disk / heuristic sizes only. Full JPEG simulate-encode is too heavy for the
+        // Share Extension memory budget (Manual mode was closing the sheet before Send).
         let items = self.shareItemController.shareItems
         var originalTotal: Int64 = 0
         for item in items {
@@ -678,34 +678,13 @@ import MBProgressHUD
                   let size = attrs[.size] as? NSNumber else { continue }
             originalTotal += size.int64Value
         }
-        let placeholder: [MediaUploadCompressionLevel: Int64] = [
+        let estimates: [MediaUploadCompressionLevel: Int64] = [
             .none: originalTotal,
             .moderate: max(12_288, Int64(Double(originalTotal) * 0.62)),
             .high: max(12_288, Int64(Double(originalTotal) * 0.22))
         ]
-        self.applyCompressionChipTitles(estimates: placeholder)
-
-        self.compressionEstimateGeneration &+= 1
-        let generation = self.compressionEstimateGeneration
-        let urlsAndFlags: [(URL, Bool)] = items.compactMap { item in
-            guard let url = item.fileURL else { return nil }
-            return (url, item.isImage)
-        }
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            var totals: [MediaUploadCompressionLevel: Int64] = [.none: 0, .moderate: 0, .high: 0]
-            for (fileURL, isImage) in urlsAndFlags {
-                let counts = MediaUploadPreprocessor.estimatedByteCounts(at: fileURL, treatAsImage: isImage)
-                totals[.none, default: 0] += counts.none
-                totals[.moderate, default: 0] += counts.moderate
-                totals[.high, default: 0] += counts.high
-            }
-            DispatchQueue.main.async {
-                guard generation == self.compressionEstimateGeneration else { return }
-                self.applyCompressionChipTitles(estimates: totals)
-            }
-        }
-
+        NCLog.log("Media upload: Choose-on-upload chips shown for \(items.count) item(s), original=\(originalTotal) bytes")
+        self.applyCompressionChipTitles(estimates: estimates)
         self.view.layoutIfNeeded()
     }
 
@@ -718,9 +697,17 @@ import MBProgressHUD
             button.setTitle(title, for: .normal)
 
             let selected = level == self.chosenCompressionLevel
-            button.backgroundColor = selected ? elementColor.withAlphaComponent(0.15) : .secondarySystemBackground
-            button.layer.borderColor = (selected ? elementColor : UIColor.separator).cgColor
-            button.setTitleColor(selected ? elementColor : .label, for: .normal)
+            if selected {
+                // Solid brand fill + white label reads clearly in light and dark mode
+                // (blue-on-near-black outline was too low-contrast in dark mode).
+                button.backgroundColor = elementColor
+                button.layer.borderColor = elementColor.cgColor
+                button.setTitleColor(.white, for: .normal)
+            } else {
+                button.backgroundColor = .secondarySystemBackground
+                button.layer.borderColor = UIColor.separator.cgColor
+                button.setTitleColor(.label, for: .normal)
+            }
         }
     }
 
@@ -1293,10 +1280,16 @@ import MBProgressHUD
         let isVideo = MediaUploadPreprocessor.isVideo(fileExtension: extensionName)
         cell.setShowsVideoIndicator(isVideo)
 
-        if let fileURL = item.fileURL, NCUtils.isImage(fileExtension: fileURL.pathExtension),
-           let image = self.shareItemController.getImageFrom(item) {
-            // We're able to get an image directly from the fileURL -> use it
-            cell.setPreviewImage(image)
+        if let fileURL = item.fileURL, NCUtils.isImage(fileExtension: fileURL.pathExtension) {
+            // Share Extension has a tight memory budget — keep preview decode modest.
+            let maxDimension: CGFloat = Bundle.main.bundlePath.hasSuffix(".appex") ? 1024 : 2048
+            if let image = MediaUploadPreprocessor.previewImage(at: fileURL, maxDimension: maxDimension) {
+                cell.setPreviewImage(image)
+            } else if let image = self.shareItemController.getImageFrom(item) {
+                cell.setPreviewImage(image)
+            } else {
+                self.generatePreview(for: cell, with: collectionView, with: item)
+            }
         } else {
             self.generatePreview(for: cell, with: collectionView, with: item)
         }
@@ -1439,6 +1432,7 @@ import MBProgressHUD
                 if self.finishingSuccessfulUpload {
                     return
                 }
+                NCLog.log("ShareConfirmation: items empty — cancelling share sheet")
                 if let extensionContext = self.extensionContext {
                     let error = NSError(domain: NSCocoaErrorDomain, code: 0)
                     extensionContext.cancelRequest(withError: error)
@@ -1469,6 +1463,10 @@ import MBProgressHUD
             self.updateStagingProgressHUD()
             self.updateSendButtonEnabledState()
             self.textDidUpdate(false)
+            // Staging finished — reveal Choose-on-upload chips without mid-copy JPEG work.
+            if shareItemController.preparingItemCount == 0 {
+                self.updateCompressionOptionsUI()
+            }
         }
     }
 

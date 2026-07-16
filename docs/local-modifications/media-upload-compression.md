@@ -21,18 +21,18 @@ user **Upload Media** setting — not by server capabilities.
 
 | Row | Options |
 |-----|---------|
-| Upload Media | No Compression / Automatic Compression / Choose on upload (**default: Automatic**) |
-| Call Video Quality | WebRTC call camera resolution (unchanged behavior) |
+| Upload Media / Media Compression | None / Automatic / Manual (**default: Automatic**) |
+| Video Call Quality | WebRTC call camera resolution (unchanged behavior) |
 
 **Include calls in call history** lives in the untitled account section (after phone number integration).
 
-### Upload Media modes
+### Media Compression modes
 
 | Mode | Preview | On Send |
 |------|---------|---------|
-| No Compression | Original | Upload as staged |
+| None | Original | Upload as staged |
 | Automatic | Original | Always compress ≥ Moderate; escalate to High if estimate > 16 MB (or > ~8 MB on cellular) |
-| Choose on upload | Original + quality control | Compress chosen None / Moderate / High |
+| Manual | Original + quality control | Compress chosen None / Moderate / High |
 
 ### Compression presets
 
