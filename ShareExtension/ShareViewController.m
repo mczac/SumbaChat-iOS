@@ -325,54 +325,75 @@
         [extItem.attachments enumerateObjectsUsingBlock:^(NSItemProvider * _Nonnull itemProvider, NSUInteger idx, BOOL * _Nonnull stop) {
             // Check if shared video
             if ([itemProvider hasItemConformingToTypeIdentifier:(NSString *)kUTTypeMovie]) {
-                [itemProvider loadItemForTypeIdentifier:(NSString *)kUTTypeMovie
-                                                options:nil
-                                      completionHandler:^(id<NSSecureCoding>  _Nullable item, NSError * _Null_unspecified error) {
-                                          if ([(NSObject *)item isKindOfClass:[NSURL class]]) {
-                                              NSLog(@"Shared Video = %@", item);
-                                              NSURL *videoURL = (NSURL *)item;
-                                            
-                                              [shareConfirmationVC.shareItemController addItemWithURL:videoURL];
-                                          }
-                                      }];
+                [itemProvider loadFileRepresentationForTypeIdentifier:(NSString *)kUTTypeMovie
+                                                    completionHandler:^(NSURL * _Nullable url, NSError * _Nullable error) {
+                    NSString *videoName = url.lastPathComponent.length > 0 ? url.lastPathComponent : NSLocalizedString("Video", comment: "Generic name when a shared video failed to load");
+                    if (url != nil && [shareConfirmationVC.shareItemController addItemWithURL:url]) {
+                        [NCLog log:[NSString stringWithFormat:@"Share: staged video via loadFileRepresentation %@", videoName]];
+                        return;
+                    }
+                    [NCLog log:[NSString stringWithFormat:@"Share: video fileRepresentation failed (%@), trying loadItem", error.localizedDescription ?: @"nil"]];
+                    [itemProvider loadItemForTypeIdentifier:(NSString *)kUTTypeMovie
+                                                    options:nil
+                                          completionHandler:^(id<NSSecureCoding>  _Nullable item, NSError * _Null_unspecified loadError) {
+                        if ([(NSObject *)item isKindOfClass:[NSURL class]] &&
+                            [shareConfirmationVC.shareItemController addItemWithURL:(NSURL *)item]) {
+                            [NCLog log:@"Share: staged video via loadItem URL"];
+                            return;
+                        }
+                        [NCLog log:[NSString stringWithFormat:@"Share: video staging failed (%@)", loadError.localizedDescription ?: @"unknown"]];
+                        [shareConfirmationVC.shareItemController reportStagingFailureWithName:videoName];
+                    }];
+                }];
                 return;
             }
             // Check if shared file
             // Make sure this is checked before image! Otherwise sharing images from Mail won't work >= iOS 13
+            // Photos on iOS 18 often only exposes public.file-url (UUID.png). Prefer loadFileRepresentation
+            // (owned temp file), then loadItem URL copy, then image decode fallback — never leave a 0-byte stage.
             if ([itemProvider hasItemConformingToTypeIdentifier:@"public.file-url"]) {
-                [itemProvider loadItemForTypeIdentifier:@"public.file-url"
-                                                options:nil
-                                      completionHandler:^(id<NSSecureCoding>  _Nullable item, NSError * _Null_unspecified error) {
-                                          if ([(NSObject *)item isKindOfClass:[NSURL class]]) {
-                                              NSLog(@"Shared File URL = %@", item);
-                                              NSURL *fileURL = (NSURL *)item;
-                                              
-                                              [shareConfirmationVC.shareItemController addItemWithURL:fileURL];
-                                          }
-                                      }];
+                void (^imageFallback)(void) = ^{
+                    if ([itemProvider hasItemConformingToTypeIdentifier:(NSString *)kUTTypeImage]) {
+                        [NCLog log:@"Share: file-url staging failed — using image fallback"];
+                        [shareConfirmationVC.shareItemController addImageFromItemProvider:itemProvider];
+                    } else {
+                        [NCLog log:@"Share: file-url staging failed and provider is not an image"];
+                        [shareConfirmationVC.shareItemController reportStagingFailureWithName:NSLocalizedString("Shared file", comment: "Generic name when a shared attachment has no filename")];
+                    }
+                };
+
+                NSString *representationType = @"public.file-url";
+                if ([itemProvider hasItemConformingToTypeIdentifier:(NSString *)kUTTypeImage]) {
+                    // Photos: image representation downloads iCloud assets more reliably than bare file-url.
+                    representationType = (NSString *)kUTTypeImage;
+                }
+
+                [itemProvider loadFileRepresentationForTypeIdentifier:representationType
+                                                    completionHandler:^(NSURL * _Nullable url, NSError * _Nullable error) {
+                    NSString *fileName = url.lastPathComponent.length > 0 ? url.lastPathComponent : NSLocalizedString("Shared file", comment: "Generic name when a shared attachment has no filename");
+                    if (url != nil && [shareConfirmationVC.shareItemController addItemWithURL:url]) {
+                        [NCLog log:[NSString stringWithFormat:@"Share: staged via loadFileRepresentation(%@) %@", representationType, fileName]];
+                        return;
+                    }
+                    [NCLog log:[NSString stringWithFormat:@"Share: loadFileRepresentation(%@) failed (%@), trying loadItem file-url",
+                                representationType, error.localizedDescription ?: @"nil"]];
+                    [itemProvider loadItemForTypeIdentifier:@"public.file-url"
+                                                    options:nil
+                                          completionHandler:^(id<NSSecureCoding>  _Nullable item, NSError * _Null_unspecified loadError) {
+                        if ([(NSObject *)item isKindOfClass:[NSURL class]] &&
+                            [shareConfirmationVC.shareItemController addItemWithURL:(NSURL *)item]) {
+                            [NCLog log:@"Share: staged via loadItem public.file-url"];
+                            return;
+                        }
+                        [NCLog log:[NSString stringWithFormat:@"Share: loadItem file-url failed (%@)", loadError.localizedDescription ?: @"unknown"]];
+                        imageFallback();
+                    }];
+                }];
                 return;
             }
             // Check if shared image
             if ([itemProvider hasItemConformingToTypeIdentifier:(NSString *)kUTTypeImage]) {
-                [itemProvider loadItemForTypeIdentifier:(NSString *)kUTTypeImage
-                                                options:nil
-                                      completionHandler:^(id<NSSecureCoding>  _Nullable item, NSError * _Null_unspecified error) {
-                                          if ([(NSObject *)item isKindOfClass:[NSURL class]]) {
-                                              NSLog(@"Shared Image = %@", item);
-                                              NSURL *imageURL = (NSURL *)item;
-                                              [shareConfirmationVC.shareItemController addItemWithURL:imageURL];
-                                          } else if ([(NSObject *)item isKindOfClass:[UIImage class]]) {
-                                              // Occurs when sharing a screenshot
-                                              NSLog(@"Shared UIImage = %@", item);
-                                              UIImage *image = (UIImage *)item;
-                                              [shareConfirmationVC.shareItemController addItemWithImage:image];
-                                          } else if ([(NSObject *)item isKindOfClass:[NSData class]]) {
-                                              // Screenshots starting iOS 26
-                                              NSLog(@"Shared UIImage = %@", item);
-                                              UIImage *image = [UIImage imageWithData:(NSData *)item];
-                                              [shareConfirmationVC.shareItemController addItemWithImage:image];
-                                          }
-                                      }];
+                [shareConfirmationVC.shareItemController addImageFromItemProvider:itemProvider];
                 return;
             }
             // Check if shared pkpass (Apple Wallet)

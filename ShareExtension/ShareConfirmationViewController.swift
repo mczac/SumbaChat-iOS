@@ -58,8 +58,16 @@ import MBProgressHUD
     private var uploadSuccess: [ShareItem] = []
     private var chosenCompressionLevel: MediaUploadCompressionLevel = .moderate
     private var isPreparingForUpload = false
+    /// True from Send until upload finishes/fails — blocks double-Send (seen on iOS 18 Manual).
+    private var isUploadingMedia = false
+    /// Set when the user hits Cancel during prepare/upload — prepare completion must not start PUT.
+    private var mediaFlowCancelled = false
+    /// In-flight NextcloudKit upload tasks so Cancel can stop the network side too.
+    private var uploadTasks: [URLSessionTask] = []
     /// After a successful upload we clear staged items; don't treat that as user cancel in the share extension.
     private var finishingSuccessfulUpload = false
+    /// Avoid stacking multiple "couldn't load" alerts while several attachments fail.
+    private var isPresentingStagingFailureAlert = false
     /// Share of the annular ring reserved for compression prepare (often longer than upload).
     private let prepareProgressShare: Float = 0.55
 
@@ -500,10 +508,11 @@ import MBProgressHUD
     }
 
     public override func canPressRightButton() -> Bool {
-        // Allow sending media without caption text, but not while preparation is running.
+        // Allow sending media without caption text, but not while preparation/upload is running.
         return !self.shareItemController.shareItems.isEmpty
             && self.shareItemController.preparingItemCount == 0
             && !self.isPreparingForUpload
+            && !self.isUploadingMedia
     }
 
     // MARK: - Button Actions
@@ -535,7 +544,26 @@ import MBProgressHUD
     }
 
     func cancelButtonPressed() {
+        self.cancelMediaFlowIfNeeded()
         self.delegate?.shareConfirmationViewControllerDidCancel(self)
+    }
+
+    /// Stops compression/upload work started by Send. Safe if nothing is in flight.
+    private func cancelMediaFlowIfNeeded() {
+        guard self.isPreparingForUpload || self.isUploadingMedia else { return }
+
+        NCLog.log("Media upload: user cancelled during prepare/upload")
+        self.mediaFlowCancelled = true
+        self.shareItemController.cancelPreparation()
+        for task in self.uploadTasks {
+            task.cancel()
+        }
+        self.uploadTasks.removeAll()
+        self.isPreparingForUpload = false
+        self.isUploadingMedia = false
+        self.hideProgressHUD()
+        self.stopAnimatingSharingIndicator()
+        self.updateSendButtonEnabledState()
     }
 
     func sendButtonPressed() {
@@ -571,11 +599,19 @@ import MBProgressHUD
     }
 
     private func prepareMediaThenUpload() {
-        guard !self.isPreparingForUpload else { return }
+        guard !self.isPreparingForUpload, !self.isUploadingMedia else {
+            NCLog.log("Media upload: ignoring Send — already preparing/uploading")
+            return
+        }
 
         let mode = self.mediaUploadMode
         let mediaCount = self.shareItemController.shareItems.count
         NCLog.log("Media upload Send: mode=\(mode.rawValue) items=\(mediaCount)")
+
+        self.mediaFlowCancelled = false
+        self.uploadTasks.removeAll()
+        self.isUploadingMedia = true
+        self.updateSendButtonEnabledState()
 
         if mode == .noCompression {
             NCLog.log("Media upload: skipping compression (No Compression)")
@@ -612,12 +648,20 @@ import MBProgressHUD
                 return MediaUploadCompressionLevel.moderate.rawValue
             }
         }, progress: { [weak self] fraction in
-            guard let self else { return }
+            guard let self, !self.mediaFlowCancelled else { return }
             self.hud?.progress = fraction * self.prepareProgressShare
             self.applyUploadProgressColors(to: self.hud)
         }, completion: { [weak self] in
             guard let self else { return }
             self.isPreparingForUpload = false
+            if self.mediaFlowCancelled {
+                NCLog.log("Media upload: prepare finished after cancel — skipping upload")
+                self.isUploadingMedia = false
+                self.hideProgressHUD()
+                self.stopAnimatingSharingIndicator()
+                self.updateSendButtonEnabledState()
+                return
+            }
             NCLog.log("Media upload: prepare finished, starting upload of \(self.shareItemController.shareItems.count) item(s)")
             self.hud?.progress = self.prepareProgressShare
             self.showProgressHUD(phase: .uploading(count: self.shareItemController.shareItems.count),
@@ -967,6 +1011,13 @@ import MBProgressHUD
         // TODO: This has no effect on ShareExtension
         let bgTask = BGTaskHelper.startBackgroundTask(withName: "uploadAndShareFiles")
 
+        if self.mediaFlowCancelled {
+            NCLog.log("Media upload: uploadAndShareFiles skipped — cancelled")
+            self.isUploadingMedia = false
+            bgTask.stopBackgroundTask()
+            return
+        }
+
         NCLog.log("Media upload: uploadAndShareFiles started (\(self.shareItemController.shareItems.count) item(s))")
 
         // Hide keyboard before upload to correctly display the HUD
@@ -998,11 +1049,21 @@ import MBProgressHUD
         if room.supportsConversationSubfolders {
             let fileNames = self.shareItemController.shareItems.compactMap { $0.fileName }
             NCAPIController.sharedInstance().probeConversationAttachmentFolder(inRoom: self.room.token, withFileNames: fileNames, forAccount: self.account) { draftFolder, _, error in
+                if self.mediaFlowCancelled {
+                    DispatchQueue.main.async {
+                        self.isUploadingMedia = false
+                        bgTask.stopBackgroundTask()
+                    }
+                    return
+                }
                 if let error {
                     NCLog.log("Probe conversation attachment folder failed: \(error.localizedDescription)")
                     DispatchQueue.main.async {
+                        self.isUploadingMedia = false
+                        self.isPreparingForUpload = false
                         self.stopAnimatingSharingIndicator()
                         self.hideProgressHUD()
+                        self.updateSendButtonEnabledState()
                         bgTask.stopBackgroundTask()
                         let alert = UIAlertController(
                             title: NSLocalizedString("Upload failed", comment: ""),
@@ -1022,6 +1083,12 @@ import MBProgressHUD
     }
 
     private func startUploads(draftFolderPath: String?, bgTask: BGTaskHelper) {
+        if self.mediaFlowCancelled {
+            self.isUploadingMedia = false
+            bgTask.stopBackgroundTask()
+            return
+        }
+
         for shareItem in self.shareItemController.shareItems {
             let byteCount = (try? FileManager.default.attributesOfItem(atPath: shareItem.filePath)[.size] as? NSNumber)?.int64Value ?? 0
             if byteCount == 0 {
@@ -1064,8 +1131,18 @@ import MBProgressHUD
         }
 
         self.uploadGroup.notify(queue: .main) {
+            self.isUploadingMedia = false
+            self.isPreparingForUpload = false
+            self.uploadTasks.removeAll()
             self.stopAnimatingSharingIndicator()
             self.hideProgressHUD()
+            self.updateSendButtonEnabledState()
+
+            if self.mediaFlowCancelled {
+                NCLog.log("Media upload: upload group finished after cancel — suppressing result UI")
+                bgTask.stopBackgroundTask()
+                return
+            }
 
             // TODO: Do error reporting per item
             if self.uploadErrors.isEmpty {
@@ -1091,12 +1168,26 @@ import MBProgressHUD
     }
 
     func uploadFile(to fileServerURL: String, with filePath: String, draftFolderPath: String?, with item: ShareItem) {
-        NextcloudKit.shared.upload(serverUrlFileName: fileServerURL, fileNameLocalPath: item.filePath) { _ in
+        if self.mediaFlowCancelled {
+            self.uploadGroup.leave()
+            return
+        }
+
+        NextcloudKit.shared.upload(serverUrlFileName: fileServerURL, fileNameLocalPath: item.filePath) { task in
             NCLog.log("Media upload: upload task created for \(item.fileName)")
+            self.uploadTasks.append(task)
+            if self.mediaFlowCancelled {
+                task.cancel()
+            }
         } progressHandler: { progress in
+            guard !self.mediaFlowCancelled else { return }
             item.uploadProgress = progress.fractionCompleted
             self.updateHudProgress()
         } completionHandler: { _, _, _, _, _, _, nkError in
+            if self.mediaFlowCancelled {
+                self.uploadGroup.leave()
+                return
+            }
             if nkError.errorCode == 0 {
                 NCLog.log("Media upload: \(item.fileName) PUT completed, verifying remote size at \(fileServerURL)")
                 NCAPIController.sharedInstance().verifyUploadedFileSize(atServerURL: fileServerURL,
@@ -1468,6 +1559,52 @@ import MBProgressHUD
                 self.updateCompressionOptionsUI()
             }
         }
+    }
+
+    public func shareItemController(_ shareItemController: ShareItemController, didFailToStageItemsWithNames fileNames: [String]) {
+        DispatchQueue.main.async {
+            self.presentStagingFailureAlert(for: fileNames, remainingItemCount: shareItemController.shareItems.count)
+        }
+    }
+
+    private func presentStagingFailureAlert(for fileNames: [String], remainingItemCount: Int) {
+        guard !fileNames.isEmpty, !self.isPresentingStagingFailureAlert else { return }
+        self.isPresentingStagingFailureAlert = true
+
+        let title = NSLocalizedString("Couldn't load file", comment: "Alert title when a shared attachment could not be staged")
+        let message: String
+        if fileNames.count == 1 {
+            message = String.localizedStringWithFormat(
+                NSLocalizedString("“%@” isn't available. It may still be in iCloud or need a network connection. Try again after it finishes downloading in Photos.", comment: "Alert when one shared file could not be loaded"),
+                fileNames[0]
+            )
+        } else {
+            let listed = fileNames.prefix(3).joined(separator: "\n")
+            let suffix = fileNames.count > 3
+                ? String.localizedStringWithFormat(
+                    NSLocalizedString("\nand %ld more", comment: "More failed file names truncated"),
+                    fileNames.count - 3
+                )
+                : ""
+            message = String.localizedStringWithFormat(
+                NSLocalizedString("These files aren't available (they may still be in iCloud):\n%@%@", comment: "Alert when multiple shared files could not be loaded"),
+                listed,
+                suffix
+            )
+        }
+
+        NCLog.log("ShareConfirmation: presenting staging failure for \(fileNames.count) item(s), remaining=\(remainingItemCount)")
+
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: ""), style: .default) { [weak self] _ in
+            guard let self else { return }
+            self.isPresentingStagingFailureAlert = false
+            // Nothing left to send — leave the share sheet the same way Cancel would.
+            if remainingItemCount == 0 && self.shareItemController.shareItems.isEmpty {
+                self.delegate?.shareConfirmationViewControllerDidCancel(self)
+            }
+        })
+        self.present(alert, animated: true)
     }
 
     /// Progress while copying/staging media into the sheet (before Send).

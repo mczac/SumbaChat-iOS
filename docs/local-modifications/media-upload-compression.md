@@ -83,3 +83,21 @@ visible on white previews.
 ## GIF / pasted PNG
 
 Unchanged (GIF skipped; pasted PNG data path unchanged).
+
+## iOS 18 hardening (build 6+)
+
+- **Staging:** security-scoped access, copy (not move), sync copy before
+  `NSItemProvider` completion returns, reject 0-byte staged files. Empty staging
+  showed placeholder preview, Manual None=`–`, Moderate/High both `~12.3 KB`.
+- **Send lock:** `isUploadingMedia` blocks re-Send while upload is in flight
+  (log showed repeated `Media upload Send` during one upload).
+- **Provider fallback chain:** `loadFileRepresentation` → `loadItem` URL copy →
+  image decode (`UIImage` / `addImageFromItemProvider`). Prefer image
+  representation for Photos file-url attachments (iCloud). Logs each step so
+  a failed copy never becomes a silent empty preview.
+- **Unavailable file UI:** staging failures surface a “Couldn't load file”
+  alert (iCloud / offline), then dismiss if nothing remains.
+- **Cancel during prepare/upload:** `mediaFlowCancelled` + export cancel token +
+  `URLSessionTask.cancel()` — prepare completion must not start PUT after Cancel.
+- **Large video hitch:** staging copy always runs on `preparationQueue`
+  (`dispatch_sync` so `loadFileRepresentation` still finishes before return).

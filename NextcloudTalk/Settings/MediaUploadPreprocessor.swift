@@ -264,12 +264,41 @@ import UniformTypeIdentifiers
         return fileType.conforms(to: .movie)
     }
 
-    @objc(compressVideoAtURL:toDestinationURL:settings:progress:completion:)
+    /// Cancels in-flight video exports when the user dismisses Send/prepare.
+    @objcMembers public final class MediaUploadPreparationToken: NSObject {
+        private let lock = NSLock()
+        private var exportSession: AVAssetExportSession?
+        public private(set) var isCancelled = false
+
+        @objc public func cancel() {
+            lock.lock()
+            defer { lock.unlock() }
+            isCancelled = true
+            exportSession?.cancelExport()
+        }
+
+        fileprivate func attach(_ session: AVAssetExportSession) {
+            lock.lock()
+            defer { lock.unlock() }
+            exportSession = session
+            if isCancelled {
+                session.cancelExport()
+            }
+        }
+    }
+
+    @objc(compressVideoAtURL:toDestinationURL:settings:cancelToken:progress:completion:)
     public static func compressVideo(at sourceURL: URL,
                                      toDestinationURL destinationURL: URL,
                                      settings: MediaUploadCompressionSettings,
+                                     cancelToken: MediaUploadPreparationToken?,
                                      progress: ((Float) -> Void)?,
                                      completion: @escaping (Bool) -> Void) {
+        if cancelToken?.isCancelled == true {
+            completion(false)
+            return
+        }
+
         let asset = AVURLAsset(url: sourceURL)
 
         guard settings.shouldCompressVideos else {
@@ -282,6 +311,8 @@ import UniformTypeIdentifiers
             completion(false)
             return
         }
+
+        cancelToken?.attach(exportSession)
 
         if FileManager.default.fileExists(atPath: destinationURL.path) {
             try? FileManager.default.removeItem(at: destinationURL)
@@ -307,6 +338,13 @@ import UniformTypeIdentifiers
             DispatchQueue.main.async {
                 progressTimer?.invalidate()
                 progress?(exportSession.progress)
+
+                if cancelToken?.isCancelled == true || exportSession.status == .cancelled {
+                    try? FileManager.default.removeItem(at: destinationURL)
+                    NCLog.log("MediaUploadPreprocessor: video export cancelled")
+                    completion(false)
+                    return
+                }
 
                 switch exportSession.status {
                 case .completed:

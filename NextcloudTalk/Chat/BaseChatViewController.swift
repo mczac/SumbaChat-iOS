@@ -1702,38 +1702,72 @@ import Toast
         picker.dismiss(animated: true) {
             self.present(navigationController, animated: true) {
                 for result in results {
+                    let provider = result.itemProvider
 
-                    result.itemProvider.loadItem(forTypeIdentifier: "public.image", options: nil) { item, error in
-                        guard error == nil, let item = item as? URL else { return }
-
-                        // Keep the real container extension (heic/png/jpeg). Forcing ".jpg" while the
-                        // bytes are still HEIC breaks No Compression / None uploads (0 KB / instant fail),
-                        // especially on multi-select from Photos on iOS 18.
-                        let ext = item.pathExtension.isEmpty ? "jpg" : item.pathExtension.lowercased()
-                        let fileName: String
-                        if let suggestedFileName = result.itemProvider.suggestedName {
-                            fileName = "\(suggestedFileName).\(ext)"
-                        } else {
-                            fileName = "IMG_\(String(Date().timeIntervalSince1970 * 1000)).\(ext)"
+                    if provider.hasItemConformingToTypeIdentifier("public.image") {
+                        // Owned temp file — copy must finish before this handler returns (ShareItemController does).
+                        provider.loadFileRepresentation(forTypeIdentifier: "public.image") { url, error in
+                            if let url {
+                                // Keep real container extension (heic/png/jpeg); don't force .jpg.
+                                let ext = url.pathExtension.isEmpty ? "jpg" : url.pathExtension.lowercased()
+                                let fileName: String
+                                if let suggestedFileName = provider.suggestedName {
+                                    fileName = "\(suggestedFileName).\(ext)"
+                                } else {
+                                    fileName = "IMG_\(String(Date().timeIntervalSince1970 * 1000)).\(ext)"
+                                }
+                                if shareConfirmationVC.shareItemController.addItem(withURLAndName: url, withName: fileName) {
+                                    NCLog.log("PHPicker: staged image via loadFileRepresentation \(fileName)")
+                                    return
+                                }
+                                NCLog.log("PHPicker: image fileRepresentation copy failed for \(fileName)")
+                            } else {
+                                NCLog.log("PHPicker: loadFileRepresentation(image) failed: \(error?.localizedDescription ?? "nil")")
+                            }
+                            // Safe fallback — JPEG from decoded bitmap (still non-empty).
+                            shareConfirmationVC.shareItemController.addImage(from: provider)
                         }
-
-                        shareConfirmationVC.shareItemController.addItem(withURLAndName: item, withName: fileName)
-                        NCLog.log("PHPicker: queued image \(fileName) from \(item.lastPathComponent)")
                     }
 
-                    result.itemProvider.loadItem(forTypeIdentifier: "public.movie", options: nil) { item, error in
-                        guard error == nil, let item = item as? URL else { return }
-
-                        let ext = item.pathExtension.isEmpty ? "mov" : item.pathExtension.lowercased()
-                        let fileName: String
-                        if let suggestedFileName = result.itemProvider.suggestedName {
-                            fileName = "\(suggestedFileName).\(ext)"
-                        } else {
-                            fileName = "VID_\(String(Date().timeIntervalSince1970 * 1000)).\(ext)"
+                    if provider.hasItemConformingToTypeIdentifier("public.movie") {
+                        provider.loadFileRepresentation(forTypeIdentifier: "public.movie") { url, error in
+                            if let url {
+                                let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension.lowercased()
+                                let fileName: String
+                                if let suggestedFileName = provider.suggestedName {
+                                    fileName = "\(suggestedFileName).\(ext)"
+                                } else {
+                                    fileName = "VID_\(String(Date().timeIntervalSince1970 * 1000)).\(ext)"
+                                }
+                                if shareConfirmationVC.shareItemController.addItem(withURLAndName: url, withName: fileName) {
+                                    NCLog.log("PHPicker: staged video via loadFileRepresentation \(fileName)")
+                                    return
+                                }
+                                NCLog.log("PHPicker: video fileRepresentation copy failed for \(fileName)")
+                            } else {
+                                NCLog.log("PHPicker: loadFileRepresentation(movie) failed: \(error?.localizedDescription ?? "nil")")
+                            }
+                            provider.loadItem(forTypeIdentifier: "public.movie", options: nil) { item, loadError in
+                                guard let item = item as? URL else {
+                                    NCLog.log("PHPicker: video loadItem failed: \(loadError?.localizedDescription ?? "unknown")")
+                                    shareConfirmationVC.shareItemController.reportStagingFailure(withName: NSLocalizedString("Video", comment: "Generic name when a shared video failed to load"))
+                                    return
+                                }
+                                let ext = item.pathExtension.isEmpty ? "mov" : item.pathExtension.lowercased()
+                                let fileName: String
+                                if let suggestedFileName = provider.suggestedName {
+                                    fileName = "\(suggestedFileName).\(ext)"
+                                } else {
+                                    fileName = "VID_\(String(Date().timeIntervalSince1970 * 1000)).\(ext)"
+                                }
+                                if shareConfirmationVC.shareItemController.addItem(withURLAndName: item, withName: fileName) {
+                                    NCLog.log("PHPicker: staged video via loadItem \(fileName)")
+                                } else {
+                                    NCLog.log("PHPicker: video loadItem copy failed for \(fileName)")
+                                    shareConfirmationVC.shareItemController.reportStagingFailure(withName: fileName)
+                                }
+                            }
                         }
-
-                        shareConfirmationVC.shareItemController.addItem(withURLAndName: item, withName: fileName)
-                        NCLog.log("PHPicker: queued video \(fileName) from \(item.lastPathComponent)")
                     }
                 }
             }

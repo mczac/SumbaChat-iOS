@@ -16,6 +16,8 @@
 @property (nonatomic, strong) MediaUploadCompressionSettings *stagingSettings;
 @property (nonatomic, strong) dispatch_queue_t preparationQueue;
 @property (nonatomic, assign, readwrite) NSInteger preparingItemCount;
+@property (nonatomic, strong) NSMutableArray<NSString *> *pendingStagingFailures;
+@property (nonatomic, strong) MediaUploadPreparationToken *activePreparationToken;
 
 @end
 
@@ -33,6 +35,7 @@
     if (self) {
         self.stagingSettings = settings ?: [[MediaUploadCompressionSettings alloc] initWithLevel:MediaUploadCompressionLevelNone];
         self.internalShareItems = [[NSMutableArray alloc] init];
+        self.pendingStagingFailures = [[NSMutableArray alloc] init];
         self.preparationQueue = dispatch_queue_create("com.spl.SumbaChat.media-upload-preparation", DISPATCH_QUEUE_SERIAL);
         [self initTempDirectory];
     }
@@ -79,6 +82,46 @@
 
     self.preparingItemCount -= 1;
     [self.delegate shareItemControllerPreparingItemsChanged:self];
+    if (self.preparingItemCount == 0) {
+        [self flushPendingStagingFailures];
+    }
+}
+
+- (void)reportStagingFailureWithName:(NSString *)fileName
+{
+    NSString *name = fileName.length > 0 ? fileName : NSLocalizedString("Shared file", comment: "Generic name when a shared attachment has no filename");
+    void (^record)(void) = ^{
+        [self.pendingStagingFailures addObject:name];
+        [NCLog log:[NSString stringWithFormat:@"ShareItemController: staging failure recorded for %@", name]];
+        if (self.preparingItemCount == 0) {
+            [self flushPendingStagingFailures];
+        }
+    };
+    if ([NSThread isMainThread]) {
+        record();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), record);
+    }
+}
+
+- (void)flushPendingStagingFailures
+{
+    NSAssert(NSThread.isMainThread, @"Staging failures must flush on the main thread");
+    if (self.pendingStagingFailures.count == 0) {
+        return;
+    }
+    NSArray<NSString *> *names = [self.pendingStagingFailures copy];
+    [self.pendingStagingFailures removeAllObjects];
+    if ([self.delegate respondsToSelector:@selector(shareItemController:didFailToStageItemsWithNames:)]) {
+        [self.delegate shareItemController:self didFailToStageItemsWithNames:names];
+    }
+}
+
+- (void)cancelPreparation
+{
+    [self.activePreparationToken cancel];
+    self.activePreparationToken = nil;
+    [NCLog log:@"ShareItemController: preparation cancelled"];
 }
 
 - (NSURL *)getFileLocalURL:(NSString *)fileName
@@ -96,34 +139,98 @@
     return fileLocalURL;
 }
 
-- (void)addItemWithURL:(NSURL *)fileURL
+- (BOOL)addItemWithURL:(NSURL *)fileURL
 {
-    [self addItemWithURLAndName:fileURL withName:fileURL.lastPathComponent];
+    return [self addItemWithURLAndName:fileURL withName:fileURL.lastPathComponent];
+}
+
+- (BOOL)fileURLHasNonZeroContent:(NSURL *)url
+{
+    NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:url.path error:nil];
+    return attrs != nil && [attrs fileSize] > 0;
 }
 
 - (BOOL)prepareFileForUploadingAtURL:(NSURL *)fileURL toLocalURL:(NSURL *)fileLocalURL withCoordinatorOption:(NSFileCoordinatorReadingOptions)options
 {
+    // Photos / Share Extension hand security-scoped URLs on iOS 18. Prefer copy over move —
+    // move can "succeed" the coordinator while leaving an empty local file when the provider
+    // only grants read access (None chip shows "–", Moderate/High floor at ~12.3 KB).
+    // Write to a staging sibling first so a failed copy never wipes an existing destination.
+    BOOL accessing = [fileURL startAccessingSecurityScopedResource];
     NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
-    __block NSError *error;
+    __block NSError *coordinatorError = nil;
+    __block NSError *ioError = nil;
+    __block BOOL wroteBytes = NO;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSURL *stagingURL = [[fileLocalURL URLByDeletingLastPathComponent]
+                         URLByAppendingPathComponent:[NSString stringWithFormat:@".%@.%@",
+                                                      [[NSUUID UUID] UUIDString],
+                                                      fileLocalURL.lastPathComponent]];
 
-    // Make a local copy to prevent bug where file is removed after some time from inbox
-    // See: https://stackoverflow.com/a/48007752/2512312
-    [coordinator coordinateReadingItemAtURL:fileURL options:options error:&error byAccessor:^(NSURL *newURL) {
-        if ([NSFileManager.defaultManager fileExistsAtPath:fileLocalURL.path]) {
-            [NSFileManager.defaultManager removeItemAtPath:fileLocalURL.path error:nil];
+    [coordinator coordinateReadingItemAtURL:fileURL options:options error:&coordinatorError byAccessor:^(NSURL *newURL) {
+        [fm removeItemAtURL:stagingURL error:nil];
+
+        if (![fm copyItemAtURL:newURL toURL:stagingURL error:&ioError]) {
+            // Fallback: read bytes (some provider URLs reject copyItem).
+            NSData *data = [NSData dataWithContentsOfURL:newURL options:NSDataReadingMappedIfSafe error:&ioError];
+            if (data.length == 0 || ![data writeToURL:stagingURL options:NSDataWritingAtomic error:&ioError]) {
+                wroteBytes = NO;
+                [fm removeItemAtURL:stagingURL error:nil];
+                return;
+            }
         }
 
-        [NSFileManager.defaultManager moveItemAtPath:newURL.path toPath:fileLocalURL.path error:nil];
+        if (![self fileURLHasNonZeroContent:stagingURL]) {
+            wroteBytes = NO;
+            [fm removeItemAtURL:stagingURL error:nil];
+            ioError = [NSError errorWithDomain:@"ShareItemController"
+                                          code:1
+                                      userInfo:@{NSLocalizedDescriptionKey: @"Copied file is empty"}];
+            return;
+        }
+
+        if ([fm fileExistsAtPath:fileLocalURL.path]) {
+            [fm removeItemAtPath:fileLocalURL.path error:nil];
+        }
+        if ([fm moveItemAtURL:stagingURL toURL:fileLocalURL error:&ioError]) {
+            wroteBytes = YES;
+        } else {
+            [fm removeItemAtURL:stagingURL error:nil];
+            wroteBytes = NO;
+        }
     }];
 
-    BOOL success = (error == nil);
-    return success;
+    if (accessing) {
+        [fileURL stopAccessingSecurityScopedResource];
+    }
+
+    if (coordinatorError != nil || !wroteBytes) {
+        NSString *detail = coordinatorError.localizedDescription ?: ioError.localizedDescription ?: @"unknown";
+        [NCLog log:[NSString stringWithFormat:@"ShareItemController: staging copy failed for %@ → %@: %@",
+                    fileURL.lastPathComponent, fileLocalURL.lastPathComponent, detail]];
+        [fm removeItemAtURL:stagingURL error:nil];
+        return NO;
+    }
+
+    NSDictionary *attrs = [fm attributesOfItemAtPath:fileLocalURL.path error:nil];
+    [NCLog log:[NSString stringWithFormat:@"ShareItemController: staged copy %@ (%llu bytes)",
+                fileLocalURL.lastPathComponent, (unsigned long long)[attrs fileSize]]];
+    return YES;
 }
 
 - (void)addShareItemWithLocalURL:(NSURL *)fileLocalURL fileName:(NSString *)fileName isImage:(BOOL)fileIsImage
 {
-    NSLog(@"Adding shareItem: %@ %@", fileName, fileLocalURL);
-    [NCLog log:[NSString stringWithFormat:@"ShareItemController: staged %@ (%@)", fileName, fileLocalURL.lastPathComponent]];
+    if (![self fileURLHasNonZeroContent:fileLocalURL]) {
+        NSLog(@"Refusing to stage empty shareItem: %@ %@", fileName, fileLocalURL);
+        [NCLog log:[NSString stringWithFormat:@"ShareItemController: refusing empty staged file %@", fileName]];
+        [NSFileManager.defaultManager removeItemAtURL:fileLocalURL error:nil];
+        return;
+    }
+
+    NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:fileLocalURL.path error:nil];
+    NSLog(@"Adding shareItem: %@ %@ (%llu bytes)", fileName, fileLocalURL, (unsigned long long)[attrs fileSize]);
+    [NCLog log:[NSString stringWithFormat:@"ShareItemController: staged %@ (%@, %llu bytes)",
+                fileName, fileLocalURL.lastPathComponent, (unsigned long long)[attrs fileSize]]];
 
     ShareItem *item = [ShareItem initWithURL:fileLocalURL withName:fileName withPlaceholderImage:[self getPlaceholderImageForFileURL:fileLocalURL] isImage:fileIsImage];
     [self.internalShareItems addObject:item];
@@ -169,63 +276,139 @@
     [self endPreparingItem];
 }
 
-- (void)addItemWithURLAndName:(NSURL *)fileURL withName:(NSString *)fileName
+- (BOOL)addItemWithURLAndName:(NSURL *)fileURL withName:(NSString *)fileName
 {
-    // PHPicker / NSItemProvider completions are often off the main thread.
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self addItemWithURLAndName:fileURL withName:fileName];
-        });
+    // NSItemProvider / PHPicker may revoke the source URL as soon as their completion
+    // returns. Previously we dispatched the copy async and returned immediately — on
+    // iOS 18 that often staged 0-byte files (placeholder preview, None=–, ~12.3 KB chips).
+    // Callers that use loadFileRepresentation MUST invoke this before the handler returns.
+    __block NSURL *fileLocalURL = nil;
+    void (^beginOnMain)(void) = ^{
+        [self beginPreparingItem];
+        fileLocalURL = [self getFileLocalURL:fileName];
+    };
+    if ([NSThread isMainThread]) {
+        beginOnMain();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), beginOnMain);
+    }
+
+    // Copy on the serial prep queue so large videos never hitch the main thread.
+    // dispatch_sync keeps loadFileRepresentation handlers from returning before the copy finishes.
+    __block BOOL preparedSuccessfully = NO;
+    dispatch_sync(self.preparationQueue, ^{
+        preparedSuccessfully = [self prepareFileForUploadingAtURL:fileURL
+                                                       toLocalURL:fileLocalURL
+                                           withCoordinatorOption:NSFileCoordinatorReadingForUploading];
+        if (!preparedSuccessfully) {
+            preparedSuccessfully = [self prepareFileForUploadingAtURL:fileURL
+                                                           toLocalURL:fileLocalURL
+                                               withCoordinatorOption:NSFileCoordinatorReadingWithoutChanges];
+        }
+    });
+
+    void (^finishOnMain)(void) = ^{
+        if (!preparedSuccessfully) {
+            NSLog(@"Failed to prepare file for sharing");
+            [NCLog log:[NSString stringWithFormat:@"ShareItemController: failed to prepare %@ for sharing", fileName]];
+            // Do not record a user-facing failure here — callers may still fall back (e.g. UIImage).
+            [self endPreparingItem];
+            return;
+        }
+
+        NSString *extension = fileLocalURL.pathExtension.lowercaseString;
+        BOOL fileIsImage = (extension.length > 0 && [NCUtils isImageWithFileExtension:extension]);
+
+        if (fileIsImage) {
+            [self finalizeImageItemFromLocalURL:fileLocalURL fileName:fileName];
+            return;
+        }
+
+        if (extension.length > 0 && [MediaUploadPreprocessor isVideoFileExtension:extension]) {
+            [self finalizeVideoItemFromLocalURL:fileLocalURL fileName:fileName];
+            return;
+        }
+
+        [self addShareItemWithLocalURL:fileLocalURL fileName:fileName isImage:fileIsImage];
+        [self endPreparingItem];
+    };
+    if ([NSThread isMainThread]) {
+        finishOnMain();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), finishOnMain);
+    }
+
+    return preparedSuccessfully;
+}
+
+- (void)addImageFromItemProvider:(NSItemProvider *)itemProvider
+{
+    if (!itemProvider || ![itemProvider hasItemConformingToTypeIdentifier:(NSString *)kUTTypeImage]) {
+        [NCLog log:@"ShareItemController: image fallback skipped — provider has no image type"];
         return;
     }
 
-    [self beginPreparingItem];
-
-    NSURL *fileLocalURL = [self getFileLocalURL:fileName];
     __weak typeof(self) weakSelf = self;
-    dispatch_async(self.preparationQueue, ^{
+    [itemProvider loadFileRepresentationForTypeIdentifier:(NSString *)kUTTypeImage
+                                         completionHandler:^(NSURL * _Nullable url, NSError * _Nullable error) {
         ShareItemController *strongSelf = weakSelf;
         if (!strongSelf) {
             return;
         }
 
-        // Copy off the main thread so large videos don't freeze the share sheet.
-        BOOL preparedSuccessfully = [strongSelf prepareFileForUploadingAtURL:fileURL toLocalURL:fileLocalURL withCoordinatorOption:NSFileCoordinatorReadingForUploading];
-
-        if (!preparedSuccessfully) {
-            preparedSuccessfully = [strongSelf prepareFileForUploadingAtURL:fileURL toLocalURL:fileLocalURL withCoordinatorOption:NSFileCoordinatorReadingWithoutChanges];
+        if (url != nil) {
+            NSString *name = url.lastPathComponent.length > 0 ? url.lastPathComponent : [NSString stringWithFormat:@"IMG_%.f.jpg", [[NSDate date] timeIntervalSince1970] * 1000];
+            // Must copy before this handler returns — system deletes the representation file.
+            if ([strongSelf addItemWithURLAndName:url withName:name]) {
+                [NCLog log:[NSString stringWithFormat:@"ShareItemController: image fallback staged file representation %@", name]];
+                return;
+            }
+            [NCLog log:[NSString stringWithFormat:@"ShareItemController: image file representation copy failed (%@)", error.localizedDescription ?: @"empty"]];
+        } else {
+            [NCLog log:[NSString stringWithFormat:@"ShareItemController: loadFileRepresentation(image) failed: %@", error.localizedDescription ?: @"nil url"]];
         }
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            ShareItemController *mainSelf = weakSelf;
-            if (!mainSelf) {
+        // Decoded bitmap path — loses HEIC container but still uploads a real JPEG.
+        [itemProvider loadObjectOfClass:[UIImage class] completionHandler:^(UIImage * _Nullable image, NSError * _Nullable imageError) {
+            ShareItemController *innerSelf = weakSelf;
+            if (!innerSelf) {
+                return;
+            }
+            if (image != nil) {
+                [NCLog log:@"ShareItemController: image fallback staged via UIImage"];
+                [innerSelf addItemWithImage:image];
                 return;
             }
 
-            if (!preparedSuccessfully) {
-                NSLog(@"Failed to prepare file for sharing");
-                [NCLog log:[NSString stringWithFormat:@"ShareItemController: failed to prepare %@ for sharing", fileName]];
-                [mainSelf endPreparingItem];
-                return;
-            }
-
-            NSString *extension = fileLocalURL.pathExtension.lowercaseString;
-            BOOL fileIsImage = (extension.length > 0 && [NCUtils isImageWithFileExtension:extension]);
-
-            if (fileIsImage) {
-                [mainSelf finalizeImageItemFromLocalURL:fileLocalURL fileName:fileName];
-                return;
-            }
-
-            if (extension.length > 0 && [MediaUploadPreprocessor isVideoFileExtension:extension]) {
-                [mainSelf finalizeVideoItemFromLocalURL:fileLocalURL fileName:fileName];
-                return;
-            }
-
-            [mainSelf addShareItemWithLocalURL:fileLocalURL fileName:fileName isImage:fileIsImage];
-            [mainSelf endPreparingItem];
-        });
-    });
+            [itemProvider loadItemForTypeIdentifier:(NSString *)kUTTypeImage
+                                            options:nil
+                                  completionHandler:^(id<NSSecureCoding>  _Nullable item, NSError * _Null_unspecified loadError) {
+                ShareItemController *loadSelf = weakSelf;
+                if (!loadSelf) {
+                    return;
+                }
+                if ([(NSObject *)item isKindOfClass:[UIImage class]]) {
+                    [NCLog log:@"ShareItemController: image fallback staged via loadItem UIImage"];
+                    [loadSelf addItemWithImage:(UIImage *)item];
+                } else if ([(NSObject *)item isKindOfClass:[NSData class]]) {
+                    UIImage *fromData = [UIImage imageWithData:(NSData *)item];
+                    if (fromData) {
+                        [NCLog log:@"ShareItemController: image fallback staged via loadItem NSData"];
+                        [loadSelf addItemWithImage:fromData];
+                    } else {
+                        [NCLog log:@"ShareItemController: image fallback NSData could not decode"];
+                    }
+                } else if ([(NSObject *)item isKindOfClass:[NSURL class]]) {
+                    [NCLog log:@"ShareItemController: image fallback trying loadItem URL"];
+                    [loadSelf addItemWithURL:(NSURL *)item];
+                } else {
+                    [NCLog log:[NSString stringWithFormat:@"ShareItemController: all image fallbacks failed (%@)",
+                                loadError.localizedDescription ?: imageError.localizedDescription ?: @"unknown"]];
+                    [loadSelf reportStagingFailureWithName:NSLocalizedString("Photo", comment: "Generic name when a shared photo failed to load")];
+                }
+            }];
+        }];
+    }];
 }
 
 - (void)addItemWithImage:(UIImage *)image
@@ -319,20 +502,26 @@
 
 - (void)updateItem:(ShareItem *)item withURL:(NSURL *)fileURL
 {
-    // This is called when an item was edited in quicklook and we want to use the edited image
-    NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
-    __block NSError *error;
-    
-    [coordinator coordinateReadingItemAtURL:fileURL options:NSFileCoordinatorReadingForUploading error:&error byAccessor:^(NSURL *newURL) {
-        if ([NSFileManager.defaultManager fileExistsAtPath:item.filePath]) {
-            [NSFileManager.defaultManager removeItemAtPath:item.filePath error:nil];
-        }
-        
-        [NSFileManager.defaultManager moveItemAtPath:newURL.path toPath:item.filePath error:nil];
-    }];
-    
+    // Quick Look edits — stage to a new local file, then swap paths (keeps original if copy fails).
+    NSURL *destination = [self getFileLocalURL:item.fileName];
+    BOOL ok = [self prepareFileForUploadingAtURL:fileURL toLocalURL:destination withCoordinatorOption:NSFileCoordinatorReadingForUploading];
+    if (!ok) {
+        ok = [self prepareFileForUploadingAtURL:fileURL toLocalURL:destination withCoordinatorOption:NSFileCoordinatorReadingWithoutChanges];
+    }
+    if (!ok) {
+        NSLog(@"Failed to update shareItem from edited URL: %@", item.fileName);
+        return;
+    }
+
+    NSString *oldPath = item.filePath;
+    item.fileURL = destination;
+    item.filePath = destination.path;
+    item.fileName = destination.lastPathComponent;
+    if (oldPath.length > 0 && ![oldPath isEqualToString:destination.path]) {
+        [NSFileManager.defaultManager removeItemAtPath:oldPath error:nil];
+    }
+
     NSLog(@"Updating shareItem: %@ %@", item.fileName, item.fileURL);
-    
     [self.delegate shareItemControllerItemsChanged:self];
 }
 
@@ -442,6 +631,7 @@
         [MediaUploadPreprocessor compressVideoAtURL:item.fileURL
                                    toDestinationURL:mp4URL
                                            settings:settings
+                                        cancelToken:self.activePreparationToken
                                            progress:^(float fraction) {
             if (progress) {
                 progress(fraction);
@@ -511,6 +701,9 @@
         }
         return;
     }
+
+    [self.activePreparationToken cancel];
+    self.activePreparationToken = [[MediaUploadPreparationToken alloc] init];
 
     [NCLog log:[NSString stringWithFormat:@"ShareItemController: prepareItemsForUpload — compressing %ld item(s)", (long)totalToCompress]];
 
@@ -583,7 +776,9 @@
     }
 
     dispatch_group_notify(group, dispatch_get_main_queue(), ^{
-        [NCLog log:@"ShareItemController: prepareItemsForUpload — finished"];
+        BOOL cancelled = self.activePreparationToken.isCancelled;
+        self.activePreparationToken = nil;
+        [NCLog log:[NSString stringWithFormat:@"ShareItemController: prepareItemsForUpload — finished (cancelled=%d)", cancelled]];
         [self.delegate shareItemControllerItemsChanged:self];
         if (completion) {
             completion();

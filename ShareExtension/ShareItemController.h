@@ -15,6 +15,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)shareItemControllerItemsChanged:(ShareItemController *)shareItemController;
 - (void)shareItemControllerPreparingItemsChanged:(ShareItemController *)shareItemController;
+/// Called when one or more attachments could not be loaded (e.g. iCloud not available).
+- (void)shareItemController:(ShareItemController *)shareItemController didFailToStageItemsWithNames:(NSArray<NSString *> *)fileNames;
 
 @end
 
@@ -27,8 +29,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (instancetype)initWithMediaUploadCompressionSettings:(MediaUploadCompressionSettings *)settings NS_DESIGNATED_INITIALIZER;
 - (instancetype)init;
-- (void)addItemWithURL:(NSURL *)fileURL;
-- (void)addItemWithURLAndName:(NSURL *)fileURL withName:(NSString *)fileName;
+/// Copies the provider URL into the upload temp dir. Returns YES only if a non-empty local file was staged.
+- (BOOL)addItemWithURL:(NSURL *)fileURL;
+- (BOOL)addItemWithURLAndName:(NSURL *)fileURL withName:(NSString *)fileName;
+/// Photos / share fallback when file-URL staging fails: file representation → UIImage → loadItem.
+- (void)addImageFromItemProvider:(NSItemProvider *)itemProvider;
 - (void)addItemWithImage:(UIImage *)image;
 - (void)addItemWithImageAndName:(UIImage *)image withName:(NSString *)imageName;
 - (void)addItemWithImageDataAndName:(NSData *)data withName:(NSString *)imageName;
@@ -46,6 +51,12 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)prepareItemsForUploadWithLevelProvider:(NSInteger (^)(ShareItem *item))levelProvider
                                       progress:(void (^ _Nullable)(float fraction))progress
                                    completion:(void (^)(void))completion;
+
+/// Stop in-flight Send-path compression (video export). Safe to call from Cancel.
+- (void)cancelPreparation;
+
+/// Record a staging failure when the share provider never reaches addItem (all fallbacks exhausted).
+- (void)reportStagingFailureWithName:(NSString *)fileName;
 
 @end
 
