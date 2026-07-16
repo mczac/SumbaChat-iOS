@@ -1706,29 +1706,34 @@ import Toast
                     result.itemProvider.loadItem(forTypeIdentifier: "public.image", options: nil) { item, error in
                         guard error == nil, let item = item as? URL else { return }
 
-                        var fileName: String
-
+                        // Keep the real container extension (heic/png/jpeg). Forcing ".jpg" while the
+                        // bytes are still HEIC breaks No Compression / None uploads (0 KB / instant fail),
+                        // especially on multi-select from Photos on iOS 18.
+                        let ext = item.pathExtension.isEmpty ? "jpg" : item.pathExtension.lowercased()
+                        let fileName: String
                         if let suggestedFileName = result.itemProvider.suggestedName {
-                            fileName = "\(suggestedFileName).jpg"
+                            fileName = "\(suggestedFileName).\(ext)"
                         } else {
-                            fileName = "IMG_\(String(Date().timeIntervalSince1970 * 1000)).jpg"
+                            fileName = "IMG_\(String(Date().timeIntervalSince1970 * 1000)).\(ext)"
                         }
 
                         shareConfirmationVC.shareItemController.addItem(withURLAndName: item, withName: fileName)
+                        NCLog.log("PHPicker: queued image \(fileName) from \(item.lastPathComponent)")
                     }
 
                     result.itemProvider.loadItem(forTypeIdentifier: "public.movie", options: nil) { item, error in
                         guard error == nil, let item = item as? URL else { return }
 
-                        var fileName: String
-
+                        let ext = item.pathExtension.isEmpty ? "mov" : item.pathExtension.lowercased()
+                        let fileName: String
                         if let suggestedFileName = result.itemProvider.suggestedName {
-                            fileName = "\(suggestedFileName).mov"
+                            fileName = "\(suggestedFileName).\(ext)"
                         } else {
-                            fileName = "VID_\(String(Date().timeIntervalSince1970 * 1000)).mov"
+                            fileName = "VID_\(String(Date().timeIntervalSince1970 * 1000)).\(ext)"
                         }
 
                         shareConfirmationVC.shareItemController.addItem(withURLAndName: item, withName: fileName)
+                        NCLog.log("PHPicker: queued video \(fileName) from \(item.lastPathComponent)")
                     }
                 }
             }

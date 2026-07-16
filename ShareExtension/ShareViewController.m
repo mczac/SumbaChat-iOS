@@ -460,16 +460,19 @@
 
 - (void)shareConfirmationViewControllerDidFail:(ShareConfirmationViewController *)viewController
 {
+    [NCLog log:@"ShareExtension: share finished with failure"];
     [self.extensionContext completeRequestReturningItems:@[] completionHandler:nil];
 }
 
 - (void)shareConfirmationViewControllerDidFinish:(ShareConfirmationViewController *)viewController
 {
+    [NCLog log:@"ShareExtension: share finished successfully"];
     [self.extensionContext completeRequestReturningItems:@[] completionHandler:nil];
 }
 
 - (void)shareConfirmationViewControllerDidCancel:(ShareConfirmationViewController *)viewController
 {
+    [NCLog log:@"ShareExtension: share cancelled"];
     [self.extensionContext completeRequestReturningItems:@[] completionHandler:nil];
 }
 

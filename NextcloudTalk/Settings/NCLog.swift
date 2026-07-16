@@ -22,11 +22,17 @@
     }()
 
     private static var logfilePath: URL? = {
-        guard let documentDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-        else { return nil }
-
         let fileManager = FileManager.default
-        let logDir = documentDir.appendingPathComponent("logs")
+        let logDir: URL
+
+        if let groupContainer = fileManager.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
+            logDir = groupContainer.appendingPathComponent("logs")
+        } else if let documentDir = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first {
+            logDir = documentDir.appendingPathComponent("logs")
+        } else {
+            return nil
+        }
+
         let logPath = logDir.path
 
         // Allow writing to files while the app is in the background

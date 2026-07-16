@@ -123,6 +123,7 @@
 - (void)addShareItemWithLocalURL:(NSURL *)fileLocalURL fileName:(NSString *)fileName isImage:(BOOL)fileIsImage
 {
     NSLog(@"Adding shareItem: %@ %@", fileName, fileLocalURL);
+    [NCLog log:[NSString stringWithFormat:@"ShareItemController: staged %@ (%@)", fileName, fileLocalURL.lastPathComponent]];
 
     ShareItem *item = [ShareItem initWithURL:fileLocalURL withName:fileName withPlaceholderImage:[self getPlaceholderImageForFileURL:fileLocalURL] isImage:fileIsImage];
     [self.internalShareItems addObject:item];
@@ -203,6 +204,7 @@
 
             if (!preparedSuccessfully) {
                 NSLog(@"Failed to prepare file for sharing");
+                [NCLog log:[NSString stringWithFormat:@"ShareItemController: failed to prepare %@ for sharing", fileName]];
                 [mainSelf endPreparingItem];
                 return;
             }
@@ -407,10 +409,20 @@
                                                               settings:settings];
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (success) {
-                    [NSFileManager.defaultManager removeItemAtPath:item.filePath error:nil];
-                    item.fileURL = jpegURL;
-                    item.filePath = jpegURL.path;
-                    item.fileName = jpegURL.lastPathComponent;
+                    NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:jpegURL.path error:nil];
+                    unsigned long long written = [attrs fileSize];
+                    if (written > 0) {
+                        if (![item.filePath isEqualToString:jpegURL.path]) {
+                            [NSFileManager.defaultManager removeItemAtPath:item.filePath error:nil];
+                        }
+                        item.fileURL = jpegURL;
+                        item.filePath = jpegURL.path;
+                        item.fileName = jpegURL.lastPathComponent;
+                    } else {
+                        NSLog(@"MediaUploadPreprocessor: refusing to swap to 0-byte compressed image %@", jpegURL.lastPathComponent);
+                        [NCLog log:[NSString stringWithFormat:@"ShareItemController: refusing 0-byte compressed image %@", jpegURL.lastPathComponent]];
+                        [NSFileManager.defaultManager removeItemAtURL:jpegURL error:nil];
+                    }
                 }
                 if (progress) {
                     progress(1.0f);
@@ -437,10 +449,20 @@
         } completion:^(BOOL success) {
             // Completion already hops to main inside MediaUploadPreprocessor.
             if (success) {
-                [NSFileManager.defaultManager removeItemAtURL:item.fileURL error:nil];
-                item.fileURL = mp4URL;
-                item.filePath = mp4URL.path;
-                item.fileName = mp4Name;
+                NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:mp4URL.path error:nil];
+                unsigned long long written = [attrs fileSize];
+                if (written > 0) {
+                    if (![item.filePath isEqualToString:mp4URL.path]) {
+                        [NSFileManager.defaultManager removeItemAtURL:item.fileURL error:nil];
+                    }
+                    item.fileURL = mp4URL;
+                    item.filePath = mp4URL.path;
+                    item.fileName = mp4Name;
+                } else {
+                    NSLog(@"MediaUploadPreprocessor: refusing to swap to 0-byte compressed video %@", mp4Name);
+                    [NCLog log:[NSString stringWithFormat:@"ShareItemController: refusing 0-byte compressed video %@", mp4Name]];
+                    [NSFileManager.defaultManager removeItemAtURL:mp4URL error:nil];
+                }
             } else {
                 [NSFileManager.defaultManager removeItemAtURL:mp4URL error:nil];
             }
@@ -480,6 +502,7 @@
     }
 
     if (totalToCompress == 0) {
+        [NCLog log:@"ShareItemController: prepareItemsForUpload — nothing to compress"];
         if (progress) {
             progress(1.0f);
         }
@@ -488,6 +511,8 @@
         }
         return;
     }
+
+    [NCLog log:[NSString stringWithFormat:@"ShareItemController: prepareItemsForUpload — compressing %ld item(s)", (long)totalToCompress]];
 
     if (progress) {
         progress(0.0f);
@@ -530,6 +555,7 @@
 
         dispatch_group_enter(group);
         [self beginPreparingItem];
+        [NCLog log:[NSString stringWithFormat:@"ShareItemController: compressing %@ at level %ld", item.fileName, (long)level]];
         [self compressItem:item withLevel:level progress:^(float fraction) {
             void (^update)(void) = ^{
                 itemFractions[itemKey] = @(MAX(0.0f, MIN(1.0f, fraction)));
@@ -557,6 +583,7 @@
     }
 
     dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        [NCLog log:@"ShareItemController: prepareItemsForUpload — finished"];
         [self.delegate shareItemControllerItemsChanged:self];
         if (completion) {
             completion();

@@ -58,7 +58,10 @@ import MBProgressHUD
     private var uploadSuccess: [ShareItem] = []
     private var chosenCompressionLevel: MediaUploadCompressionLevel = .moderate
     private var isPreparingForUpload = false
-    /// Fraction of the combined progress ring reserved for prepare/compress before upload bytes.
+    /// Bumps whenever share items change so stale background size estimates are ignored.
+    private var compressionEstimateGeneration: UInt = 0
+    /// After a successful upload we clear staged items; don't treat that as user cancel in the share extension.
+    private var finishingSuccessfulUpload = false
     /// Share of the annular ring reserved for compression prepare (often longer than upload).
     private let prepareProgressShare: Float = 0.55
 
@@ -574,7 +577,10 @@ import MBProgressHUD
 
         let mode = self.mediaUploadMode
         let mediaCount = self.shareItemController.shareItems.count
+        NCLog.log("Media upload Send: mode=\(mode.rawValue) items=\(mediaCount)")
+
         if mode == .noCompression {
+            NCLog.log("Media upload: skipping compression (No Compression)")
             self.startAnimatingSharingIndicator()
             self.showProgressHUD(phase: .uploading(count: mediaCount), progress: 0, overMedia: true)
             self.uploadAndShareFiles()
@@ -585,6 +591,7 @@ import MBProgressHUD
         self.textView.resignFirstResponder()
         self.startAnimatingSharingIndicator()
         self.showProgressHUD(phase: .preparing, progress: 0, overMedia: true)
+        NCLog.log("Media upload: preparing \(mediaCount) item(s) for compression")
 
         let chosenLevel = self.chosenCompressionLevel
         self.shareItemController.prepareItemsForUpload(levelProvider: { item in
@@ -613,24 +620,13 @@ import MBProgressHUD
         }, completion: { [weak self] in
             guard let self else { return }
             self.isPreparingForUpload = false
+            NCLog.log("Media upload: prepare finished, starting upload of \(self.shareItemController.shareItems.count) item(s)")
             self.hud?.progress = self.prepareProgressShare
             self.showProgressHUD(phase: .uploading(count: self.shareItemController.shareItems.count),
                                  progress: self.prepareProgressShare,
                                  overMedia: true)
             self.uploadAndShareFiles()
         })
-    }
-
-    private func estimatedByteCountsByLevel() -> [MediaUploadCompressionLevel: Int64] {
-        var totals: [MediaUploadCompressionLevel: Int64] = [.none: 0, .moderate: 0, .high: 0]
-        for item in self.shareItemController.shareItems {
-            guard let fileURL = item.fileURL else { continue }
-            let counts = MediaUploadPreprocessor.estimatedByteCounts(at: fileURL, treatAsImage: item.isImage)
-            totals[.none, default: 0] += counts.none
-            totals[.moderate, default: 0] += counts.moderate
-            totals[.high, default: 0] += counts.high
-        }
-        return totals
     }
 
     private func title(for level: MediaUploadCompressionLevel) -> String {
@@ -671,7 +667,49 @@ import MBProgressHUD
             return
         }
 
-        let estimates = self.estimatedByteCountsByLevel()
+        // Show cheap on-disk sizes immediately (None). Moderate/High placeholders stay honest-ish
+        // from file size until the background estimate finishes — never JPEG-encode on the main
+        // thread while multi-select is still staging (that jetsams on iOS 18).
+        let items = self.shareItemController.shareItems
+        var originalTotal: Int64 = 0
+        for item in items {
+            guard let fileURL = item.fileURL,
+                  let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+                  let size = attrs[.size] as? NSNumber else { continue }
+            originalTotal += size.int64Value
+        }
+        let placeholder: [MediaUploadCompressionLevel: Int64] = [
+            .none: originalTotal,
+            .moderate: max(12_288, Int64(Double(originalTotal) * 0.62)),
+            .high: max(12_288, Int64(Double(originalTotal) * 0.22))
+        ]
+        self.applyCompressionChipTitles(estimates: placeholder)
+
+        self.compressionEstimateGeneration &+= 1
+        let generation = self.compressionEstimateGeneration
+        let urlsAndFlags: [(URL, Bool)] = items.compactMap { item in
+            guard let url = item.fileURL else { return nil }
+            return (url, item.isImage)
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            var totals: [MediaUploadCompressionLevel: Int64] = [.none: 0, .moderate: 0, .high: 0]
+            for (fileURL, isImage) in urlsAndFlags {
+                let counts = MediaUploadPreprocessor.estimatedByteCounts(at: fileURL, treatAsImage: isImage)
+                totals[.none, default: 0] += counts.none
+                totals[.moderate, default: 0] += counts.moderate
+                totals[.high, default: 0] += counts.high
+            }
+            DispatchQueue.main.async {
+                guard generation == self.compressionEstimateGeneration else { return }
+                self.applyCompressionChipTitles(estimates: totals)
+            }
+        }
+
+        self.view.layoutIfNeeded()
+    }
+
+    private func applyCompressionChipTitles(estimates: [MediaUploadCompressionLevel: Int64]) {
         let elementColor = NCAppBranding.elementColor()
         for case let button as UIButton in self.compressionOptionsView.arrangedSubviews {
             guard let level = MediaUploadCompressionLevel(rawValue: button.tag) else { continue }
@@ -684,8 +722,6 @@ import MBProgressHUD
             button.layer.borderColor = (selected ? elementColor : UIColor.separator).cgColor
             button.setTitleColor(selected ? elementColor : .label, for: .normal)
         }
-
-        self.view.layoutIfNeeded()
     }
 
     private func configureCompressionUI() {
@@ -944,6 +980,8 @@ import MBProgressHUD
         // TODO: This has no effect on ShareExtension
         let bgTask = BGTaskHelper.startBackgroundTask(withName: "uploadAndShareFiles")
 
+        NCLog.log("Media upload: uploadAndShareFiles started (\(self.shareItemController.shareItems.count) item(s))")
+
         // Hide keyboard before upload to correctly display the HUD
         self.textView.resignFirstResponder()
 
@@ -998,7 +1036,16 @@ import MBProgressHUD
 
     private func startUploads(draftFolderPath: String?, bgTask: BGTaskHelper) {
         for shareItem in self.shareItemController.shareItems {
-            NSLog("Uploading \(shareItem.fileURL.absoluteString)")
+            let byteCount = (try? FileManager.default.attributesOfItem(atPath: shareItem.filePath)[.size] as? NSNumber)?.int64Value ?? 0
+            if byteCount == 0 {
+                NCLog.log("Media upload: refusing 0-byte upload for \(shareItem.fileName) at \(shareItem.filePath)")
+                self.uploadErrors.append(String.localizedStringWithFormat(
+                    NSLocalizedString("“%@” is empty and was not uploaded.", comment: "Upload aborted because staged file has 0 bytes"),
+                    shareItem.fileName
+                ))
+                continue
+            }
+            NCLog.log("Media upload: uploading \(shareItem.fileName) (\(byteCount) bytes) from \(shareItem.filePath)")
 
             self.uploadGroup.enter()
 
@@ -1035,7 +1082,9 @@ import MBProgressHUD
 
             // TODO: Do error reporting per item
             if self.uploadErrors.isEmpty {
+                self.finishingSuccessfulUpload = true
                 self.shareItemController.removeAllItems()
+                self.finishingSuccessfulUpload = false
                 self.delegate?.shareConfirmationViewControllerDidFinish(self)
             } else {
                 // We remove the successfully uploaded items, so only the failed ones are kept
@@ -1056,58 +1105,30 @@ import MBProgressHUD
 
     func uploadFile(to fileServerURL: String, with filePath: String, draftFolderPath: String?, with item: ShareItem) {
         NextcloudKit.shared.upload(serverUrlFileName: fileServerURL, fileNameLocalPath: item.filePath) { _ in
-            NSLog("Upload task")
+            NCLog.log("Media upload: upload task created for \(item.fileName)")
         } progressHandler: { progress in
             item.uploadProgress = progress.fractionCompleted
             self.updateHudProgress()
         } completionHandler: { _, _, _, _, _, _, nkError in
             if nkError.errorCode == 0 {
-                var talkMetaData: [String: Any] = [:]
-
-                let itemCaption = item.caption.trimmingCharacters(in: .whitespaces)
-                if !itemCaption.isEmpty {
-                    talkMetaData["caption"] = itemCaption
-                }
-
-                if self.shareSilently {
-                    talkMetaData["silent"] = self.shareSilently
-                }
-
-                if let thread = self.thread {
-                    talkMetaData["threadId"] = thread.threadId
-                }
-
-                if let draftFolderPath {
-                    NCAPIController.sharedInstance().postConversationAttachment(inRoom: self.room.token,
-                                                                                filePath: draftFolderPath,
-                                                                                fileName: item.fileName,
-                                                                                referenceId: nil,
-                                                                                talkMetaData: talkMetaData,
-                                                                                forAccount: self.account) { error in
-                        if let error {
-                            NCLog.log("Failed to post attachment. Error: \(error.localizedDescription)")
-                            self.uploadErrors.append(error.localizedDescription)
-                        } else {
-                            self.uploadSuccess.append(item)
-                        }
-
+                NCLog.log("Media upload: \(item.fileName) PUT completed, verifying remote size at \(fileServerURL)")
+                NCAPIController.sharedInstance().verifyUploadedFileSize(atServerURL: fileServerURL,
+                                                                          minimumBytes: 1,
+                                                                          forAccount: self.account) { verified, remoteBytes, verifyError in
+                    guard verified else {
+                        let reason = verifyError ?? String.localizedStringWithFormat(
+                            NSLocalizedString("Server stored “%@” as empty (%lld bytes).", comment: "Upload rejected after PROPFIND shows 0 bytes"),
+                            item.fileName,
+                            remoteBytes
+                        )
+                        NCLog.log("Media upload: PROPFIND rejected \(item.fileName) — \(reason)")
+                        self.uploadErrors.append(reason)
                         self.uploadGroup.leave()
+                        return
                     }
-                } else {
-                    NCAPIController.sharedInstance().shareFileOrFolder(forAccount: self.account,
-                                                                       atPath: filePath,
-                                                                       toRoom: self.room.token,
-                                                                       withTalkMetaData: talkMetaData,
-                                                                       withReferenceId: nil) { error in
-                        if let error {
-                            NCLog.log(String(format: "Failed to share file. Error: %@", error.localizedDescription))
-                            self.uploadErrors.append(error.localizedDescription)
-                        } else {
-                            self.uploadSuccess.append(item)
-                        }
 
-                        self.uploadGroup.leave()
-                    }
+                    NCLog.log("Media upload: \(item.fileName) verified on server (\(remoteBytes) bytes)")
+                    self.postUploadedFileToRoom(filePath: filePath, draftFolderPath: draftFolderPath, item: item)
                 }
             } else if nkError.errorCode == 404 || nkError.errorCode == 409 {
                 NCAPIController.sharedInstance().checkOrCreateAttachmentFolder(forAccount: self.account) { created, _ in
@@ -1121,6 +1142,58 @@ import MBProgressHUD
             } else {
                 NCLog.log(String(format: "Failed to upload file. Error: %@", nkError.errorDescription))
                 self.uploadErrors.append(nkError.errorDescription)
+                self.uploadGroup.leave()
+            }
+        }
+    }
+
+    private func postUploadedFileToRoom(filePath: String, draftFolderPath: String?, item: ShareItem) {
+        var talkMetaData: [String: Any] = [:]
+
+        let itemCaption = item.caption.trimmingCharacters(in: .whitespaces)
+        if !itemCaption.isEmpty {
+            talkMetaData["caption"] = itemCaption
+        }
+
+        if self.shareSilently {
+            talkMetaData["silent"] = self.shareSilently
+        }
+
+        if let thread = self.thread {
+            talkMetaData["threadId"] = thread.threadId
+        }
+
+        if let draftFolderPath {
+            NCAPIController.sharedInstance().postConversationAttachment(inRoom: self.room.token,
+                                                                        filePath: draftFolderPath,
+                                                                        fileName: item.fileName,
+                                                                        referenceId: nil,
+                                                                        talkMetaData: talkMetaData,
+                                                                        forAccount: self.account) { error in
+                if let error {
+                    NCLog.log("Failed to post attachment. Error: \(error.localizedDescription)")
+                    self.uploadErrors.append(error.localizedDescription)
+                } else {
+                    NCLog.log("Media upload: posted attachment \(item.fileName) to room \(self.room.token)")
+                    self.uploadSuccess.append(item)
+                }
+
+                self.uploadGroup.leave()
+            }
+        } else {
+            NCAPIController.sharedInstance().shareFileOrFolder(forAccount: self.account,
+                                                               atPath: filePath,
+                                                               toRoom: self.room.token,
+                                                               withTalkMetaData: talkMetaData,
+                                                               withReferenceId: nil) { error in
+                if let error {
+                    NCLog.log(String(format: "Failed to share file. Error: %@", error.localizedDescription))
+                    self.uploadErrors.append(error.localizedDescription)
+                } else {
+                    NCLog.log("Media upload: shared \(item.fileName) to room \(self.room.token)")
+                    self.uploadSuccess.append(item)
+                }
+
                 self.uploadGroup.leave()
             }
         }
@@ -1363,6 +1436,9 @@ import MBProgressHUD
     public func shareItemControllerItemsChanged(_ shareItemController: ShareItemController) {
         DispatchQueue.main.async {
             if shareItemController.shareItems.isEmpty && shareItemController.preparingItemCount == 0 {
+                if self.finishingSuccessfulUpload {
+                    return
+                }
                 if let extensionContext = self.extensionContext {
                     let error = NSError(domain: NSCocoaErrorDomain, code: 0)
                     extensionContext.cancelRequest(withError: error)

@@ -167,19 +167,26 @@ import UniformTypeIdentifiers
     public static func compressionLevel(forFileURL fileURL: URL) -> MediaUploadCompressionLevel {
         startMonitoringIfNeeded()
 
-        let moderateEstimate = MediaUploadPreprocessor.estimatedByteCount(at: fileURL, level: .moderate)
+        // Use on-disk size only. A full JPEG simulate-encode here used to run on the main
+        // thread during Send (Automatic), which can jetsam the app on large HEIC/photos —
+        // especially noticeable on iOS 18 / lower-RAM devices. Escalation thresholds still
+        // work well against original bytes.
+        let originalBytes = MediaUploadPreprocessor.fileSize(at: fileURL)
         let path = latestPath
         let isConstrainedCellular = path?.isExpensive == true || path?.isConstrained == true
             || path?.usesInterfaceType(.cellular) == true
 
-        if moderateEstimate > MediaUploadCompressionSettings.automaticMaxBytes {
+        if originalBytes > MediaUploadCompressionSettings.automaticMaxBytes {
+            NCLog.log("MediaUploadAutomaticPolicy: \(fileURL.lastPathComponent) → High (\(originalBytes) bytes > 16 MB)")
             return .high
         }
 
-        if isConstrainedCellular && moderateEstimate > MediaUploadCompressionSettings.automaticCellularEscalateBytes {
+        if isConstrainedCellular && originalBytes > MediaUploadCompressionSettings.automaticCellularEscalateBytes {
+            NCLog.log("MediaUploadAutomaticPolicy: \(fileURL.lastPathComponent) → High (cellular, \(originalBytes) bytes)")
             return .high
         }
 
+        NCLog.log("MediaUploadAutomaticPolicy: \(fileURL.lastPathComponent) → Moderate (\(originalBytes) bytes)")
         return .moderate
     }
 }
@@ -197,23 +204,44 @@ import UniformTypeIdentifiers
             return false
         }
 
-        guard let image = UIImage(contentsOfFile: sourceURL.path) else {
+        // Downsample via ImageIO to the target max dimension — never decode full-resolution
+        // HEIC/JPEG into memory (UIImage(contentsOfFile:) jetsams on large camera photos).
+        guard let image = previewImage(at: sourceURL, maxDimension: settings.imageMaxDimension)
+                ?? UIImage(contentsOfFile: sourceURL.path) else {
+            NCLog.log("MediaUploadPreprocessor: failed to decode image for compression at \(sourceURL.lastPathComponent)")
             return false
         }
 
-        guard let jpegData = compressedJPEGData(from: image, settings: settings) else {
+        guard let jpegData = compressedJPEGData(from: image, settings: settings), !jpegData.isEmpty else {
+            NCLog.log("MediaUploadPreprocessor: JPEG encode produced empty data for \(sourceURL.lastPathComponent)")
             return false
         }
+
+        // Never delete the source if destination is the same path.
+        let sourcePath = sourceURL.standardizedFileURL.path
+        let destinationPath = destinationURL.standardizedFileURL.path
+        let destinationIsSource = sourcePath == destinationPath
 
         do {
-            if FileManager.default.fileExists(atPath: destinationURL.path) {
+            if !destinationIsSource, FileManager.default.fileExists(atPath: destinationPath) {
                 try FileManager.default.removeItem(at: destinationURL)
             }
 
             try jpegData.write(to: destinationURL, options: .atomic)
+
+            let written = fileSize(at: destinationURL)
+            guard written > 0 else {
+                NCLog.log("MediaUploadPreprocessor: compressed image write left 0-byte file")
+                if !destinationIsSource {
+                    try? FileManager.default.removeItem(at: destinationURL)
+                }
+                return false
+            }
+
+            NCLog.log("MediaUploadPreprocessor: compressed image \(sourceURL.lastPathComponent) (\(fileSize(at: sourceURL)) → \(written) bytes)")
             return true
         } catch {
-            NSLog("MediaUploadPreprocessor: failed to write compressed image: \(error.localizedDescription)")
+            NCLog.log("MediaUploadPreprocessor: failed to write compressed image: \(error.localizedDescription)")
             return false
         }
     }
@@ -250,7 +278,7 @@ import UniformTypeIdentifiers
         }
 
         guard let exportSession = AVAssetExportSession(asset: asset, presetName: settings.avVideoPreset) else {
-            NSLog("MediaUploadPreprocessor: unable to create export session")
+            NCLog.log("MediaUploadPreprocessor: unable to create export session")
             completion(false)
             return
         }
@@ -287,15 +315,15 @@ import UniformTypeIdentifiers
 
                     guard compressedSize > 0, sourceSize == 0 || compressedSize < sourceSize else {
                         try? FileManager.default.removeItem(at: destinationURL)
-                        NSLog("MediaUploadPreprocessor: compressed video was not smaller; using original")
+                        NCLog.log("MediaUploadPreprocessor: compressed video was not smaller; using original")
                         completion(false)
                         return
                     }
 
-                    NSLog("MediaUploadPreprocessor: compressed video from \(sourceSize) to \(compressedSize) bytes")
+                    NCLog.log("MediaUploadPreprocessor: compressed video from \(sourceSize) to \(compressedSize) bytes")
                     completion(true)
                 case .failed, .cancelled:
-                    NSLog("MediaUploadPreprocessor: video export failed: \(exportSession.error?.localizedDescription ?? "unknown error")")
+                    NCLog.log("MediaUploadPreprocessor: video export failed: \(exportSession.error?.localizedDescription ?? "unknown error")")
                     completion(false)
                 default:
                     completion(false)

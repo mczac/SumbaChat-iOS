@@ -3070,6 +3070,30 @@ class NCAPIController: NSObject, NKCommonDelegate {
         }
     }
 
+    /// PROPFIND depth 0 — confirm remote DAV object exists and has non-zero size after PUT.
+    func verifyUploadedFileSize(atServerURL serverUrlFileName: String,
+                                minimumBytes: Int64 = 1,
+                                forAccount account: TalkAccount,
+                                completionBlock: @escaping (_ verified: Bool, _ remoteBytes: Int64, _ errorDescription: String?) -> Void) {
+        self.setupNCCommunication(forAccount: account)
+
+        let options = NKRequestOptions(timeout: TimeInterval(60), queue: .main)
+        NextcloudKit.shared.readFileOrFolder(serverUrlFileName: serverUrlFileName, depth: "0", showHiddenFiles: true, includeHiddenFiles: [], requestBody: nil, options: options) { _, files, _, error in
+            if error.errorCode != 0 {
+                completionBlock(false, 0, error.errorDescription)
+                return
+            }
+
+            guard let file = files.first else {
+                completionBlock(false, 0, "PROPFIND returned no file metadata")
+                return
+            }
+
+            let remoteBytes = Int64(file.size)
+            completionBlock(remoteBytes >= minimumBytes, remoteBytes, nil)
+        }
+    }
+
     func checkOrCreateAttachmentFolder(forAccount account: TalkAccount, completionBlock: @escaping (_ created: Bool, _ statusCode: Int) -> Void) {
         self.setupNCCommunication(forAccount: account)
 
