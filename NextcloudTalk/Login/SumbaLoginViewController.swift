@@ -22,20 +22,52 @@ import UIKit
         configuration.httpShouldSetCookies = false
         return URLSession(configuration: configuration)
     }()
-    private weak var activeTextField: UITextField?
 
-    private lazy var scrollView: UIScrollView = {
-        let view = UIScrollView()
-        view.translatesAutoresizingMaskIntoConstraints = false
-        view.keyboardDismissMode = .interactive
-        view.alwaysBounceVertical = false
-        return view
+    private lazy var logoImageView: UIImageView = {
+        let imageView = UIImageView(image: UIImage(named: "sumbaLoginLogo") ?? UIImage(systemName: "bubble.left.and.bubble.right.fill"))
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.contentMode = .scaleAspectFit
+        imageView.layer.cornerCurve = .continuous
+        imageView.clipsToBounds = true
+        // Compress first when vertical space is tight.
+        imageView.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        imageView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        return imageView
     }()
 
-    private lazy var contentView: UIView = {
-        let view = UIView()
-        view.translatesAutoresizingMaskIntoConstraints = false
-        return view
+    private lazy var logoContainer: UIView = {
+        let container = UIView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(logoImageView)
+        container.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        container.setContentHuggingPriority(.defaultLow, for: .vertical)
+        return container
+    }()
+
+    private lazy var titleLabel: UILabel = {
+        let label = UILabel()
+        label.font = .systemFont(ofSize: 32, weight: .heavy)
+        label.adjustsFontForContentSizeCategory = true
+        label.adjustsFontSizeToFitWidth = true
+        label.minimumScaleFactor = 0.75
+        label.textAlignment = .center
+        label.text = "SumbaChat"
+        label.setContentCompressionResistancePriority(.defaultHigh, for: .vertical)
+        return label
+    }()
+
+    private lazy var subtitleLabel: UILabel = {
+        let label = UILabel()
+        label.font = .preferredFont(forTextStyle: .subheadline)
+        label.adjustsFontForContentSizeCategory = true
+        label.textColor = .secondaryLabel
+        label.textAlignment = .center
+        label.numberOfLines = 1
+        label.adjustsFontSizeToFitWidth = true
+        label.minimumScaleFactor = 0.75
+        label.text = NSLocalizedString("Enter your username and password to continue", comment: "")
+        label.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        return label
     }()
 
     private lazy var usernameTextField = makeTextField(
@@ -43,6 +75,17 @@ import UIKit
         systemImage: "person.fill",
         contentType: .username
     )
+
+    private lazy var passwordVisibilityButton: UIButton = {
+        let button = UIButton(type: .system)
+        let symbolConfig = UIImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+        button.setImage(UIImage(systemName: "eye.slash", withConfiguration: symbolConfig), for: .normal)
+        button.tintColor = .secondaryLabel
+        button.frame = CGRect(x: 0, y: 0, width: 36, height: 52)
+        button.accessibilityLabel = NSLocalizedString("Show password", comment: "")
+        button.addTarget(self, action: #selector(togglePasswordVisibility), for: .touchUpInside)
+        return button
+    }()
 
     private lazy var passwordTextField: UITextField = {
         let field = makeTextField(
@@ -53,32 +96,30 @@ import UIKit
         field.isSecureTextEntry = true
         field.returnKeyType = .go
 
-        let button = UIButton(type: .system)
-        button.setImage(UIImage(systemName: "eye"), for: .normal)
-        button.tintColor = .secondaryLabel
-        button.frame = CGRect(x: 0, y: 0, width: 44, height: 44)
-        button.accessibilityLabel = NSLocalizedString("Show password", comment: "")
-        button.addTarget(self, action: #selector(togglePasswordVisibility), for: .touchUpInside)
-        field.rightView = button
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 40, height: 52))
+        passwordVisibilityButton.frame = CGRect(x: 0, y: 0, width: 36, height: 52)
+        container.addSubview(passwordVisibilityButton)
+        field.rightView = container
         field.rightViewMode = .always
         return field
     }()
 
     private lazy var loginButton: UIButton = {
         var configuration = UIButton.Configuration.filled()
-        configuration.title = NSLocalizedString("Sign in", comment: "")
-        configuration.cornerStyle = .medium
+        configuration.title = NSLocalizedString("Log in", comment: "")
+        configuration.cornerStyle = .large
         configuration.baseBackgroundColor = NCAppBranding.brandColor()
         configuration.baseForegroundColor = NCAppBranding.brandTextColor()
         configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
             var attributes = attributes
-            attributes.font = .preferredFont(forTextStyle: .headline)
+            attributes.font = .systemFont(ofSize: 18, weight: .semibold)
             return attributes
         }
 
         let button = UIButton(configuration: configuration)
         button.translatesAutoresizingMaskIntoConstraints = false
         button.addTarget(self, action: #selector(signIn), for: .touchUpInside)
+        button.setContentCompressionResistancePriority(.required, for: .vertical)
         return button
     }()
 
@@ -92,6 +133,46 @@ import UIKit
         label.isHidden = true
         label.accessibilityTraits = .staticText
         return label
+    }()
+
+    private lazy var copyrightLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .preferredFont(forTextStyle: .caption1)
+        label.textColor = .tertiaryLabel
+        label.textAlignment = .center
+        label.numberOfLines = 2
+        label.text = "\(copyright)\n\(licenseNotice)"
+        return label
+    }()
+
+    /// Prefer roomy gaps; Auto Layout may compress them when the keyboard is up.
+    private lazy var afterLogoSpacer = makeSpacer(preferred: 14, minimum: 6)
+    private lazy var afterTitleSpacer = makeSpacer(preferred: 6, minimum: 2)
+    private lazy var afterSubtitleSpacer = makeSpacer(preferred: 28, minimum: 8)
+    private lazy var afterUsernameSpacer = makeSpacer(preferred: 12, minimum: 8)
+    private lazy var beforeButtonSpacer = makeSpacer(preferred: 18, minimum: 8)
+
+    private lazy var formStack: UIStackView = {
+        let stack = UIStackView(arrangedSubviews: [
+            logoContainer,
+            afterLogoSpacer,
+            titleLabel,
+            afterTitleSpacer,
+            subtitleLabel,
+            afterSubtitleSpacer,
+            usernameTextField,
+            afterUsernameSpacer,
+            passwordTextField,
+            errorLabel,
+            beforeButtonSpacer,
+            loginButton
+        ])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .vertical
+        stack.alignment = .fill
+        stack.spacing = 0
+        return stack
     }()
 
     init(serverURL: String) {
@@ -109,9 +190,11 @@ import UIKit
         registerForKeyboardNotifications()
     }
 
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        usernameTextField.becomeFirstResponder()
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let side = logoImageView.bounds.width
+        guard side > 0 else { return }
+        logoImageView.layer.cornerRadius = min(18, side * 0.2)
     }
 
     deinit {
@@ -132,77 +215,69 @@ import UIKit
             )
         }
 
-        let titleLabel = UILabel()
-        titleLabel.font = .preferredFont(forTextStyle: .largeTitle)
-        titleLabel.adjustsFontForContentSizeCategory = true
-        titleLabel.textAlignment = .center
-        titleLabel.text = "SumbaChat"
+        view.addSubview(formStack)
+        view.addSubview(copyrightLabel)
 
-        let subtitleLabel = UILabel()
-        subtitleLabel.font = .preferredFont(forTextStyle: .body)
-        subtitleLabel.adjustsFontForContentSizeCategory = true
-        subtitleLabel.textColor = .secondaryLabel
-        subtitleLabel.textAlignment = .center
-        subtitleLabel.numberOfLines = 0
-        subtitleLabel.text = NSLocalizedString("Enter your username and password to continue.", comment: "")
+        let stackFillWidth = formStack.widthAnchor.constraint(equalTo: view.safeAreaLayoutGuide.widthAnchor, constant: -40)
+        stackFillWidth.priority = .defaultHigh
 
-        let serverLabel = UILabel()
-        serverLabel.font = .preferredFont(forTextStyle: .footnote)
-        serverLabel.textColor = .tertiaryLabel
-        serverLabel.textAlignment = .center
-        serverLabel.text = serverURL
+        // Prefer a roomy top inset; allow it to compress slightly on short screens.
+        let preferredTop = formStack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 24)
+        preferredTop.priority = .defaultHigh
+        let minimumTop = formStack.topAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.topAnchor, constant: 8)
 
-        let stack = UIStackView(arrangedSubviews: [
-            titleLabel,
-            subtitleLabel,
-            serverLabel,
-            usernameTextField,
-            passwordTextField,
-            errorLabel,
-            loginButton
-        ])
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.axis = .vertical
-        stack.spacing = 16
-        stack.setCustomSpacing(8, after: titleLabel)
-        stack.setCustomSpacing(4, after: subtitleLabel)
-        stack.setCustomSpacing(32, after: serverLabel)
-        stack.setCustomSpacing(12, after: usernameTextField)
-        stack.setCustomSpacing(24, after: passwordTextField)
+        // Keep the form clear of the keyboard. Compression happens on logo/spacers first.
+        let keyboardClearance = formStack.bottomAnchor.constraint(
+            lessThanOrEqualTo: view.keyboardLayoutGuide.topAnchor,
+            constant: -12
+        )
 
-        view.addSubview(scrollView)
-        scrollView.addSubview(contentView)
-        contentView.addSubview(stack)
+        let preferredLogoHeight = logoContainer.heightAnchor.constraint(equalToConstant: 88)
+        preferredLogoHeight.priority = .defaultHigh
+        let minimumLogoHeight = logoContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 52)
 
         NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            stackFillWidth,
+            preferredTop,
+            minimumTop,
+            formStack.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            formStack.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
+            formStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            formStack.widthAnchor.constraint(lessThanOrEqualToConstant: 520),
+            keyboardClearance,
 
-            contentView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
-            contentView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
-            contentView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
-            contentView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
-            contentView.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
-            contentView.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.frameLayoutGuide.heightAnchor),
+            preferredLogoHeight,
+            minimumLogoHeight,
+            logoImageView.heightAnchor.constraint(equalTo: logoContainer.heightAnchor),
+            logoImageView.widthAnchor.constraint(equalTo: logoImageView.heightAnchor),
+            logoImageView.centerXAnchor.constraint(equalTo: logoContainer.centerXAnchor),
+            logoImageView.centerYAnchor.constraint(equalTo: logoContainer.centerYAnchor),
 
-            stack.leadingAnchor.constraint(greaterThanOrEqualTo: contentView.safeAreaLayoutGuide.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: contentView.safeAreaLayoutGuide.trailingAnchor, constant: -24),
-            stack.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-            stack.widthAnchor.constraint(lessThanOrEqualToConstant: 480),
-            stack.centerYAnchor.constraint(equalTo: contentView.centerYAnchor, constant: -24),
-            stack.topAnchor.constraint(greaterThanOrEqualTo: contentView.topAnchor, constant: 32),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -32),
+            usernameTextField.heightAnchor.constraint(equalToConstant: 52),
+            passwordTextField.heightAnchor.constraint(equalToConstant: 52),
+            loginButton.heightAnchor.constraint(equalToConstant: 54),
 
-            usernameTextField.heightAnchor.constraint(greaterThanOrEqualToConstant: 56),
-            passwordTextField.heightAnchor.constraint(greaterThanOrEqualToConstant: 56),
-            loginButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 52)
+            copyrightLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
+            copyrightLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
+            copyrightLabel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12)
         ])
 
         let tapGesture = UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard))
         tapGesture.cancelsTouchesInView = false
         view.addGestureRecognizer(tapGesture)
+    }
+
+    private func makeSpacer(preferred: CGFloat, minimum: CGFloat) -> UIView {
+        let spacer = UIView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
+
+        let preferredHeight = spacer.heightAnchor.constraint(equalToConstant: preferred)
+        preferredHeight.priority = .defaultHigh
+        let minimumHeight = spacer.heightAnchor.constraint(greaterThanOrEqualToConstant: minimum)
+        NSLayoutConstraint.activate([preferredHeight, minimumHeight])
+        return spacer
     }
 
     private func makeTextField(placeholder: String,
@@ -213,7 +288,7 @@ import UIKit
         field.delegate = self
         field.placeholder = placeholder
         field.textContentType = contentType
-        field.font = .preferredFont(forTextStyle: .body)
+        field.font = .systemFont(ofSize: 18, weight: .regular)
         field.adjustsFontForContentSizeCategory = true
         field.autocorrectionType = .no
         field.autocapitalizationType = .none
@@ -224,13 +299,14 @@ import UIKit
         field.layer.cornerRadius = 12
         field.layer.borderWidth = 1
         field.layer.borderColor = UIColor.separator.cgColor
+        field.setContentCompressionResistancePriority(.required, for: .vertical)
 
         let icon = UIImageView(image: UIImage(systemName: systemImage))
         icon.tintColor = .secondaryLabel
         icon.contentMode = .scaleAspectFit
 
-        let container = UIView(frame: CGRect(x: 0, y: 0, width: 48, height: 56))
-        icon.frame = CGRect(x: 16, y: 18, width: 20, height: 20)
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 48, height: 52))
+        icon.frame = CGRect(x: 16, y: 16, width: 20, height: 20)
         container.addSubview(icon)
         field.leftView = container
         field.leftViewMode = .always
@@ -253,23 +329,27 @@ import UIKit
     }
 
     @objc private func keyboardWillChangeFrame(_ notification: Notification) {
-        guard let keyboardFrame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else {
+        guard let userInfo = notification.userInfo,
+              let keyboardFrame = userInfo[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else {
             return
         }
 
         let frameInView = view.convert(keyboardFrame, from: nil)
-        let overlap = max(0, view.bounds.maxY - frameInView.minY)
-        scrollView.contentInset.bottom = overlap
-        scrollView.verticalScrollIndicatorInsets.bottom = overlap
+        let keyboardVisible = frameInView.minY < view.bounds.maxY - 1
+        let duration = (userInfo[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
+        let curveRaw = (userInfo[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?.uintValue ?? 7
+        let options = UIView.AnimationOptions(rawValue: curveRaw << 16)
 
-        if let activeTextField {
-            scrollView.scrollRectToVisible(activeTextField.convert(activeTextField.bounds, to: scrollView).insetBy(dx: 0, dy: -24), animated: true)
+        UIView.animate(withDuration: duration, delay: 0, options: options) {
+            self.copyrightLabel.alpha = keyboardVisible ? 0 : 1
         }
     }
 
-    @objc private func keyboardWillHide() {
-        scrollView.contentInset.bottom = 0
-        scrollView.verticalScrollIndicatorInsets.bottom = 0
+    @objc private func keyboardWillHide(_ notification: Notification) {
+        let duration = (notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
+        UIView.animate(withDuration: duration) {
+            self.copyrightLabel.alpha = 1
+        }
     }
 
     @objc private func dismissKeyboard() {
@@ -278,8 +358,9 @@ import UIKit
 
     @objc private func togglePasswordVisibility(_ sender: UIButton) {
         passwordTextField.isSecureTextEntry.toggle()
-        let imageName = passwordTextField.isSecureTextEntry ? "eye" : "eye.slash"
-        sender.setImage(UIImage(systemName: imageName), for: .normal)
+        let imageName = passwordTextField.isSecureTextEntry ? "eye.slash" : "eye"
+        let symbolConfig = UIImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+        sender.setImage(UIImage(systemName: imageName, withConfiguration: symbolConfig), for: .normal)
         sender.accessibilityLabel = passwordTextField.isSecureTextEntry
             ? NSLocalizedString("Show password", comment: "")
             : NSLocalizedString("Hide password", comment: "")
@@ -403,20 +484,10 @@ import UIKit
 
         if loading {
             loginButton.configuration?.showsActivityIndicator = true
-            loginButton.configuration?.title = NSLocalizedString("Signing in…", comment: "")
+            loginButton.configuration?.title = NSLocalizedString("Logging in…", comment: "")
         } else {
             loginButton.configuration?.showsActivityIndicator = false
-            loginButton.configuration?.title = NSLocalizedString("Sign in", comment: "")
-        }
-    }
-
-    func textFieldDidBeginEditing(_ textField: UITextField) {
-        activeTextField = textField
-    }
-
-    func textFieldDidEndEditing(_ textField: UITextField) {
-        if activeTextField === textField {
-            activeTextField = nil
+            loginButton.configuration?.title = NSLocalizedString("Log in", comment: "")
         }
     }
 

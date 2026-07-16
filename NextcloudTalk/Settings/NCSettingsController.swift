@@ -711,7 +711,12 @@ public class NCSettingsController: NSObject {
             managedAccount?.deviceSignature = signature
             try? realm.commitWriteTransaction()
 
-            NCAPIController.sharedInstance().subscribeAccount(account, toPushServerWithCompletionBlock: { error in
+            NCAPIController.sharedInstance().subscribeToPushServer(
+                deviceIdentifier: deviceIdentifier,
+                deviceIdentifierSignature: signature,
+                userPublicKey: publicKey,
+                cloudId: account.accountId
+            ) { error in
                 guard error == nil else {
                     NCLog.log("Error while subscribing to Push Notification server. Error: \(error?.localizedDescription ?? "")")
                     NCLog.log("Push notification, public key: \(publicKey)")
@@ -733,7 +738,7 @@ public class NCSettingsController: NSObject {
                 NCLog.log("Subscribed to Push Notification server successfully.")
                 block?(true)
                 bgTask.stopBackgroundTask()
-            })
+            }
         })
 #else
         block?(true)

@@ -28,7 +28,11 @@ NSString * const licenseNotice = @"Based on Nextcloud Talk, licensed under GPLv3
 NSString * const bundleIdentifier = @"com.spl.SumbaChat";
 NSString * const groupIdentifier = @"group.com.spl.SumbaChat";
 NSString * const appsGroupIdentifier = @"group.com.spl.apps";
-NSString * const pushNotificationServer = @"https://push-notifications.nextcloud.com";
+#if DEBUG
+NSString * const pushNotificationServer = @"https://push-dev.example.com";
+#else
+NSString * const pushNotificationServer = @"https://push.example.com";
+#endif
 NSString * const privacyURL = @"https://nextcloud.com/privacy";
 BOOL const isBrandedApp = YES;
 BOOL const multiAccountEnabled = YES;

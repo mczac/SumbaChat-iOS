@@ -5,6 +5,26 @@ This list is intended to help users that have problems to receive talk notificat
 not be complete. Please contribute to this list as you gain new knowledge. Just create an issue with the 
 "notification" label or create a pull request for this document. 
 
+## SumbaChat push proxies
+
+SumbaChat uses its own APNs-compatible push proxies because its bundle identifier
+(`com.spl.SumbaChat`) cannot use the APNs credentials of the official Nextcloud
+Talk app:
+
+- Debug/Xcode builds: `https://push-dev.example.com`
+- Release/TestFlight/App Store builds: `https://push.example.com`
+
+After notification permission is granted and both the standard APNs and PushKit
+tokens are available, the app automatically registers every configured account
+with the proxy selected for its build configuration. The same proxy URL is sent
+to the Nextcloud notifications API; no proxy configuration is required on the
+iPhone.
+
+Installing a build with a different proxy URL causes the account to subscribe
+again when APNs supplies its tokens. During testing, verify both
+`Subscribed to NC server successfully.` and
+`Subscribed to Push Notification server successfully.` in the app log.
+
 # 📱 Users
 Please make sure you're using the latest version available on the AppStore. Push notifications are not available if you're compiling and installing the app yourself through XCode.
 

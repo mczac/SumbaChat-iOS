@@ -2437,20 +2437,46 @@ class NCAPIController: NSObject, NKCommonDelegate {
         }
     }
 
-    public func subscribeAccount(_ account: TalkAccount, toPushServerWithCompletionBlock completionBlock: @escaping (_ error: Error?) -> Void) {
+    public func subscribeToPushServer(
+        deviceIdentifier: String,
+        deviceIdentifierSignature: String,
+        userPublicKey: String,
+        cloudId: String,
+        withCompletionBlock completionBlock: @escaping (_ error: Error?) -> Void
+    ) {
         let urlString = "\(pushNotificationServer)/devices"
-        let parameters = [
-            "pushToken": NCKeyChainController.sharedInstance().combinedPushToken(),
-            "deviceIdentifier": account.deviceIdentifier,
-            "deviceIdentifierSignature": account.deviceSignature,
-            "userPublicKey": account.userPublicKey
+        guard let pushToken = NCKeyChainController.sharedInstance().combinedPushToken() else {
+            completionBlock(NSError(domain: NSCocoaErrorDomain, code: NSURLErrorBadURL))
+            return
+        }
+
+        // Use the NC registration response fields directly. talkAccount(forAccountId:)
+        // returns an unmanaged copy, so reading account.deviceIdentifier here can send
+        // stale/empty values while the logs show the fresh response.
+        let parameters: [String: String] = [
+            "pushToken": pushToken,
+            "deviceIdentifier": deviceIdentifier,
+            "deviceIdentifierSignature": deviceIdentifierSignature,
+            "userPublicKey": userPublicKey
         ]
 
-        NCPushProxySessionManager.shared.post(urlString, parameters: parameters, progress: nil) { _, _ in
-            completionBlock(nil)
-        } failure: { _, error in
-            completionBlock(error)
+        func subscribe(parameters: [String: String]) {
+            NCPushProxySessionManager.shared.post(urlString, parameters: parameters, progress: nil) { _, _ in
+                completionBlock(nil)
+            } failure: { task, error in
+                let statusCode = (task?.response as? HTTPURLResponse)?.statusCode
+                if statusCode == 409, parameters["cloudId"] == nil {
+                    NCLog.log("Push proxy registration conflict. Retrying with cloudId.")
+                    var retryParameters = parameters
+                    retryParameters["cloudId"] = cloudId
+                    subscribe(parameters: retryParameters)
+                } else {
+                    completionBlock(error)
+                }
+            }
         }
+
+        subscribe(parameters: parameters)
     }
 
     public func unsubscribeAccount(_ account: TalkAccount, fromPushServerWithCompletionBlock completionBlock: @escaping (_ error: Error?) -> Void) {
