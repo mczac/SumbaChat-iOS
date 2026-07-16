@@ -201,10 +201,8 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
         case ProfileSection.kProfileSectionSummary.rawValue:
             return summaryCellForRow(row: indexPath.row)
         case ProfileSection.kProfileSectionRemoveAccount.rawValue:
-            let actionTitle = multiAccountEnabled.boolValue ? NSLocalizedString("Remove account", comment: "") : NSLocalizedString("Log out", comment: "")
-            let actionImage = multiAccountEnabled.boolValue ?
-            UIImage(systemName: "trash")?.applyingSymbolConfiguration(iconConfiguration) :
-            UIImage(systemName: "arrow.right.square")?.applyingSymbolConfiguration(iconConfiguration)
+            let actionTitle = NSLocalizedString("Log out", comment: "")
+            let actionImage = UIImage(systemName: "arrow.right.square")?.applyingSymbolConfiguration(iconConfiguration)
             return actionCellWith(identifier: "RemoveAccountCellIdentifier", text: actionTitle, textColor: .systemRed, image: actionImage, tintColor: .systemRed)
         default:
             break

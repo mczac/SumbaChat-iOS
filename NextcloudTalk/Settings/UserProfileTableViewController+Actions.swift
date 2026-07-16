@@ -31,13 +31,12 @@ extension UserProfileTableViewController {
     }
 
     func showLogoutConfirmationDialog() {
-        let alertTitle = multiAccountEnabled.boolValue ? NSLocalizedString("Remove account", comment: "") : NSLocalizedString("Log out", comment: "")
-        let alertMessageAccountRemove = NSLocalizedString("Do you really want to remove this account?", comment: "")
-        let alertMessageAccountLogout = NSLocalizedString("Do you really want to log out from this account?", comment: "")
-        let alertMessage = multiAccountEnabled.boolValue ? alertMessageAccountRemove : alertMessageAccountLogout
-        let actionTitle = multiAccountEnabled.boolValue ? NSLocalizedString("Remove", comment: "") : NSLocalizedString("Log out", comment: "")
-        let confirmDialog = UIAlertController(title: alertTitle, message: alertMessage, preferredStyle: .alert)
-        let confirmAction = UIAlertAction(title: actionTitle, style: .destructive) { _ in
+        let confirmDialog = UIAlertController(
+            title: NSLocalizedString("Log out", comment: ""),
+            message: NSLocalizedString("Do you really want to log out from this account?", comment: ""),
+            preferredStyle: .alert
+        )
+        let confirmAction = UIAlertAction(title: NSLocalizedString("Log out", comment: ""), style: .destructive) { _ in
             self.logout()
         }
         confirmDialog.addAction(confirmAction)
