@@ -140,30 +140,40 @@ final class UnitShareItemStagingTest: XCTestCase {
         XCTAssertTrue(controller.shareItems.isEmpty)
     }
 
-    // MARK: - Manual chip heuristic (matches Ingmar’s – / 12.3 KB UI)
+    // MARK: - Manual chip cheap estimates (mixed bag)
 
-    func testHeuristicFloorWhenOriginalIsZero() {
-        // Mirrors ShareConfirmationViewController Manual chip labels.
-        XCTAssertEqual(Self.chipEstimate(original: 0, level: .moderate), 12_288)
-        XCTAssertEqual(Self.chipEstimate(original: 0, level: .high), 12_288)
-        // None chip shows “–” in UI when originalTotal == 0.
+    func testCheapImageEstimateUsesHeuristicNotFlatBag() throws {
+        let a = try writeJPEG(named: "a.jpg", size: CGSize(width: 64, height: 64))
+        let b = try writeJPEG(named: "b.jpg", size: CGSize(width: 64, height: 64))
+        let totals = MediaUploadPreprocessor.cheapEstimatedByteCounts(forFileURLs: [a, b])
+        let sizeA = try FileManager.default.attributesOfItem(atPath: a.path)[.size] as! NSNumber
+        let sizeB = try FileManager.default.attributesOfItem(atPath: b.path)[.size] as! NSNumber
+        let original = sizeA.int64Value + sizeB.int64Value
+        XCTAssertEqual(totals.none, original)
+        XCTAssertLessThan(totals.high, totals.moderate)
+        XCTAssertLessThanOrEqual(totals.moderate, totals.none)
+        // High should be well below a naive “22% of bag” only when… still ~22% for images; just ensure ladder.
+        XCTAssertGreaterThan(totals.moderate, 0)
     }
 
-    func testHeuristicScalesForRealOriginal() {
-        let original: Int64 = 1_000_000
-        XCTAssertEqual(Self.chipEstimate(original: original, level: .moderate), Int64(Double(original) * 0.62))
-        XCTAssertEqual(Self.chipEstimate(original: original, level: .high), Int64(Double(original) * 0.22))
-        XCTAssertLessThan(Self.chipEstimate(original: original, level: .high),
-                          Self.chipEstimate(original: original, level: .moderate))
+    func testCheapPassthroughForNonMedia() throws {
+        let pdf = scratchDir.appendingPathComponent("doc.pdf")
+        try Data(repeating: 0x41, count: 50_000).write(to: pdf)
+        let counts = MediaUploadPreprocessor.cheapEstimatedByteCounts(at: pdf)
+        XCTAssertEqual(counts.none, 50_000)
+        XCTAssertEqual(counts.moderate, 50_000)
+        XCTAssertEqual(counts.high, 50_000)
     }
 
-    private static func chipEstimate(original: Int64, level: MediaUploadCompressionLevel) -> Int64 {
-        switch level {
-        case .none: return original
-        case .moderate: return max(12_288, Int64(Double(original) * 0.62))
-        case .high: return max(12_288, Int64(Double(original) * 0.22))
-        @unknown default: return original
-        }
+    func testCheapMixedBagAddsPassthroughAndImage() throws {
+        let image = try writeJPEG(named: "pic.jpg", size: CGSize(width: 48, height: 48))
+        let other = scratchDir.appendingPathComponent("note.txt")
+        try Data("hello".utf8).write(to: other)
+        let totals = MediaUploadPreprocessor.cheapEstimatedByteCounts(forFileURLs: [image, other])
+        let imageCounts = MediaUploadPreprocessor.cheapEstimatedByteCounts(at: image)
+        XCTAssertEqual(totals.none, imageCounts.none + 5)
+        XCTAssertEqual(totals.moderate, imageCounts.moderate + 5)
+        XCTAssertEqual(totals.high, imageCounts.high + 5)
     }
 
     // MARK: - Cancel prepare (Send-path)

@@ -104,3 +104,6 @@ Unchanged (GIF skipped; pasted PNG data path unchanged).
 - **Loading media…:** spinner from `beginProviderLoad` (provider / iCloud)
   through local staging (`isBusyLoadingMedia`), then **Preparing…** on Send,
   then **Uploading**. Chips / Send / auto-dismiss wait until load finishes.
+- **Manual chip sizes:** per-item cheap estimates summed for mixed bags —
+  images: % heuristic; videos: duration × bitrate; audio/files: passthrough.
+  No JPEG simulate-encode in the Share Extension.

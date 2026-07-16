@@ -409,6 +409,51 @@ import UniformTypeIdentifiers
         return (none, none, none)
     }
 
+    /// Share Extension–safe chip labels: no JPEG simulate-encode (jetsam).
+    /// Images use % heuristics; videos use duration × preset bitrate; audio/files passthrough.
+    public static func cheapEstimatedByteCounts(at fileURL: URL, treatAsImage: Bool? = nil) -> (none: Int64, moderate: Int64, high: Int64) {
+        let extensionName = fileURL.pathExtension.lowercased()
+        let originalSize = fileSize(at: fileURL)
+        let none = originalSize
+
+        let looksLikeImage = treatAsImage ?? NCUtils.isImage(fileExtension: extensionName)
+        if looksLikeImage {
+            if extensionName == "gif" {
+                return (none, none, none)
+            }
+            let moderate = min(heuristicCompressedByteCount(originalSize: originalSize, level: .moderate), none)
+            let high = min(heuristicCompressedByteCount(originalSize: originalSize, level: .high), moderate)
+            return (none, moderate, high)
+        }
+
+        if isVideo(fileExtension: extensionName) {
+            let moderate = estimatedVideoByteCount(at: fileURL, level: .moderate, originalSize: originalSize)
+            let high = estimatedVideoByteCount(at: fileURL, level: .high, originalSize: originalSize)
+            return (none, moderate, min(high, moderate))
+        }
+
+        // Audio and other attachments are not recompressed on Send.
+        return (none, none, none)
+    }
+
+    /// Sum of `cheapEstimatedByteCounts` for a mixed bag (photos + videos + files).
+    public static func cheapEstimatedByteCounts(forFileURLs fileURLs: [URL]) -> (none: Int64, moderate: Int64, high: Int64) {
+        var none: Int64 = 0
+        var moderate: Int64 = 0
+        var high: Int64 = 0
+        for url in fileURLs {
+            let counts = cheapEstimatedByteCounts(at: url)
+            none += counts.none
+            moderate += counts.moderate
+            high += counts.high
+        }
+        // Keep the quality ladder readable even if one item's estimate is noisy.
+        high = min(high, moderate)
+        moderate = min(moderate, none)
+        high = min(high, moderate)
+        return (none, moderate, high)
+    }
+
     private static func estimatedImageByteCounts(at fileURL: URL, originalSize: Int64) -> (none: Int64, moderate: Int64, high: Int64) {
         let none = originalSize
 
@@ -493,26 +538,38 @@ import UniformTypeIdentifiers
 
     private static func estimatedVideoByteCount(at fileURL: URL, level: MediaUploadCompressionLevel, originalSize: Int64) -> Int64 {
         let asset = AVURLAsset(url: fileURL)
+        // Local staged copies usually already have duration; briefly wait if not yet loaded.
+        if asset.statusOfValue(forKey: "duration", error: nil) != .loaded {
+            let group = DispatchGroup()
+            group.enter()
+            asset.loadValuesAsynchronously(forKeys: ["duration"]) {
+                group.leave()
+            }
+            _ = group.wait(timeout: .now() + 0.4)
+        }
+
         let duration = CMTimeGetSeconds(asset.duration)
         guard duration.isFinite, duration > 0 else {
-            return originalSize
+            // Fall back to aggressive % so chips don't show near-original for High on movies.
+            return heuristicCompressedByteCount(originalSize: originalSize, level: level == .none ? .none : level)
         }
 
         // Approximate average video bitrates for export presets (bits/sec), plus AAC audio.
+        // Tuned toward typical AVAssetExportSession output (High/low is often well under 1 Mbps).
         let videoBitsPerSecond: Double
         switch level {
         case .none:
             return originalSize
         case .moderate:
-            videoBitsPerSecond = 2_500_000
+            videoBitsPerSecond = 2_500_000 // ~720p
         case .high:
-            videoBitsPerSecond = 800_000
+            videoBitsPerSecond = 600_000 // ~low preset
         @unknown default:
             return originalSize
         }
         let audioBitsPerSecond = 128_000.0
         let estimated = Int64((videoBitsPerSecond + audioBitsPerSecond) * duration / 8.0)
-        return min(estimated, originalSize)
+        return max(12_288, min(estimated, originalSize))
     }
 
     private static func pixelSize(of image: UIImage) -> CGSize {

@@ -564,8 +564,8 @@ import MBProgressHUD
         self.uploadTasks.removeAll()
         self.isPreparingForUpload = false
         self.isUploadingMedia = false
+        self.compressionOptionsView.isUserInteractionEnabled = true
         self.hideProgressHUD()
-        self.stopAnimatingSharingIndicator()
         self.updateSendButtonEnabledState()
     }
 
@@ -616,9 +616,11 @@ import MBProgressHUD
         self.isUploadingMedia = true
         self.updateSendButtonEnabledState()
 
+        // Media uses the center HUD only — no nav-bar spinner (avoids double spinners).
+        self.compressionOptionsView.isUserInteractionEnabled = false
+
         if mode == .noCompression {
             NCLog.log("Media upload: skipping compression (No Compression)")
-            self.startAnimatingSharingIndicator()
             self.showProgressHUD(phase: .uploading(count: mediaCount), progress: 0, overMedia: true)
             self.uploadAndShareFiles()
             return
@@ -626,7 +628,6 @@ import MBProgressHUD
 
         self.isPreparingForUpload = true
         self.textView.resignFirstResponder()
-        self.startAnimatingSharingIndicator()
         self.showProgressHUD(phase: .preparing, progress: 0, overMedia: true)
         NCLog.log("Media upload: preparing \(mediaCount) item(s) for compression")
 
@@ -660,8 +661,8 @@ import MBProgressHUD
             if self.mediaFlowCancelled {
                 NCLog.log("Media upload: prepare finished after cancel — skipping upload")
                 self.isUploadingMedia = false
+                self.compressionOptionsView.isUserInteractionEnabled = true
                 self.hideProgressHUD()
-                self.stopAnimatingSharingIndicator()
                 self.updateSendButtonEnabledState()
                 return
             }
@@ -715,22 +716,17 @@ import MBProgressHUD
             return
         }
 
-        // Cheap on-disk / heuristic sizes only. Full JPEG simulate-encode is too heavy for the
-        // Share Extension memory budget (Manual mode was closing the sheet before Send).
+        // Per-item cheap estimates (video: duration×bitrate; image: % heuristic; audio/files: passthrough),
+        // then summed. Avoids JPEG simulate-encode (Share Extension jetsam) and flat % on the whole bag.
         let items = self.shareItemController.shareItems
-        var originalTotal: Int64 = 0
-        for item in items {
-            guard let fileURL = item.fileURL,
-                  let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-                  let size = attrs[.size] as? NSNumber else { continue }
-            originalTotal += size.int64Value
-        }
+        let urls = items.compactMap(\.fileURL)
+        let totals = MediaUploadPreprocessor.cheapEstimatedByteCounts(forFileURLs: urls)
         let estimates: [MediaUploadCompressionLevel: Int64] = [
-            .none: originalTotal,
-            .moderate: max(12_288, Int64(Double(originalTotal) * 0.62)),
-            .high: max(12_288, Int64(Double(originalTotal) * 0.22))
+            .none: totals.none,
+            .moderate: totals.moderate,
+            .high: totals.high
         ]
-        NCLog.log("Media upload: Choose-on-upload chips shown for \(items.count) item(s), original=\(originalTotal) bytes")
+        NCLog.log("Media upload: Choose-on-upload chips for \(items.count) item(s) — none=\(totals.none) moderate=\(totals.moderate) high=\(totals.high)")
         self.applyCompressionChipTitles(estimates: estimates)
         self.view.layoutIfNeeded()
     }
@@ -1071,7 +1067,7 @@ import MBProgressHUD
                     DispatchQueue.main.async {
                         self.isUploadingMedia = false
                         self.isPreparingForUpload = false
-                        self.stopAnimatingSharingIndicator()
+                        self.compressionOptionsView.isUserInteractionEnabled = true
                         self.hideProgressHUD()
                         self.updateSendButtonEnabledState()
                         bgTask.stopBackgroundTask()
@@ -1144,7 +1140,7 @@ import MBProgressHUD
             self.isUploadingMedia = false
             self.isPreparingForUpload = false
             self.uploadTasks.removeAll()
-            self.stopAnimatingSharingIndicator()
+            self.compressionOptionsView.isUserInteractionEnabled = true
             self.hideProgressHUD()
             self.updateSendButtonEnabledState()
 
@@ -1163,6 +1159,8 @@ import MBProgressHUD
             } else {
                 // We remove the successfully uploaded items, so only the failed ones are kept
                 self.shareItemController.remove(self.uploadSuccess)
+                // Refresh chip labels from whatever is left (failed items only).
+                self.updateCompressionOptionsUI()
 
                 let alert = UIAlertController(title: NSLocalizedString("Upload failed", comment: ""),
                                               message: self.uploadErrors.joined(separator: "\n"),
@@ -1555,7 +1553,10 @@ import MBProgressHUD
                 // Make sure all changes are fully populated before we update our UI elements
                 self.shareCollectionView.layoutIfNeeded()
                 self.updateToolbarForCurrentItem()
-                self.updateCompressionOptionsUI()
+                // Don't refresh chip labels mid-Send — prepare replaces files and would show nonsense sizes.
+                if !self.isPreparingForUpload && !self.isUploadingMedia {
+                    self.updateCompressionOptionsUI()
+                }
                 self.pageControl.numberOfPages = shareItemController.shareItems.count
                 self.collectionViewScrollToEnd()
 
@@ -1574,7 +1575,9 @@ import MBProgressHUD
             self.updateSendButtonEnabledState()
             self.textDidUpdate(false)
             // Load + staging finished — reveal Choose-on-upload chips without mid-copy JPEG work.
-            if !shareItemController.isBusyLoadingMedia {
+            if !shareItemController.isBusyLoadingMedia
+                && !self.isPreparingForUpload
+                && !self.isUploadingMedia {
                 self.updateCompressionOptionsUI()
             }
         }
