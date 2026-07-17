@@ -546,9 +546,9 @@ import UniformTypeIdentifiers
             let medium: Int64
             let high: Int64
             if let duration, duration > 0 {
-                low = MediaUploadDebugSettings.estimatedVideoBytes(profile: lowP, durationSeconds: duration, originalSize: originalSize)
-                medium = MediaUploadDebugSettings.estimatedVideoBytes(profile: medP, durationSeconds: duration, originalSize: originalSize)
-                high = MediaUploadDebugSettings.estimatedVideoBytes(profile: highP, durationSeconds: duration, originalSize: originalSize)
+                low = MediaUploadDebugSettings.estimatedVideoBytes(at: fileURL, profile: lowP, durationSeconds: duration, originalSize: originalSize)
+                medium = MediaUploadDebugSettings.estimatedVideoBytes(at: fileURL, profile: medP, durationSeconds: duration, originalSize: originalSize)
+                high = MediaUploadDebugSettings.estimatedVideoBytes(at: fileURL, profile: highP, durationSeconds: duration, originalSize: originalSize)
             } else {
                 low = heuristicCompressedByteCount(originalSize: originalSize, level: .low)
                 medium = heuristicCompressedByteCount(originalSize: originalSize, level: .medium)

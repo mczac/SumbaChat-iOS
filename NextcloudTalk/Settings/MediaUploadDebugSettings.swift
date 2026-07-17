@@ -158,10 +158,96 @@ import UniformTypeIdentifiers
         return max(0.05, total - 0.128)
     }
 
-    /// Target Mbps for a profile under the current video engine.
+    /// Effective MB/s for Writer: min(profile rate, profileMaxBytes / duration).
+    public static func effectiveRateMBps(profile: MediaUploadProfileConfig, durationSeconds: Double) -> Double {
+        let base = max(0.01, profile.videoRateMBps)
+        guard durationSeconds.isFinite, durationSeconds > 0 else { return base }
+        let capped = Double(profile.videoMaxBytes) / (durationSeconds * 1_048_576.0)
+        return min(base, max(0.01, capped))
+    }
+
+    private static let estimateCacheLock = NSLock()
+    private static var estimateCache: [String: (bytes: Int64, at: Date)] = [:]
+    private static let estimateCacheTTL: TimeInterval = 30
+
+    /// Maps Debug preset keys to `AVAssetExportSession` preset names.
+    public static func avExportPresetName(forKey key: String) -> String {
+        switch key {
+        case "medium": return AVAssetExportPresetMediumQuality
+        case "high": return AVAssetExportPresetHighestQuality
+        case "480p": return AVAssetExportPreset640x480
+        case "540p": return AVAssetExportPreset960x540
+        case "720p": return AVAssetExportPreset1280x720
+        case "1080p": return AVAssetExportPreset1920x1080
+        case "2160p": return AVAssetExportPreset3840x2160
+        default: return AVAssetExportPresetLowQuality
+        }
+    }
+
+    /// Apple's asset-aware ExportSession size estimate (better than Mbps guests). Cached ~30s.
+    /// nil / failure → caller should prefer compress (don't skip on a bad guess).
+    public static func appleEstimatedExportBytes(at fileURL: URL, presetKey: String, timeout: TimeInterval = 0.85) -> Int64? {
+        let original = MediaUploadPreprocessor.fileSizePublic(at: fileURL)
+        let cacheKey = "\(fileURL.path)|\(presetKey)|\(original)"
+        estimateCacheLock.lock()
+        if let hit = estimateCache[cacheKey], Date().timeIntervalSince(hit.at) < estimateCacheTTL, hit.bytes > 0 {
+            let cached = hit.bytes
+            estimateCacheLock.unlock()
+            return cached
+        }
+        estimateCacheLock.unlock()
+
+        let presetName = avExportPresetName(forKey: presetKey)
+        let asset = AVURLAsset(url: fileURL)
+        if asset.statusOfValue(forKey: "duration", error: nil) != .loaded {
+            let g = DispatchGroup()
+            g.enter()
+            asset.loadValuesAsynchronously(forKeys: ["duration"]) { g.leave() }
+            _ = g.wait(timeout: .now() + 0.35)
+        }
+        let duration = asset.duration
+        guard duration.isValid, !duration.isIndefinite, CMTimeGetSeconds(duration) > 0 else { return nil }
+        guard let session = AVAssetExportSession(asset: asset, presetName: presetName) else { return nil }
+
+        session.timeRange = CMTimeRange(start: .zero, duration: duration)
+        session.outputFileType = .mp4
+        session.shouldOptimizeForNetworkUse = true
+
+        let group = DispatchGroup()
+        group.enter()
+        var estimated: Int64 = 0
+        var estimateError: Error?
+        session.estimateOutputFileLength { length, error in
+            estimated = length
+            estimateError = error
+            group.leave()
+        }
+        if group.wait(timeout: .now() + timeout) == .timedOut {
+            NCLog.log("MediaUploadHeuristic AppleEstimate TIMEOUT \(fileURL.lastPathComponent) preset=\(presetKey)")
+            return nil
+        }
+        if let estimateError {
+            NCLog.log("MediaUploadHeuristic AppleEstimate ERROR \(fileURL.lastPathComponent) preset=\(presetKey): \(estimateError.localizedDescription)")
+            return nil
+        }
+        guard estimated > 0 else {
+            NCLog.log("MediaUploadHeuristic AppleEstimate ZERO \(fileURL.lastPathComponent) preset=\(presetKey)")
+            return nil
+        }
+
+        estimateCacheLock.lock()
+        estimateCache[cacheKey] = (estimated, Date())
+        estimateCacheLock.unlock()
+
+        NCLog.log(String(format:
+            "MediaUploadHeuristic AppleEstimate %@ preset=%@ → %lld (%.2f MB) original=%lld",
+            fileURL.lastPathComponent, presetKey, estimated, Double(estimated) / 1_048_576.0, original))
+        return estimated
+    }
+
+    /// Target Mbps for a profile under the current video engine (Writer rate or preset guestimate).
     public static func targetVideoMbps(profile: MediaUploadProfileConfig, durationSeconds: Double) -> Double {
         if shared().usesAssetWriter {
-            // Writer Debug rate is MB/s → Mbps × 8.
             return effectiveRateMBps(profile: profile, durationSeconds: durationSeconds) * 8.0
         }
         return guestimatedExportPresetMbps(profile.exportPreset)
@@ -170,11 +256,19 @@ import UniformTypeIdentifiers
     public static func estimatedVideoBytes(profile: MediaUploadProfileConfig, durationSeconds: Double, originalSize: Int64) -> Int64 {
         let mbps = targetVideoMbps(profile: profile, durationSeconds: durationSeconds)
         let estimated = Int64(mbps * durationSeconds * 1_000_000.0 / 8.0)
-        // HighestQuality / huge presets: never claim below original for chip math.
         if !shared().usesAssetWriter, profile.exportPreset == "high" {
             return originalSize > 0 ? originalSize : max(12_288, estimated)
         }
         return max(12_288, min(estimated, originalSize > 0 ? originalSize : estimated))
+    }
+
+    /// URL-aware estimate: Apple ExportSession estimate when engine is presets.
+    public static func estimatedVideoBytes(at fileURL: URL, profile: MediaUploadProfileConfig, durationSeconds: Double, originalSize: Int64) -> Int64 {
+        if !shared().usesAssetWriter,
+           let apple = appleEstimatedExportBytes(at: fileURL, presetKey: profile.exportPreset) {
+            return max(12_288, min(apple, originalSize > 0 ? originalSize : apple))
+        }
+        return estimatedVideoBytes(profile: profile, durationSeconds: durationSeconds, originalSize: originalSize)
     }
 
     /// Whether compressing this video at `level` is likely to shrink (≥10% smaller).
@@ -204,17 +298,45 @@ import UniformTypeIdentifiers
 
         let sourceTotalMbps = approximateSourceTotalMbps(fileBytes: original, durationSeconds: duration)
         let sourceVideoMbps = approximateSourceVideoMbps(fileBytes: original, durationSeconds: duration)
+        let thresholdBytes = Int64(Double(original) * shrinkEnableMargin)
+
+        // ExportSession: prefer Apple's asset-aware estimate over Mbps guests.
+        if !shared().usesAssetWriter {
+            if let appleBytes = appleEstimatedExportBytes(at: fileURL, presetKey: profile.exportPreset) {
+                let willShrink = appleBytes < thresholdBytes
+                let appleMbps = approximateSourceTotalMbps(fileBytes: appleBytes, durationSeconds: duration)
+                NCLog.log(String(format:
+                    "MediaUploadHeuristic video %@ level=%ld engine=preset:%@ duration=%.2fs original=%lld (%.2f MB, %.3fMbps) AppleEstimate=%lld (%.2f MB, %.3fMbps) threshold=%lld → %@ (apple)",
+                    fileURL.lastPathComponent,
+                    level.rawValue,
+                    profile.exportPreset,
+                    duration,
+                    original,
+                    Double(original) / 1_048_576.0,
+                    sourceTotalMbps,
+                    appleBytes,
+                    Double(appleBytes) / 1_048_576.0,
+                    appleMbps,
+                    thresholdBytes,
+                    willShrink ? "compress" : "skip"))
+                return willShrink
+            }
+            // Estimate failed: do NOT skip on guestimate alone — prefer compress (keep-if-smaller).
+            NCLog.log(String(format:
+                "MediaUploadHeuristic video %@ level=%ld engine=preset:%@ AppleEstimate unavailable → compress=YES (safe fallback)",
+                fileURL.lastPathComponent, level.rawValue, profile.exportPreset))
+            return true
+        }
+
         let targetMbps = targetVideoMbps(profile: profile, durationSeconds: duration)
         let expectedBytes = estimatedVideoBytes(profile: profile, durationSeconds: duration, originalSize: original)
         let thresholdMbps = sourceVideoMbps * shrinkEnableMargin
         let willShrink = targetMbps < thresholdMbps
 
-        let engine = shared().usesAssetWriter ? "writer" : "preset:\(profile.exportPreset)"
         NCLog.log(String(format:
-            "MediaUploadHeuristic video %@ level=%ld engine=%@ duration=%.2fs original=%lld (%.2f MB) sourceTotal=%.3fMbps sourceVideo=%.3fMbps target=%.3fMbps threshold=%.3fMbps expected=%lld (%.2f MB) → %@",
+            "MediaUploadHeuristic video %@ level=%ld engine=writer duration=%.2fs original=%lld (%.2f MB) sourceTotal=%.3fMbps sourceVideo=%.3fMbps target=%.3fMbps threshold=%.3fMbps expected=%lld (%.2f MB) → %@",
             fileURL.lastPathComponent,
             level.rawValue,
-            engine,
             duration,
             original,
             Double(original) / 1_048_576.0,

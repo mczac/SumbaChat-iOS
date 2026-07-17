@@ -124,5 +124,6 @@ Unchanged (GIF skipped; pasted PNG data path unchanged).
   image/video in the bag is likely ≥10% smaller. On Send, each item that would
   not shrink **skips** that level (as-is); encode still keeps original if not
   smaller. Chip labels sum **per-item** compress-or-original the same way.
-- **Debug ExportSession presets:** picker/row shows guestimated Mbps
-  (community figures, not Apple contracts).
+- **ExportSession harden:** skip/compress and chip video sizes prefer Apple
+  `estimateOutputFileLength` (cached); Mbps guest table only for Debug labels /
+  Writer-unrelated UI. If Apple estimate fails → **compress** (never skip on guest alone).

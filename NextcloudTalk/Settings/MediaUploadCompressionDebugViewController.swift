@@ -104,7 +104,7 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
             if usesWriter {
                 return NSLocalizedString("Video rate is MB/s. Max MB caps long clips. Image settings always apply.", comment: "")
             }
-            return NSLocalizedString("Video uses the ExportSession preset only. Guestimated bitrates are shown on each preset (not Apple contracts). Image JPEG settings still apply.", comment: "")
+            return NSLocalizedString("Video uses ExportSession presets. Skip/compress uses Apple estimateOutputFileLength when available (Mbps guests only as last resort). Guestimated Mbps still shown on presets for reference.", comment: "")
         default:
             return nil
         }
