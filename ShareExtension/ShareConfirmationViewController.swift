@@ -542,6 +542,8 @@ import MBProgressHUD
 
     @objc private func compressionOptionPressed(_ sender: UIButton) {
         guard let level = MediaUploadCompressionLevel(rawValue: sender.tag) else { return }
+        let urls = self.shareItemController.shareItems.compactMap(\.fileURL)
+        guard MediaUploadDebugSettings.compressionLevelLikelyUseful(level, forFileURLs: urls) else { return }
         self.chosenCompressionLevel = level
         self.updateCompressionOptionsUI()
     }
@@ -727,7 +729,7 @@ import MBProgressHUD
             return
         }
 
-        // Per-item cheap estimates from Debug rates (video: rate×duration; image: quality heuristic).
+        // Per-item cheap estimates from Debug rates (video: rate×duration or preset Mbps; image: quality heuristic).
         let items = self.shareItemController.shareItems
         let urls = items.compactMap(\.fileURL)
         let totals = MediaUploadPreprocessor.cheapEstimatedByteCounts(forFileURLs: urls)
@@ -737,12 +739,25 @@ import MBProgressHUD
             .medium: totals.medium,
             .high: totals.high
         ]
-        NCLog.log("Media upload: Choose-on-upload chips for \(items.count) item(s) — none=\(totals.none) low=\(totals.low) medium=\(totals.medium) high=\(totals.high)")
-        self.applyCompressionChipTitles(estimates: estimates)
+
+        let enabled: Set<MediaUploadCompressionLevel> = Set(
+            [MediaUploadCompressionLevel.none, .low, .medium, .high].filter {
+                MediaUploadDebugSettings.compressionLevelLikelyUseful($0, forFileURLs: urls)
+            }
+        )
+
+        // If the selected level can't shrink, fall back to None.
+        if !enabled.contains(self.chosenCompressionLevel) {
+            self.chosenCompressionLevel = .none
+        }
+
+        NCLog.log("Media upload: Choose-on-upload chips for \(items.count) item(s) — none=\(totals.none) low=\(totals.low) medium=\(totals.medium) high=\(totals.high) enabled=\(enabled.map(\.rawValue).sorted())")
+        self.applyCompressionChipTitles(estimates: estimates, enabled: enabled)
         self.view.layoutIfNeeded()
     }
 
-    private func applyCompressionChipTitles(estimates: [MediaUploadCompressionLevel: Int64]) {
+    private func applyCompressionChipTitles(estimates: [MediaUploadCompressionLevel: Int64],
+                                            enabled: Set<MediaUploadCompressionLevel>) {
         let elementColor = NCAppBranding.elementColor()
         for case let button as UIButton in self.compressionOptionsView.arrangedSubviews {
             guard let level = MediaUploadCompressionLevel(rawValue: button.tag) else { continue }
@@ -750,17 +765,19 @@ import MBProgressHUD
             let title = "\(self.title(for: level))\n\(self.sizeLabel(for: level, estimated: estimated))"
             button.setTitle(title, for: .normal)
 
-            let selected = level == self.chosenCompressionLevel
+            let isEnabled = enabled.contains(level)
+            button.isEnabled = isEnabled
+            button.alpha = isEnabled ? 1.0 : 0.4
+
+            let selected = isEnabled && level == self.chosenCompressionLevel
             if selected {
-                // Solid brand fill + white label reads clearly in light and dark mode
-                // (blue-on-near-black outline was too low-contrast in dark mode).
                 button.backgroundColor = elementColor
                 button.layer.borderColor = elementColor.cgColor
                 button.setTitleColor(.white, for: .normal)
             } else {
                 button.backgroundColor = .secondarySystemBackground
                 button.layer.borderColor = UIColor.separator.cgColor
-                button.setTitleColor(.label, for: .normal)
+                button.setTitleColor(isEnabled ? .label : .tertiaryLabel, for: .normal)
             }
         }
     }

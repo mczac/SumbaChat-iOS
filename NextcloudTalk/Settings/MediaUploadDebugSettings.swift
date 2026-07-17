@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
+import AVFoundation
 import Foundation
+import CoreMedia
 
 /// Video encode backend for Build 9 debug.
 @objc public enum MediaUploadVideoEngine: Int {
@@ -119,18 +121,99 @@ import Foundation
         }
     }
 
-    /// Effective MB/s for a clip: min(profile rate, profileMaxBytes / duration).
-    public static func effectiveRateMBps(profile: MediaUploadProfileConfig, durationSeconds: Double) -> Double {
-        let base = max(0.01, profile.videoRateMBps)
-        guard durationSeconds.isFinite, durationSeconds > 0 else { return base }
-        let capped = Double(profile.videoMaxBytes) / (durationSeconds * 1_048_576.0)
-        return min(base, max(0.01, capped))
+    /// Need ~10% savings before offering a compress chip (estimate slack).
+    public static let shrinkEnableMargin: Double = 0.9
+
+    /// Community / empirical Mbps guesses for ExportSession presets (not Apple contracts).
+    public static func guestimatedExportPresetMbps(_ presetKey: String) -> Double {
+        switch presetKey {
+        case "low": return 0.15
+        case "medium": return 0.7
+        case "high": return 8.0 // HighestQuality — often near source; treat as mild
+        case "480p": return 1.5
+        case "540p": return 2.5
+        case "720p": return 4.0
+        case "1080p": return 8.0
+        case "2160p": return 20.0
+        default: return 2.0
+        }
+    }
+
+    public static func guestimatedExportPresetLabel(_ presetKey: String) -> String {
+        let mbps = guestimatedExportPresetMbps(presetKey)
+        return String(format: "~%.2f Mbps", mbps)
+    }
+
+    /// File bytes → approx total Mbps for duration (includes audio + container).
+    public static func approximateSourceTotalMbps(fileBytes: Int64, durationSeconds: Double) -> Double {
+        guard fileBytes > 0, durationSeconds.isFinite, durationSeconds > 0.05 else { return 0 }
+        return (Double(fileBytes) * 8.0) / durationSeconds / 1_000_000.0
+    }
+
+    /// Rough video-only Mbps after subtracting typical AAC.
+    public static func approximateSourceVideoMbps(fileBytes: Int64, durationSeconds: Double) -> Double {
+        let total = approximateSourceTotalMbps(fileBytes: fileBytes, durationSeconds: durationSeconds)
+        return max(0.05, total - 0.128)
+    }
+
+    /// Target Mbps for a profile under the current video engine.
+    public static func targetVideoMbps(profile: MediaUploadProfileConfig, durationSeconds: Double) -> Double {
+        if shared().usesAssetWriter {
+            // Writer Debug rate is MB/s → Mbps × 8.
+            return effectiveRateMBps(profile: profile, durationSeconds: durationSeconds) * 8.0
+        }
+        return guestimatedExportPresetMbps(profile.exportPreset)
     }
 
     public static func estimatedVideoBytes(profile: MediaUploadProfileConfig, durationSeconds: Double, originalSize: Int64) -> Int64 {
-        let rate = effectiveRateMBps(profile: profile, durationSeconds: durationSeconds)
-        let estimated = Int64(rate * durationSeconds * 1_048_576.0)
+        let mbps = targetVideoMbps(profile: profile, durationSeconds: durationSeconds)
+        let estimated = Int64(mbps * durationSeconds * 1_000_000.0 / 8.0)
+        // HighestQuality / huge presets: never claim below original for chip math.
+        if !shared().usesAssetWriter, profile.exportPreset == "high" {
+            return originalSize > 0 ? originalSize : max(12_288, estimated)
+        }
         return max(12_288, min(estimated, originalSize > 0 ? originalSize : estimated))
+    }
+
+    /// Whether compressing this video at `level` is likely to shrink (≥10% smaller).
+    public static func videoCompressionLikelyShrinks(at fileURL: URL, level: MediaUploadCompressionLevel) -> Bool {
+        guard level != .none else { return true }
+        guard let profile = shared().profile(for: level) else { return false }
+        let original = MediaUploadPreprocessor.fileSizePublic(at: fileURL)
+        guard original > 0 else { return false }
+
+        let asset = AVURLAsset(url: fileURL)
+        if asset.statusOfValue(forKey: "duration", error: nil) != .loaded {
+            let group = DispatchGroup()
+            group.enter()
+            asset.loadValuesAsynchronously(forKeys: ["duration"]) {
+                group.leave()
+            }
+            _ = group.wait(timeout: .now() + 0.4)
+        }
+        let duration = CMTimeGetSeconds(asset.duration)
+        // Short clips: container overhead dominates — allow compress (post-encode still guards).
+        guard duration.isFinite, duration > 2.0 else { return true }
+
+        let sourceMbps = approximateSourceVideoMbps(fileBytes: original, durationSeconds: duration)
+        let targetMbps = targetVideoMbps(profile: profile, durationSeconds: duration)
+        return targetMbps < sourceMbps * shrinkEnableMargin
+    }
+
+    /// Manual chip gate for a mixed bag: None always; other levels need every video to likely shrink.
+    public static func compressionLevelLikelyUseful(_ level: MediaUploadCompressionLevel, forFileURLs fileURLs: [URL]) -> Bool {
+        if level == .none { return true }
+        var sawVideo = false
+        for url in fileURLs {
+            let ext = url.pathExtension.lowercased()
+            guard MediaUploadPreprocessor.isVideo(fileExtension: ext) else { continue }
+            sawVideo = true
+            if !videoCompressionLikelyShrinks(at: url, level: level) {
+                return false
+            }
+        }
+        // Photos-only (or non-video): keep levels enabled.
+        return true
     }
 
     @objc(sharedSettings)

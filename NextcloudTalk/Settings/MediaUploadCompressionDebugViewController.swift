@@ -104,7 +104,7 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
             if usesWriter {
                 return NSLocalizedString("Video rate is MB/s. Max MB caps long clips. Image settings always apply.", comment: "")
             }
-            return NSLocalizedString("Video uses the ExportSession preset only. Image JPEG settings still apply.", comment: "")
+            return NSLocalizedString("Video uses the ExportSession preset only. Guestimated bitrates are shown on each preset (not Apple contracts). Image JPEG settings still apply.", comment: "")
         default:
             return nil
         }
@@ -174,7 +174,8 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
             case .imageMaxEdge:
                 cell.textLabel?.text = "Image max edge: \(profile.imageMaxDimension) px"
             case .exportPreset:
-                cell.textLabel?.text = "Video preset: \(readablePreset(profile.exportPreset))"
+                let guess = MediaUploadDebugSettings.guestimatedExportPresetLabel(profile.exportPreset)
+                cell.textLabel?.text = "Video preset: \(readablePreset(profile.exportPreset)) (\(guess))"
             }
         }
     }
@@ -315,9 +316,14 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
             ("1080p", "1920×1080"),
             ("2160p", "3840×2160")
         ]
-        let sheet = UIAlertController(title: "Video preset", message: nil, preferredStyle: .actionSheet)
+        let sheet = UIAlertController(
+            title: "Video preset",
+            message: "Guestimated average bitrate (community figures, not Apple docs).",
+            preferredStyle: .actionSheet
+        )
         for (key, title) in presets {
-            sheet.addAction(UIAlertAction(title: title, style: .default) { _ in
+            let guess = MediaUploadDebugSettings.guestimatedExportPresetLabel(key)
+            sheet.addAction(UIAlertAction(title: "\(title)  \(guess)", style: .default) { _ in
                 var profile = self.settings[keyPath: keyPath]
                 profile.exportPreset = key
                 self.settings[keyPath: keyPath] = profile

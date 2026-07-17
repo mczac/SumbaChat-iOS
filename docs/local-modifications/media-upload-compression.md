@@ -120,3 +120,8 @@ Unchanged (GIF skipped; pasted PNG data path unchanged).
 - **Video:** default `AVAssetWriter` (bitrate + size + fps); falls back to
   `AVAssetExportSession` on failure. Preset mode uses Apple size/quality presets
   (`640x480`, `960x540`, `1280x720`, … — not fictional 1024×576 / 854×480).
+- **Manual chip gating:** None always enabled; Low/Medium/High only if every
+  video in the bag is likely ≥10% smaller (source Mbps vs Writer rate or
+  guestimated preset Mbps). Post-encode still keeps original if not smaller.
+- **Debug ExportSession presets:** picker/row shows guestimated Mbps
+  (community figures, not Apple contracts).

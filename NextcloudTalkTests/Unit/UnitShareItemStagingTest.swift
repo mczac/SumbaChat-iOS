@@ -226,9 +226,19 @@ final class UnitShareItemStagingTest: XCTestCase {
 
     func testEffectiveRateRespectsMaxBytesCap() {
         let profile = MediaUploadProfileConfig.defaultHigh
-        // 200s at 0.12 MB/s would be 24 MB; cap is 12 MB → rate ≤ 0.06
+        // 200s at 0.12 MB/s would be 24 MB; cap is 12 MB → rate ≤ 0.06 MB/s
         let rate = MediaUploadDebugSettings.effectiveRateMBps(profile: profile, durationSeconds: 200)
         XCTAssertLessThanOrEqual(rate, 0.12)
         XCTAssertEqual(rate, 12.0 / 200.0, accuracy: 0.001)
+    }
+
+    func testPresetGuestimateLabels() {
+        XCTAssertEqual(MediaUploadDebugSettings.guestimatedExportPresetMbps("low"), 0.15, accuracy: 0.001)
+        XCTAssertEqual(MediaUploadDebugSettings.guestimatedExportPresetMbps("medium"), 0.7, accuracy: 0.001)
+        XCTAssertTrue(MediaUploadDebugSettings.guestimatedExportPresetLabel("720p").contains("4.00"))
+    }
+
+    func testCompressionLevelNoneAlwaysUseful() {
+        XCTAssertTrue(MediaUploadDebugSettings.compressionLevelLikelyUseful(.none, forFileURLs: []))
     }
 }
