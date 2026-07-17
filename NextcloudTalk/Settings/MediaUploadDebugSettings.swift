@@ -19,7 +19,7 @@ import Foundation
     public var videoMaxBytes: Int64
     public var videoMaxEdge: Int
     public var videoFPS: Double
-    /// ExportSession preset key when engine is presets: low, medium, 480p, 540p, 720p, 1080p.
+    /// ExportSession preset key: low, medium, high, 480p, 540p, 720p, 1080p, 2160p.
     public var exportPreset: String
 
     public init(imageMaxDimension: Int,

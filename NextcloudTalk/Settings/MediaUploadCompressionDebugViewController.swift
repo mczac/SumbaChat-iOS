@@ -183,10 +183,12 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
         switch key {
         case "low": return "LowQuality"
         case "medium": return "MediumQuality"
+        case "high": return "HighestQuality"
         case "480p": return "640×480"
         case "540p": return "960×540"
         case "720p": return "1280×720"
         case "1080p": return "1920×1080"
+        case "2160p": return "3840×2160"
         default: return key
         }
     }
@@ -306,10 +308,12 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
         let presets: [(String, String)] = [
             ("low", "LowQuality"),
             ("medium", "MediumQuality"),
+            ("high", "HighestQuality"),
             ("480p", "640×480"),
             ("540p", "960×540"),
             ("720p", "1280×720"),
-            ("1080p", "1920×1080")
+            ("1080p", "1920×1080"),
+            ("2160p", "3840×2160")
         ]
         let sheet = UIAlertController(title: "Video preset", message: nil, preferredStyle: .actionSheet)
         for (key, title) in presets {
