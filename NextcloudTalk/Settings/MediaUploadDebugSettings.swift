@@ -4,8 +4,10 @@
 //
 
 import AVFoundation
-import Foundation
 import CoreMedia
+import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 /// Video encode backend for Build 9 debug.
 @objc public enum MediaUploadVideoEngine: Int {
@@ -200,19 +202,117 @@ import CoreMedia
         return targetMbps < sourceMbps * shrinkEnableMargin
     }
 
-    /// Manual chip gate for a mixed bag: None always; other levels need every video to likely shrink.
+    /// Whether re-JPEG at `level` is likely ≥10% smaller (no trial encode).
+    /// Uses max-edge scale + rough bits-per-pixel from JPEG quality.
+    public static func imageCompressionLikelyShrinks(at fileURL: URL, level: MediaUploadCompressionLevel) -> Bool {
+        guard level != .none else { return true }
+        guard let profile = shared().profile(for: level) else { return false }
+
+        let ext = fileURL.pathExtension.lowercased()
+        if ext == "gif" { return false }
+
+        let original = MediaUploadPreprocessor.fileSizePublic(at: fileURL)
+        guard original > 0 else { return false }
+
+        guard let pixelSize = imagePixelSize(at: fileURL) else {
+            // Unknown dimensions — allow compress; Send path decides.
+            return true
+        }
+
+        let maxEdge = CGFloat(max(320, profile.imageMaxDimension))
+        let longest = max(pixelSize.width, pixelSize.height)
+        let scale = longest > maxEdge ? maxEdge / longest : 1.0
+        let outPixels = Double(pixelSize.width * pixelSize.height) * Double(scale * scale)
+        guard outPixels > 0 else { return true }
+
+        let sourceBpp = (Double(original) * 8.0) / Double(pixelSize.width * pixelSize.height)
+        let targetBpp = expectedJPEGBitsPerPixel(qualityPercent: profile.imageJPEGQuality)
+        let expectedBytes = Int64((outPixels * targetBpp) / 8.0)
+
+        // Resize almost always wins on large camera photos.
+        if scale < 0.95 {
+            return expectedBytes < Int64(Double(original) * shrinkEnableMargin)
+        }
+
+        // Quality-only: if source is already denser-compressed than our target JPEG, skip.
+        // HEIC/PNG often look "small" in bytes but expand when forced to JPEG — require clear win.
+        if ["heic", "heif", "png", "webp"].contains(ext) {
+            return expectedBytes < Int64(Double(original) * shrinkEnableMargin)
+        }
+
+        // Already-JPEG (or similar): compare bpp / expected size.
+        if sourceBpp <= targetBpp * 1.05 {
+            return false
+        }
+        return expectedBytes < Int64(Double(original) * shrinkEnableMargin)
+    }
+
+    /// Rough output bpp for `jpegData(compressionQuality:)` (empirical, not a spec).
+    public static func expectedJPEGBitsPerPixel(qualityPercent: Int) -> Double {
+        let q = min(100, max(1, qualityPercent))
+        switch q {
+        case 1...20: return 0.45
+        case 21...40: return 0.8
+        case 41...60: return 1.3
+        case 61...80: return 2.2
+        default: return 3.5
+        }
+    }
+
+    private static func imagePixelSize(at fileURL: URL) -> CGSize? {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(fileURL as CFURL, options) else { return nil }
+        guard let props = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any] else {
+            return nil
+        }
+        guard let wNum = props[kCGImagePropertyPixelWidth] as? NSNumber,
+              let hNum = props[kCGImagePropertyPixelHeight] as? NSNumber else {
+            return nil
+        }
+        let w = CGFloat(truncating: wNum)
+        let h = CGFloat(truncating: hNum)
+        guard w > 0, h > 0 else { return nil }
+        return CGSize(width: w, height: h)
+    }
+
+    /// Manual chip gate: None always.
+    /// - Videos present: every video must likely shrink (images ignored — one level still applies on Send).
+    /// - Photos-only: every compressible image must likely shrink.
     public static func compressionLevelLikelyUseful(_ level: MediaUploadCompressionLevel, forFileURLs fileURLs: [URL]) -> Bool {
         if level == .none { return true }
+
         var sawVideo = false
+        var sawImage = false
+
         for url in fileURLs {
             let ext = url.pathExtension.lowercased()
-            guard MediaUploadPreprocessor.isVideo(fileExtension: ext) else { continue }
-            sawVideo = true
-            if !videoCompressionLikelyShrinks(at: url, level: level) {
-                return false
+            if MediaUploadPreprocessor.isVideo(fileExtension: ext) {
+                sawVideo = true
+                if !videoCompressionLikelyShrinks(at: url, level: level) {
+                    return false
+                }
+            } else if NCUtils.isImage(fileExtension: ext), ext != "gif" {
+                sawImage = true
             }
         }
-        // Photos-only (or non-video): keep levels enabled.
+
+        if sawVideo {
+            return true
+        }
+
+        // Photos-only (or images + non-media): gate on images.
+        if sawImage {
+            for url in fileURLs {
+                let ext = url.pathExtension.lowercased()
+                guard NCUtils.isImage(fileExtension: ext), ext != "gif" else { continue }
+                if !imageCompressionLikelyShrinks(at: url, level: level) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        // No media to compress (pdf/audio/etc.) — chips unused; leave enabled.
         return true
     }
 

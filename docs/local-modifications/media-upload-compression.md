@@ -122,6 +122,8 @@ Unchanged (GIF skipped; pasted PNG data path unchanged).
   (`640x480`, `960x540`, `1280x720`, … — not fictional 1024×576 / 854×480).
 - **Manual chip gating:** None always enabled; Low/Medium/High only if every
   video in the bag is likely ≥10% smaller (source Mbps vs Writer rate or
-  guestimated preset Mbps). Post-encode still keeps original if not smaller.
+  guestimated preset Mbps). **Photos-only:** same idea via bits-per-pixel +
+  max-edge heuristic (no trial JPEG encode). Mixed bags still gate on videos
+  only. Post-encode still keeps original video if not smaller.
 - **Debug ExportSession presets:** picker/row shows guestimated Mbps
   (community figures, not Apple contracts).

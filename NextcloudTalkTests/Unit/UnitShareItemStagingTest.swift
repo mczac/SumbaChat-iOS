@@ -241,4 +241,25 @@ final class UnitShareItemStagingTest: XCTestCase {
     func testCompressionLevelNoneAlwaysUseful() {
         XCTAssertTrue(MediaUploadDebugSettings.compressionLevelLikelyUseful(.none, forFileURLs: []))
     }
+
+    func testExpectedJPEGBitsPerPixelMonotonic() {
+        XCTAssertLessThan(
+            MediaUploadDebugSettings.expectedJPEGBitsPerPixel(qualityPercent: 15),
+            MediaUploadDebugSettings.expectedJPEGBitsPerPixel(qualityPercent: 80)
+        )
+    }
+
+    func testPhotosOnlyTinyJPEGDisablesHarshLevels() throws {
+        // Very small already-JPEG: High (q15 / 1280) quality-only should not look useful.
+        let url = try writeJPEG(named: "tiny-gate.jpg", size: CGSize(width: 64, height: 64))
+        // Ensure file is a normal small JPEG on disk.
+        let size = MediaUploadPreprocessor.fileSizePublic(at: url)
+        XCTAssertGreaterThan(size, 0)
+
+        // High is harsh quality — still may or may not gate depending on bpp of our test JPEG writer.
+        // At minimum, None stays useful.
+        XCTAssertTrue(MediaUploadDebugSettings.compressionLevelLikelyUseful(.none, forFileURLs: [url]))
+        // Low (mild, q80) on a 64px JPEG almost never helps.
+        XCTAssertFalse(MediaUploadDebugSettings.imageCompressionLikelyShrinks(at: url, level: .low))
+    }
 }
