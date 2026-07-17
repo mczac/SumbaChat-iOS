@@ -82,4 +82,11 @@ NSString *const kShareConfirmationTableCellNibName = @"ShareConfirmationCollecti
     self.videoIndicatorView.hidden = !showsVideoIndicator;
 }
 
+- (void)releaseDecodedPreview
+{
+    self.previewView.image = nil;
+    self.placeholderImageView.hidden = NO;
+    self.placeholderTextView.hidden = NO;
+}
+
 @end

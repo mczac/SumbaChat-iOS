@@ -6,6 +6,66 @@
 import AVFoundation
 import CoreMedia
 import UIKit
+import os
+
+/// Waits for jetsam headroom between serial AVAssetWriter sessions.
+enum MediaUploadMemoryGate {
+    static func availableBytes() -> UInt64 {
+        UInt64(os_proc_available_memory())
+    }
+
+    /// Block the calling (background) thread until free memory recovers or timeout.
+    /// `os_proc_available_memory()` may return 0 when unknown — do not spin on that
+    /// (was burning a full 2.5s after multi-video ExportSession, masking the real handoff crash).
+    static func waitForHeadroom(minAvailableBytes: UInt64 = 120 * 1024 * 1024,
+                                timeout: TimeInterval = 2.5) {
+        let available = availableBytes()
+        if available == 0 {
+            NCLog.logSync(String(format: "MediaUploadMemoryGate: skip wait (available unknown), min=%.0f MB",
+                                 Double(minAvailableBytes) / 1_048_576.0))
+            return
+        }
+        if available >= minAvailableBytes {
+            return
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        var spins = 0
+        while availableBytes() < minAvailableBytes, Date() < deadline {
+            spins += 1
+            Thread.sleep(forTimeInterval: 0.08)
+            autoreleasepool { }
+        }
+        if spins > 0 {
+            NCLog.logSync(String(format: "MediaUploadMemoryGate: waited %d spin(s), available=%.1f MB",
+                                 spins, Double(availableBytes()) / 1_048_576.0))
+        }
+    }
+
+    /// Fixed mediaserverd cooldown after a heavy ExportSession batch (no memory API dependency).
+    static func drainAfterExportBatch(seconds: TimeInterval = 1.0) {
+        NCLog.logSync(String(format: "MediaUploadMemoryGate: post-batch drain %.2fs avail=%.0f MB",
+                             seconds, Double(availableBytes()) / 1_048_576.0))
+        Thread.sleep(forTimeInterval: seconds)
+        autoreleasepool { }
+        NCLog.logSync(String(format: "MediaUploadMemoryGate: post-batch drain done avail=%.0f MB",
+                             Double(availableBytes()) / 1_048_576.0))
+    }
+}
+
+/// ObjC entry for ShareItemController between-encode / post-batch pauses.
+@objcMembers public final class MediaUploadMemoryGateObjC: NSObject {
+    @objc public static func waitForHeadroom() {
+        MediaUploadMemoryGate.waitForHeadroom()
+    }
+
+    @objc public static func drainAfterExportBatch() {
+        MediaUploadMemoryGate.drainAfterExportBatch()
+    }
+
+    @objc public static func availableMegabytes() -> Double {
+        Double(MediaUploadMemoryGate.availableBytes()) / 1_048_576.0
+    }
+}
 
 /// AVAssetWriter-based video compress with bitrate, max edge, and fps targets.
 enum MediaUploadVideoWriter {
@@ -54,14 +114,18 @@ enum MediaUploadVideoWriter {
         let totalBitsPerSecond = rateMBps * 1_048_576.0 * 8.0
         let audioBitsPerSecond = 128_000.0
         let videoBitsPerSecond = max(100_000, Int(totalBitsPerSecond - audioBitsPerSecond))
+        let fps = max(1, Int(profile.videoFPS.rounded()))
 
         do {
             try? FileManager.default.removeItem(at: destinationURL)
             let reader = try AVAssetReader(asset: asset)
             let writer = try AVAssetWriter(outputURL: destinationURL, fileType: .mp4)
 
-            let readerVideoSettings: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            // Prefer decoder output at encode size — avoids full-res frame peaks even when scale ≈ 1.
+            var readerVideoSettings: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height
             ]
             let videoReaderOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: readerVideoSettings)
             videoReaderOutput.alwaysCopiesSampleData = false
@@ -74,7 +138,7 @@ enum MediaUploadVideoWriter {
             let compression: [String: Any] = [
                 AVVideoAverageBitRateKey: videoBitsPerSecond,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264MainAutoLevel,
-                AVVideoExpectedSourceFrameRateKey: max(1, Int(profile.videoFPS.rounded()))
+                AVVideoExpectedSourceFrameRateKey: fps
             ]
             let writerVideoSettings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
@@ -91,33 +155,22 @@ enum MediaUploadVideoWriter {
             }
             writer.add(videoWriterInput)
 
+            // Passthrough compressed audio — Linear PCM decode was a large memory spike.
             var audioReaderOutput: AVAssetReaderTrackOutput?
             var audioWriterInput: AVAssetWriterInput?
             if let audioTrack = asset.tracks(withMediaType: .audio).first {
-                let audioReaderSettings: [String: Any] = [
-                    AVFormatIDKey: kAudioFormatLinearPCM
-                ]
-                let aOut = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: audioReaderSettings)
+                let aOut = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
                 aOut.alwaysCopiesSampleData = false
                 if reader.canAdd(aOut) {
                     reader.add(aOut)
                     audioReaderOutput = aOut
-
-                    var layout = AudioChannelLayout()
-                    layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
-                    let layoutData = Data(bytes: &layout, count: MemoryLayout<AudioChannelLayout>.size)
-                    let audioWriterSettings: [String: Any] = [
-                        AVFormatIDKey: kAudioFormatMPEG4AAC,
-                        AVNumberOfChannelsKey: 2,
-                        AVSampleRateKey: 44_100,
-                        AVEncoderBitRateKey: Int(audioBitsPerSecond),
-                        AVChannelLayoutKey: layoutData
-                    ]
-                    let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: audioWriterSettings)
+                    let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
                     aIn.expectsMediaDataInRealTime = false
                     if writer.canAdd(aIn) {
                         writer.add(aIn)
                         audioWriterInput = aIn
+                    } else {
+                        audioReaderOutput = nil
                     }
                 }
             }
@@ -147,18 +200,25 @@ enum MediaUploadVideoWriter {
                         group.leave()
                         return
                     }
-                    if let sample = videoReaderOutput.copyNextSampleBuffer() {
-                        if !videoWriterInput.append(sample) {
-                            videoWriterInput.markAsFinished()
-                            group.leave()
-                            return
+                    var reachedEnd = false
+                    autoreleasepool {
+                        if let sample = videoReaderOutput.copyNextSampleBuffer() {
+                            if !videoWriterInput.append(sample) {
+                                reachedEnd = true
+                                return
+                            }
+                            let t = CMSampleBufferGetPresentationTimeStamp(sample)
+                            let fraction = Float(CMTimeGetSeconds(t) / max(0.001, CMTimeGetSeconds(totalDuration)))
+                            if state.shouldReportProgress(fraction) {
+                                DispatchQueue.main.async {
+                                    progress?(min(0.99, max(0, fraction)))
+                                }
+                            }
+                        } else {
+                            reachedEnd = true
                         }
-                        let t = CMSampleBufferGetPresentationTimeStamp(sample)
-                        let fraction = Float(CMTimeGetSeconds(t) / max(0.001, CMTimeGetSeconds(totalDuration)))
-                        DispatchQueue.main.async {
-                            progress?(min(0.99, max(0, fraction)))
-                        }
-                    } else {
+                    }
+                    if reachedEnd {
                         videoWriterInput.markAsFinished()
                         group.leave()
                         return
@@ -175,13 +235,17 @@ enum MediaUploadVideoWriter {
                             group.leave()
                             return
                         }
-                        if let sample = audioReaderOutput.copyNextSampleBuffer() {
-                            if !audioWriterInput.append(sample) {
-                                audioWriterInput.markAsFinished()
-                                group.leave()
-                                return
+                        var reachedEnd = false
+                        autoreleasepool {
+                            if let sample = audioReaderOutput.copyNextSampleBuffer() {
+                                if !audioWriterInput.append(sample) {
+                                    reachedEnd = true
+                                }
+                            } else {
+                                reachedEnd = true
                             }
-                        } else {
+                        }
+                        if reachedEnd {
                             audioWriterInput.markAsFinished()
                             group.leave()
                             return
@@ -202,38 +266,45 @@ enum MediaUploadVideoWriter {
                 }
 
                 writer.finishWriting {
-                    DispatchQueue.main.async {
-                        if cancelToken?.isCancelled == true {
-                            try? FileManager.default.removeItem(at: destinationURL)
-                            completion(false)
-                            return
+                    let sourceSize = MediaUploadPreprocessor.fileSizePublic(at: sourceURL)
+                    let compressedSize = MediaUploadPreprocessor.fileSizePublic(at: destinationURL)
+                    let duration = durationSeconds
+                    let writerStatus = writer.status
+                    let writerError = writer.error?.localizedDescription
+                    // Leave the finishWriting callback before hopping to main so AVFoundation can drop buffers.
+                    DispatchQueue.global(qos: .utility).async {
+                        cancelToken?.clearExportSession()
+                        MediaUploadMemoryGate.waitForHeadroom()
+                        DispatchQueue.main.async {
+                            if cancelToken?.isCancelled == true {
+                                try? FileManager.default.removeItem(at: destinationURL)
+                                completion(false)
+                                return
+                            }
+                            guard writerStatus == .completed else {
+                                NCLog.log("MediaUploadVideoWriter: finish failed \(writerError ?? "unknown")")
+                                try? FileManager.default.removeItem(at: destinationURL)
+                                completion(false)
+                                return
+                            }
+                            guard compressedSize > 0, sourceSize == 0 || compressedSize < sourceSize else {
+                                try? FileManager.default.removeItem(at: destinationURL)
+                                NCLog.log("MediaUploadVideoWriter: output not smaller; using original")
+                                completion(false)
+                                return
+                            }
+                            let srcMbps = duration > 0
+                                ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: sourceSize, durationSeconds: duration) : 0
+                            let outMbps = duration > 0
+                                ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: compressedSize, durationSeconds: duration) : 0
+                            NCLog.log(String(format:
+                                "MediaUploadVideoWriter: ACTUAL %@ %lld (%.2f MB, %.3fMbps) → %lld (%.2f MB, %.3fMbps) %dx%d targetVideoBitrate=%d bps",
+                                sourceURL.lastPathComponent,
+                                sourceSize, Double(sourceSize) / 1_048_576.0, srcMbps,
+                                compressedSize, Double(compressedSize) / 1_048_576.0, outMbps,
+                                width, height, videoBitsPerSecond))
+                            completion(true)
                         }
-                        guard writer.status == .completed else {
-                            NCLog.log("MediaUploadVideoWriter: finish failed \(writer.error?.localizedDescription ?? "unknown")")
-                            try? FileManager.default.removeItem(at: destinationURL)
-                            completion(false)
-                            return
-                        }
-                        let sourceSize = MediaUploadPreprocessor.fileSizePublic(at: sourceURL)
-                        let compressedSize = MediaUploadPreprocessor.fileSizePublic(at: destinationURL)
-                        guard compressedSize > 0, sourceSize == 0 || compressedSize < sourceSize else {
-                            try? FileManager.default.removeItem(at: destinationURL)
-                            NCLog.log("MediaUploadVideoWriter: output not smaller; using original")
-                            completion(false)
-                            return
-                        }
-                        let duration = CMTimeGetSeconds(asset.duration)
-                        let srcMbps = duration > 0
-                            ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: sourceSize, durationSeconds: duration) : 0
-                        let outMbps = duration > 0
-                            ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: compressedSize, durationSeconds: duration) : 0
-                        NCLog.log(String(format:
-                            "MediaUploadVideoWriter: ACTUAL %@ %lld (%.2f MB, %.3fMbps) → %lld (%.2f MB, %.3fMbps) %dx%d targetVideoBitrate=%d bps",
-                            sourceURL.lastPathComponent,
-                            sourceSize, Double(sourceSize) / 1_048_576.0, srcMbps,
-                            compressedSize, Double(compressedSize) / 1_048_576.0, outMbps,
-                            width, height, videoBitsPerSecond))
-                        completion(true)
                     }
                 }
             }
@@ -258,6 +329,17 @@ enum MediaUploadVideoWriter {
     private final class WriterState {
         private let lock = NSLock()
         private(set) var isCancelled = false
+        private var lastProgressReported: Float = -1
+
+        func shouldReportProgress(_ fraction: Float) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if fraction - lastProgressReported >= 0.05 || fraction >= 0.99 {
+                lastProgressReported = fraction
+                return true
+            }
+            return false
+        }
 
         func cancel(reader: AVAssetReader, writer: AVAssetWriter) {
             lock.lock()

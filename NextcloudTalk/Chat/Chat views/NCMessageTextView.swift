@@ -12,10 +12,10 @@ class NCMessageTextView: SLKTextView {
 
         self.keyboardType = .default
 
-        self.backgroundColor = NCAppBranding.backgroundColor()
+        self.backgroundColor = InputbarViewController.messageComposerChromeFill
 
-        self.placeholder = NSLocalizedString("Write message, @ to mention someone …", comment: "")
-        self.placeholderColor = NCAppBranding.placeholderColor()
+        self.placeholder = NSLocalizedString("Message", comment: "")
+        self.placeholderColor = .secondaryLabel
     }
 
     @available(iOS 18.0, *)

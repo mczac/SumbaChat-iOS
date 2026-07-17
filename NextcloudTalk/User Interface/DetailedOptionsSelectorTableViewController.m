@@ -43,10 +43,16 @@
     [super viewDidLoad];
 
     [NCAppBranding styleViewController:self];
-    
-    UIBarButtonItem *cancelButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel
-                                                                                  target:self action:@selector(cancelButtonPressed)];
-    self.navigationController.navigationBar.topItem.leftBarButtonItem = cancelButton;
+
+    // Only show Cancel when presented as the root of a navigation stack (modal sheet).
+    // When pushed, keep the system Back button. Never mutate navigationBar.topItem —
+    // that stomped the parent VC's left item and left a dead Cancel after pop.
+    BOOL isRootOfStack = self.navigationController.viewControllers.firstObject == self;
+    if (isRootOfStack) {
+        UIBarButtonItem *cancelButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel
+                                                                                      target:self action:@selector(cancelButtonPressed)];
+        self.navigationItem.leftBarButtonItem = cancelButton;
+    }
 }
 
 #pragma mark - Table view data source
@@ -59,6 +65,11 @@
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
     return self.options.count;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
+{
+    return self.footerText.length > 0 ? self.footerText : nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath

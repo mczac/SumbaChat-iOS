@@ -33,7 +33,7 @@ NSString * const pushNotificationServer = @"https://push-dev.example.com";
 #else
 NSString * const pushNotificationServer = @"https://push.example.com";
 #endif
-NSString * const privacyURL = @"https://nextcloud.com/privacy";
+NSString * const privacyURL = @"https://cloud.example.com/privacy";
 BOOL const isBrandedApp = YES;
 BOOL const multiAccountEnabled = YES;
 BOOL const useAppsGroup = NO;
@@ -55,7 +55,7 @@ NSString * const appAlternateVersion = @"";
 
 NSString * const brandColorHex = @"#0082C9";
 NSString * const brandTextColorHex = @"#FFFFFF";
-BOOL const customNavigationLogo = NO;
+BOOL const customNavigationLogo = YES;
 BOOL const useServerThemimg = YES;
 
 + (UIColor *)brandColor
@@ -137,6 +137,25 @@ BOOL const useServerThemimg = YES;
 
 + (UIImage *)navigationLogoImage
 {
+    // SumbaChat wave mark (login asset) in the rooms list title bar.
+    UIImage *waveLogo = [UIImage imageNamed:@"sumbaLoginLogo"];
+    if (waveLogo) {
+        // Login asset is ~180pt; nav title bar expects ~navigationLogo size (~24–28pt).
+        CGFloat targetHeight = 28.0;
+        if (waveLogo.size.height > targetHeight + 0.5) {
+            CGFloat scale = targetHeight / waveLogo.size.height;
+            CGSize newSize = CGSizeMake(waveLogo.size.width * scale, targetHeight);
+            UIGraphicsBeginImageContextWithOptions(newSize, NO, 0);
+            [waveLogo drawInRect:CGRectMake(0, 0, newSize.width, newSize.height)];
+            UIImage *scaled = UIGraphicsGetImageFromCurrentImageContext();
+            UIGraphicsEndImageContext();
+            if (scaled) {
+                waveLogo = scaled;
+            }
+        }
+        return [waveLogo imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+    }
+
     if (@available(iOS 26.0, *)) {
         if (!customNavigationLogo) {
             return [[UIImage imageNamed:@"navigationLogo"] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];

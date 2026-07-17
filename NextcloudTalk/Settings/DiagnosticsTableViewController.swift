@@ -256,6 +256,10 @@ class DiagnosticsTableViewController: UITableViewController {
         }
     }
 
+    override func tableView(_ tableView: UITableView, willDisplayHeaderView view: UIView, forSection section: Int) {
+        applyAppleStyleSectionHeader(view, title: self.tableView(tableView, titleForHeaderInSection: section))
+    }
+
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         switch indexPath.section {
         case DiagnosticsSections.kDiagnosticsSectionApp.rawValue:

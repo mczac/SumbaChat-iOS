@@ -32,12 +32,40 @@ public typealias PresentCallControllerCompletionBlock = () -> Void
     override private init() {
         super.init()
 
+        configureStatusBarNotifications()
+
         let notificationCenter = NotificationCenter.default
         notificationCenter.addObserver(self, selector: #selector(appStateHasChanged(_:)), name: .NCAppStateHasChangedNotification, object: nil)
         notificationCenter.addObserver(self, selector: #selector(connectionStateHasChanged(_:)), name: .NCConnectionStateHasChangedNotification, object: nil)
         notificationCenter.addObserver(self, selector: #selector(presentTalkNotInstalledWarningAlert), name: .NCTalkNotInstalled, object: nil)
         notificationCenter.addObserver(self, selector: #selector(presentTalkOutdatedWarningAlert), name: .NCOutdatedTalkVersion, object: nil)
         notificationCenter.addObserver(self, selector: #selector(presentServerMaintenanceModeWarning(_:)), name: .NCServerMaintenanceMode, object: nil)
+    }
+
+    /// Prefer a calm fade over the default pill slide (and avoid Bounce) for status toasts.
+    private func configureStatusBarNotifications() {
+        let presenter = NotificationPresenter.shared()
+        presenter.updateDefaultStyle { style in
+            style.animationType = .fade
+            return style
+        }
+
+        let quietStyles: [(String, IncludedStatusBarNotificationStyle)] = [
+            ("sumba.success", .success),
+            ("sumba.error", .error),
+            ("sumba.warning", .warning),
+            ("sumba.dark", .dark)
+        ]
+        for (name, base) in quietStyles {
+            _ = presenter.addStyle(styleName: name, basedOnIncludedStyle: base) { style in
+                style.animationType = .fade
+                return style
+            }
+        }
+    }
+
+    private func presentStatusToast(_ text: String, customStyle: String, delay: TimeInterval = 4.0) {
+        NotificationPresenter.shared().present(text: text, dismissAfterDelay: delay, customStyle: customStyle)
     }
 
     deinit {
@@ -159,7 +187,7 @@ public typealias PresentCallControllerCompletionBlock = () -> Void
         let accountId = notification.userInfo?["accountId"] as? String
 
         if let accountId, activeAccount.accountId == accountId {
-            NotificationPresenter.shared().present(text: NSLocalizedString("Server is currently in maintenance mode", comment: ""), dismissAfterDelay: 4.0, includedStyle: .error)
+            presentStatusToast(NSLocalizedString("Server is currently in maintenance mode", comment: ""), customStyle: "sumba.error")
         }
     }
 
@@ -463,9 +491,9 @@ public typealias PresentCallControllerCompletionBlock = () -> Void
 
         switch connectionState {
         case .disconnected:
-            NotificationPresenter.shared().present(text: NSLocalizedString("Network not available", comment: ""), dismissAfterDelay: 4.0, includedStyle: .error)
+            presentStatusToast(NSLocalizedString("Network not available", comment: ""), customStyle: "sumba.error")
         case .connected:
-            NotificationPresenter.shared().present(text: NSLocalizedString("Network available", comment: ""), dismissAfterDelay: 4.0, includedStyle: .success)
+            presentStatusToast(NSLocalizedString("Network available", comment: ""), customStyle: "sumba.success")
         default:
             break
         }

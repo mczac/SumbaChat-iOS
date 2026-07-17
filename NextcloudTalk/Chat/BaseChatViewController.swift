@@ -269,6 +269,7 @@ import Toast
         self.leftButton.accessibilityLabel = String(format: NSLocalizedString("Share a file from %@", comment: ""), filesAppName)
         self.leftButton.accessibilityHint = NSLocalizedString("Double tap to open file browser", comment: "")
         self.leftButton.accessibilityIdentifier = "shareButton"
+        self.styleMessageInputChrome()
 
         // Add LongPressRecognizer to allow showing photo picker directly
         let longPressRecognizer = UILongPressGestureRecognizer(target: self, action: #selector(longPress(gestureRecognizer:)))
@@ -277,6 +278,7 @@ import Toast
 
         // Set delegate to retrieve typing events
         self.tableView?.separatorStyle = .none
+        self.tableView?.keyboardDismissMode = .interactive
 
         self.tableView?.register(UINib(nibName: "BaseChatTableViewCell", bundle: nil), forCellReuseIdentifier: chatMessageCellIdentifier)
         self.tableView?.register(UINib(nibName: "BaseChatTableViewCell", bundle: nil), forCellReuseIdentifier: chatGroupedMessageCellIdentifier)

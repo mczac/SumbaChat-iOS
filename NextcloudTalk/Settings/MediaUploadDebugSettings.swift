@@ -71,6 +71,18 @@ import UniformTypeIdentifiers
                                  videoFPS: 24,
                                  exportPreset: "low")
     }
+
+    /// Copy with a lower encode max-edge (batch jetsam mitigation). Rate/FPS unchanged.
+    public func cappingVideoMaxEdge(_ cap: Int) -> MediaUploadProfileConfig {
+        let edge = max(320, min(videoMaxEdge, cap))
+        return MediaUploadProfileConfig(imageMaxDimension: imageMaxDimension,
+                                        imageJPEGQuality: imageJPEGQuality,
+                                        videoRateMBps: videoRateMBps,
+                                        videoMaxBytes: videoMaxBytes,
+                                        videoMaxEdge: edge,
+                                        videoFPS: videoFPS,
+                                        exportPreset: exportPreset)
+    }
 }
 
 /// Build 9 debug compression controls. Mirrored to App Group for Share Extension.
@@ -129,11 +141,13 @@ import UniformTypeIdentifiers
     /// Community / empirical Mbps guesses for ExportSession presets (not Apple contracts).
     public static func guestimatedExportPresetMbps(_ presetKey: String) -> Double {
         switch presetKey {
-        case "low": return 0.15
+        // Calibrated to High/ExportSession ACTUAL on screen recordings + phone clips (~0.10–0.21 Mbps).
+        case "low": return 0.12
         case "medium": return 0.7
         case "high": return 8.0 // HighestQuality — often near source; treat as mild
         case "480p": return 1.5
-        case "540p": return 2.5
+        // Calibrated to Medium/ExportSession ACTUAL (5-video bag, ~3.4–5.7 Mbps, ~4.3 avg).
+        case "540p": return 4.3
         case "720p": return 4.0
         case "1080p": return 8.0
         case "2160p": return 20.0
@@ -144,6 +158,11 @@ import UniformTypeIdentifiers
     public static func guestimatedExportPresetLabel(_ presetKey: String) -> String {
         let mbps = guestimatedExportPresetMbps(presetKey)
         return String(format: "~%.2f Mbps", mbps)
+    }
+
+    /// Full Apple constant name for UI (e.g. `AVAssetExportPresetLowQuality`).
+    public static func readableAVExportPreset(_ presetKey: String) -> String {
+        avExportPresetName(forKey: presetKey)
     }
 
     /// File bytes → approx total Mbps for duration (includes audio + container).
@@ -269,6 +288,19 @@ import UniformTypeIdentifiers
             return max(12_288, min(apple, originalSize > 0 ? originalSize : apple))
         }
         return estimatedVideoBytes(profile: profile, durationSeconds: durationSeconds, originalSize: originalSize)
+    }
+
+    /// Force ExportSession-preset sizing for chip labels when multi-video Send will use
+    /// `preferExportSession`. Cheap Mbps guestimate only — Apple `estimateOutputFileLength`
+    /// on several large videos at chip-draw time is too heavy (Share Extension jetsam risk).
+    public static func estimatedVideoBytesForExportPreset(at fileURL: URL,
+                                                          profile: MediaUploadProfileConfig,
+                                                          durationSeconds: Double,
+                                                          originalSize: Int64) -> Int64 {
+        _ = fileURL
+        let mbps = guestimatedExportPresetMbps(profile.exportPreset)
+        let estimated = Int64(mbps * durationSeconds * 1_000_000.0 / 8.0)
+        return max(12_288, min(estimated, originalSize > 0 ? originalSize : estimated))
     }
 
     /// Whether compressing this video at `level` is likely to shrink (≥10% smaller).

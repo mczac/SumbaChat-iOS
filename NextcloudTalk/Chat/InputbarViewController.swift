@@ -106,11 +106,10 @@ import UIKit
         }
 
         self.textInputbar.semanticContentAttribute = .forceLeftToRight
-        self.textInputbar.contentInset = .init(top: 8, left: 4, bottom: 8, right: 4)
-        self.textView.textContainerInset = .init(top: 8, left: 8, bottom: 8, right: 8)
+        self.textInputbar.contentInset = .init(top: 8, left: 8, bottom: 8, right: 8)
+        self.textView.textContainerInset = .init(top: 8, left: 12, bottom: 8, right: 12)
 
         self.textView.layoutSubviews()
-        self.textView.layer.cornerRadius = self.textView.frame.size.height / 2
 
         // Need a compile-time check here for old xcode version on CI
 #if swift(>=5.9)
@@ -141,13 +140,15 @@ import UIKit
 
         self.view.backgroundColor = .systemBackground
         self.tableView?.backgroundColor = .systemBackground
-        self.textInputbar.backgroundColor = .systemBackground
+        self.styleFloatingComposerChrome()
 
         self.textInputbar.editorTitle.textColor = .label
-        self.textView.layer.borderWidth = 1.0
-        self.textView.layer.borderColor = UIColor.systemGray4.cgColor
+        self.styleMessageInputChrome()
 
         self.textView.delegate = self
+
+        self.view.bringSubviewToFront(self.autoCompletionView)
+        self.view.bringSubviewToFront(self.textInputbar)
 
         self.autoCompletionView.register(AutoCompletionTableViewCell.self, forCellReuseIdentifier: AutoCompletionTableViewCell.identifier)
         self.registerPrefixes(forAutoCompletion: ["@"])
@@ -174,16 +175,93 @@ import UIKit
         self.restorePendingMessage()
     }
 
+    public override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        self.updateMessageInputChromeCorners()
+    }
+
     public override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
         if self.traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) {
-            // We use a CGColor so we loose the automatic color changing of dynamic colors -> update manually
-            self.textView.layer.borderColor = UIColor.systemGray4.cgColor
             self.textView.tintColor = UIColor(cgColor: UIColor.systemBlue.cgColor)
+            // Border uses CGColor — refresh fill + stroke for the new appearance.
+            self.styleMessageInputChrome()
 
             self.setTitleView()
         } else if previousTraitCollection?.horizontalSizeClass != self.traitCollection.horizontalSizeClass || previousTraitCollection?.verticalSizeClass != self.traitCollection.verticalSizeClass {
             // When the size class changes, we want to update the title view (e.g. to show/hide subtitle)
             self.setTitleView()
+        }
+    }
+
+    // MARK: - Message input chrome (Telegram-style)
+
+    /// Stronger than `secondarySystemFill` so the field/buttons stay visible on white and black chat backgrounds.
+    static var messageComposerChromeFill: UIColor {
+        UIColor { traits in
+            if traits.userInterfaceStyle == .dark {
+                // Lift off pure black (systemGray4 ≈ #3A3A3C)
+                return .systemGray4
+            }
+            // Distinct from white / systemBackground (systemGray5 ≈ #E5E5EA)
+            return .systemGray5
+        }
+    }
+
+    static var messageComposerChromeStroke: UIColor {
+        UIColor { traits in
+            if traits.userInterfaceStyle == .dark {
+                return UIColor.white.withAlphaComponent(0.18)
+            }
+            return UIColor.black.withAlphaComponent(0.12)
+        }
+    }
+
+    /// Transparent bar so the chat list shows through behind + / field / send.
+    func styleFloatingComposerChrome() {
+        // SLKTextInputbar is a UIView (not UIToolbar) — only clear its background.
+        self.textInputbar.backgroundColor = .clear
+        self.textInputbar.isOpaque = false
+    }
+
+    /// Filled pill field + circular action buttons with enough contrast for light and dark mode.
+    func styleMessageInputChrome() {
+        self.styleFloatingComposerChrome()
+
+        let fill = Self.messageComposerChromeFill
+        let stroke = Self.messageComposerChromeStroke.cgColor
+
+        self.textView.backgroundColor = fill
+        self.textView.layer.borderWidth = 1.0 / UIScreen.main.scale
+        self.textView.layer.borderColor = stroke
+        self.textView.clipsToBounds = true
+        if let messageTextView = self.textView as? NCMessageTextView {
+            messageTextView.placeholderColor = .secondaryLabel
+        }
+
+        self.styleMessageInputActionButton(self.leftButton, fill: fill, stroke: stroke)
+        self.styleMessageInputActionButton(self.rightButton, fill: fill, stroke: stroke)
+        self.updateMessageInputChromeCorners()
+    }
+
+    private func styleMessageInputActionButton(_ button: UIButton, fill: UIColor, stroke: CGColor) {
+        button.backgroundColor = fill
+        button.tintColor = .label
+        button.clipsToBounds = true
+        button.layer.borderWidth = 1.0 / UIScreen.main.scale
+        button.layer.borderColor = stroke
+    }
+
+    private func updateMessageInputChromeCorners() {
+        let textHeight = self.textView.bounds.height
+        if textHeight > 0 {
+            self.textView.layer.cornerRadius = textHeight / 2
+        }
+
+        for button in [self.leftButton, self.rightButton] {
+            let side = min(button.bounds.width, button.bounds.height)
+            if side > 0 {
+                button.layer.cornerRadius = side / 2
+            }
         }
     }
 

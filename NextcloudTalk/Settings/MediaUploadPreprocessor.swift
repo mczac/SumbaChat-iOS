@@ -51,6 +51,12 @@ import UniformTypeIdentifiers
 
     @objc(initWithLevel:)
     public convenience init(level: MediaUploadCompressionLevel) {
+        self.init(level: level, videoMaxEdgeCap: 0)
+    }
+
+    /// - Parameter videoMaxEdgeCap: When > 0, Writer encode edge is min(profile, cap). Used for multi-video batches.
+    @objc(initWithLevel:videoMaxEdgeCap:)
+    public convenience init(level: MediaUploadCompressionLevel, videoMaxEdgeCap: Int) {
         let debug = MediaUploadDebugSettings.shared()
         switch level {
         case .none:
@@ -62,7 +68,10 @@ import UniformTypeIdentifiers
                       videoPreset: Self.defaultVideoPreset,
                       profile: nil)
         case .low, .medium, .high:
-            let profile = debug.profile(for: level) ?? .defaultMedium
+            var profile = debug.profile(for: level) ?? .defaultMedium
+            if videoMaxEdgeCap > 0 {
+                profile = profile.cappingVideoMaxEdge(videoMaxEdgeCap)
+            }
             self.init(enabled: true,
                       imageEnabled: true,
                       imageMaxDimension: profile.imageMaxDimension,
@@ -276,6 +285,14 @@ import UniformTypeIdentifiers
         }
     }
 
+    /// Drop the finished session so mediaserverd can reclaim before the next encode.
+    func clearExportSession() {
+        lock.lock()
+        defer { lock.unlock() }
+        exportSession = nil
+        writerCancel = nil
+    }
+
     func attachWriterCancel(_ block: @escaping () -> Void) {
         lock.lock()
         defer { lock.unlock() }
@@ -289,6 +306,11 @@ import UniformTypeIdentifiers
 /// Compresses photos and videos before they are uploaded.
 @objcMembers public class MediaUploadPreprocessor: NSObject {
 
+    /// Multi-video Send: use ExportSession (lighter than Writer) and enforce off-main serial teardown.
+    @objc public static var preferExportSession = false
+
+    /// One export at a time; asset/session created here — never on the main thread.
+    private static let exportQueue = DispatchQueue(label: "com.spl.SumbaChat.media-upload-export", qos: .userInitiated)
     @objc(compressImageAtURL:toDestinationURL:settings:)
     public static func compressImage(at sourceURL: URL,
                                      toDestinationURL destinationURL: URL,
@@ -382,7 +404,8 @@ import UniformTypeIdentifiers
         }
 
         let debug = MediaUploadDebugSettings.shared()
-        if debug.usesAssetWriter, let profile = settings.profile {
+        let useWriter = debug.usesAssetWriter && !preferExportSession
+        if useWriter, let profile = settings.profile {
             MediaUploadVideoWriter.compress(at: sourceURL,
                                             toDestinationURL: destinationURL,
                                             profile: profile,
@@ -407,6 +430,10 @@ import UniformTypeIdentifiers
             return
         }
 
+        if preferExportSession {
+            NCLog.log("MediaUploadPreprocessor: batch preferExportSession — \(sourceURL.lastPathComponent)")
+        }
+
         compressVideoWithExportSession(at: sourceURL,
                                        toDestinationURL: destinationURL,
                                        settings: settings,
@@ -421,77 +448,116 @@ import UniformTypeIdentifiers
                                                        cancelToken: MediaUploadPreparationToken?,
                                                        progress: ((Float) -> Void)?,
                                                        completion: @escaping (Bool) -> Void) {
-        let asset = AVURLAsset(url: sourceURL)
-
-        guard let exportSession = AVAssetExportSession(asset: asset, presetName: settings.avVideoPreset) else {
-            NCLog.log("MediaUploadPreprocessor: unable to create export session")
-            completion(false)
-            return
-        }
-
-        cancelToken?.attach(exportSession)
-
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            try? FileManager.default.removeItem(at: destinationURL)
-        }
-
-        exportSession.outputURL = destinationURL
-        exportSession.outputFileType = .mp4
-        exportSession.shouldOptimizeForNetworkUse = true
-
-        var progressTimer: Timer?
-        if progress != nil {
-            let timer = Timer(timeInterval: 0.1, repeats: true) { timer in
-                progress?(exportSession.progress)
-                if exportSession.status != .waiting && exportSession.status != .exporting {
-                    timer.invalidate()
-                }
-            }
-            progressTimer = timer
-            RunLoop.main.add(timer, forMode: .common)
-        }
-
-        exportSession.exportAsynchronously {
-            DispatchQueue.main.async {
-                progressTimer?.invalidate()
-                progress?(exportSession.progress)
-
-                if cancelToken?.isCancelled == true || exportSession.status == .cancelled {
-                    try? FileManager.default.removeItem(at: destinationURL)
-                    NCLog.log("MediaUploadPreprocessor: video export cancelled")
-                    completion(false)
+        // Public pattern: serial OperationQueue / dedicated queue + full session release between
+        // exports. Creating AVAssetExportSession on the main thread repeatedly correlated with
+        // silent process death on the Nth file (avail RAM still multi-GB).
+        let run: () -> Void = {
+            autoreleasepool {
+                if cancelToken?.isCancelled == true {
+                    DispatchQueue.main.async { completion(false) }
                     return
                 }
 
-                switch exportSession.status {
-                case .completed:
+                let asset = AVURLAsset(url: sourceURL, options: [
+                    AVURLAssetPreferPreciseDurationAndTimingKey: false
+                ])
+
+                guard let exportSession = AVAssetExportSession(asset: asset, presetName: settings.avVideoPreset) else {
+                    NCLog.log("MediaUploadPreprocessor: unable to create export session")
+                    DispatchQueue.main.async { completion(false) }
+                    return
+                }
+
+                cancelToken?.attach(exportSession)
+
+                if FileManager.default.fileExists(atPath: destinationURL.path) {
+                    try? FileManager.default.removeItem(at: destinationURL)
+                }
+
+                exportSession.outputURL = destinationURL
+                exportSession.outputFileType = .mp4
+                exportSession.shouldOptimizeForNetworkUse = true
+
+                final class ProgressPollState: @unchecked Sendable {
+                    var active = true
+                }
+                let pollState = ProgressPollState()
+                if progress != nil {
+                    exportQueue.async {
+                        while pollState.active {
+                            let fraction = exportSession.progress
+                            DispatchQueue.main.async {
+                                progress?(fraction)
+                            }
+                            let status = exportSession.status
+                            if status != .waiting && status != .exporting {
+                                break
+                            }
+                            Thread.sleep(forTimeInterval: 0.25)
+                        }
+                    }
+                }
+
+                exportSession.exportAsynchronously {
+                    pollState.active = false
+                    let status = exportSession.status
+                    let errorDescription = exportSession.error?.localizedDescription
                     let sourceSize = fileSize(at: sourceURL)
                     let compressedSize = fileSize(at: destinationURL)
-
-                    guard compressedSize > 0, sourceSize == 0 || compressedSize < sourceSize else {
-                        try? FileManager.default.removeItem(at: destinationURL)
-                        NCLog.log("MediaUploadPreprocessor: compressed video was not smaller; using original")
-                        completion(false)
-                        return
-                    }
-
                     let duration = CMTimeGetSeconds(asset.duration)
-                    let srcMbps = duration > 0 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: sourceSize, durationSeconds: duration) : 0
-                    let outMbps = duration > 0 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: compressedSize, durationSeconds: duration) : 0
-                    NCLog.log(String(format:
-                        "MediaUploadPreprocessor: ExportSession ACTUAL %@ %lld (%.2f MB, %.3fMbps) → %lld (%.2f MB, %.3fMbps) preset=%@",
-                        sourceURL.lastPathComponent,
-                        sourceSize, Double(sourceSize) / 1_048_576.0, srcMbps,
-                        compressedSize, Double(compressedSize) / 1_048_576.0, outMbps,
-                        settings.videoPreset))
-                    completion(true)
-                case .failed, .cancelled:
-                    NCLog.log("MediaUploadPreprocessor: video export failed: \(exportSession.error?.localizedDescription ?? "unknown error")")
-                    completion(false)
-                default:
-                    completion(false)
+                    let presetName = settings.videoPreset
+                    let sourceName = sourceURL.lastPathComponent
+
+                    // Drop session refs before the next encode — mediaserverd needs a beat to reclaim.
+                    cancelToken?.clearExportSession()
+                    Thread.sleep(forTimeInterval: 0.45)
+                    autoreleasepool { }
+
+                    DispatchQueue.main.async {
+                        progress?(1.0)
+
+                        if cancelToken?.isCancelled == true || status == .cancelled {
+                            try? FileManager.default.removeItem(at: destinationURL)
+                            NCLog.log("MediaUploadPreprocessor: video export cancelled")
+                            completion(false)
+                            return
+                        }
+
+                        switch status {
+                        case .completed:
+                            guard compressedSize > 0, sourceSize == 0 || compressedSize < sourceSize else {
+                                try? FileManager.default.removeItem(at: destinationURL)
+                                NCLog.log("MediaUploadPreprocessor: compressed video was not smaller; using original")
+                                completion(false)
+                                return
+                            }
+
+                            let srcMbps = duration > 0 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: sourceSize, durationSeconds: duration) : 0
+                            let outMbps = duration > 0 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: compressedSize, durationSeconds: duration) : 0
+                            NCLog.logSync(String(format:
+                                "MediaUploadPreprocessor: ExportSession ACTUAL %@ %lld (%.2f MB, %.3fMbps) → %lld (%.2f MB, %.3fMbps) preset=%@",
+                                sourceName,
+                                sourceSize, Double(sourceSize) / 1_048_576.0, srcMbps,
+                                compressedSize, Double(compressedSize) / 1_048_576.0, outMbps,
+                                presetName))
+                            completion(true)
+                        case .failed, .cancelled:
+                            NCLog.log("MediaUploadPreprocessor: video export failed: \(errorDescription ?? "unknown error")")
+                            try? FileManager.default.removeItem(at: destinationURL)
+                            completion(false)
+                        default:
+                            try? FileManager.default.removeItem(at: destinationURL)
+                            completion(false)
+                        }
+                    }
                 }
             }
+        }
+
+        if Thread.isMainThread {
+            exportQueue.async(execute: run)
+        } else {
+            run()
         }
     }
 
@@ -568,8 +634,33 @@ import UniformTypeIdentifiers
         var low: Int64 = 0
         var medium: Int64 = 0
         var high: Int64 = 0
+        // Multi-video Send forces ExportSession (see ShareItemController preferExportSession).
+        // Chips must use preset guests (Medium=540p, High=low), not Writer rates.
+        let videoCount = fileURLs.reduce(0) { partial, url in
+            partial + (isVideo(fileExtension: url.pathExtension.lowercased()) ? 1 : 0)
+        }
+        let multiVideoUsesExportSession = videoCount >= 2
+        let debug = MediaUploadDebugSettings.shared()
+
         for url in fileURLs {
-            let counts = cheapEstimatedByteCounts(at: url)
+            var counts = cheapEstimatedByteCounts(at: url)
+            if multiVideoUsesExportSession,
+               isVideo(fileExtension: url.pathExtension.lowercased()),
+               let duration = videoDurationSeconds(at: url), duration > 0 {
+                let original = fileSize(at: url)
+                let exportMedium = MediaUploadDebugSettings.estimatedVideoBytesForExportPreset(
+                    at: url,
+                    profile: debug.medium,
+                    durationSeconds: duration,
+                    originalSize: original)
+                let exportHigh = MediaUploadDebugSettings.estimatedVideoBytesForExportPreset(
+                    at: url,
+                    profile: debug.high,
+                    durationSeconds: duration,
+                    originalSize: original)
+                counts.medium = max(12_288, min(exportMedium, counts.low, original > 0 ? original : exportMedium))
+                counts.high = max(12_288, min(exportHigh, counts.medium, original > 0 ? original : exportHigh))
+            }
             // Match Send: skip items that would not shrink at that level → count original size.
             let lowBytes = MediaUploadDebugSettings.itemCompressionLikelyShrinks(at: url, level: .low)
                 ? counts.low : counts.none
@@ -578,9 +669,9 @@ import UniformTypeIdentifiers
             let highBytes = MediaUploadDebugSettings.itemCompressionLikelyShrinks(at: url, level: .high)
                 ? counts.high : counts.none
 
-            var itemLow = min(lowBytes, counts.none)
-            var itemMedium = min(mediumBytes, itemLow)
-            var itemHigh = min(highBytes, itemMedium)
+            let itemLow = min(lowBytes, counts.none)
+            let itemMedium = min(mediumBytes, itemLow)
+            let itemHigh = min(highBytes, itemMedium)
 
             none += counts.none
             low += itemLow

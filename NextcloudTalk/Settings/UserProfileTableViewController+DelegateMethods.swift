@@ -11,15 +11,26 @@ extension UserProfileTableViewController: UINavigationControllerDelegate, UIText
     // MARK: - DetailedOptionSelector Delegate
 
     func detailedOptionsSelector(_ viewController: DetailedOptionsSelectorTableViewController!, didSelectOptionWithIdentifier option: DetailedOption!) {
-        self.dismiss(animated: true) {
+        let applySelection = {
             if !option.selected {
                 self.setUserProfileField(viewController.senderId, scopeValue: option.identifier)
             }
         }
+
+        if navigationController?.viewControllers.contains(viewController) == true {
+            navigationController?.popViewController(animated: true)
+            applySelection()
+        } else {
+            dismiss(animated: true, completion: applySelection)
+        }
     }
 
     func detailedOptionsSelectorWasCancelled(_ viewController: DetailedOptionsSelectorTableViewController!) {
-        self.dismiss(animated: true, completion: nil)
+        if navigationController?.viewControllers.contains(viewController) == true {
+            navigationController?.popViewController(animated: true)
+        } else {
+            dismiss(animated: true, completion: nil)
+        }
     }
 
     // MARK: - UIImagePickerController Delegate

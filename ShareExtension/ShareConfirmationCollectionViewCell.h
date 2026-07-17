@@ -21,6 +21,8 @@ extern NSString *const kShareConfirmationTableCellNibName;
 - (void)setPlaceHolderText:(NSString *)text;
 - (void)setPreviewImage:(UIImage *)image;
 - (void)setShowsVideoIndicator:(BOOL)showsVideoIndicator;
+/// Drop decoded preview bitmaps (full-screen video thumbs) so multi-encode Send can stay under jetsam.
+- (void)releaseDecodedPreview;
 
 @end
 

@@ -26,6 +26,7 @@
 @property (nonatomic, weak) id<DetailedOptionsSelectorTableViewControllerDelegate> delegate;
 @property (nonatomic, strong) NSArray *options;
 @property (nonatomic, strong) NSString *senderId;
+@property (nonatomic, copy) NSString *footerText;
 @property (nonatomic, assign) DetailedOptionsSelectorType type;
 
 - (instancetype)initWithOptions:(NSArray *)options forSenderIdentifier:(NSString *)senderId andStyle:(UITableViewStyle)style;

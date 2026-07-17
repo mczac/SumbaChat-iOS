@@ -19,6 +19,7 @@
 @property (nonatomic, assign, readwrite) NSInteger pendingProviderLoadCount;
 @property (nonatomic, strong) NSMutableArray<NSString *> *pendingStagingFailures;
 @property (nonatomic, strong) MediaUploadPreparationToken *activePreparationToken;
+@property (nonatomic, assign) NSInteger batchVideoMaxEdgeCap;
 
 @end
 
@@ -659,7 +660,8 @@
              progress:(void (^)(float fraction))progress
            completion:(void (^)(void))completion
 {
-    MediaUploadCompressionSettings *settings = [[MediaUploadCompressionSettings alloc] initWithLevel:level];
+    MediaUploadCompressionSettings *settings =
+        [[MediaUploadCompressionSettings alloc] initWithLevel:level videoMaxEdgeCap:self.batchVideoMaxEdgeCap];
     NSString *extension = item.fileURL.pathExtension.lowercaseString;
 
     if (item.isImage && extension.length > 0 && [NCUtils isImageWithFileExtension:extension] && ![extension isEqualToString:@"gif"]) {
@@ -717,7 +719,9 @@
 
     if (extension.length > 0 && [MediaUploadPreprocessor isVideoFileExtension:extension]) {
         // Chip may be on because another item benefits — skip already-small videos.
-        if (![MediaUploadDebugSettings itemCompressionLikelyShrinksAtURL:item.fileURL level:level]) {
+        // Heavy-batch ExportSession path already curated the work list; avoid another AVAsset open.
+        if (!MediaUploadPreprocessor.preferExportSession
+            && ![MediaUploadDebugSettings itemCompressionLikelyShrinksAtURL:item.fileURL level:level]) {
             [NCLog log:[NSString stringWithFormat:@"ShareItemController: skipping video compress for %@ (unlikely to shrink at level %ld)",
                         item.fileName, (long)level]];
             if (progress) {
@@ -731,39 +735,52 @@
 
         NSString *mp4Name = [[item.fileName stringByDeletingPathExtension] stringByAppendingPathExtension:@"mp4"];
         NSURL *mp4URL = [self getFileLocalURL:mp4Name];
+        NSURL *sourceURL = item.fileURL;
+        MediaUploadPreparationToken *token = self.activePreparationToken;
 
-        [MediaUploadPreprocessor compressVideoAtURL:item.fileURL
-                                   toDestinationURL:mp4URL
-                                           settings:settings
-                                        cancelToken:self.activePreparationToken
-                                           progress:^(float fraction) {
-            if (progress) {
-                progress(fraction);
-            }
-        } completion:^(BOOL success) {
-            // Completion already hops to main inside MediaUploadPreprocessor.
-            if (success) {
-                NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:mp4URL.path error:nil];
-                unsigned long long written = [attrs fileSize];
-                if (written > 0) {
-                    if (![item.filePath isEqualToString:mp4URL.path]) {
-                        [NSFileManager.defaultManager removeItemAtURL:item.fileURL error:nil];
-                    }
-                    item.fileURL = mp4URL;
-                    item.filePath = mp4URL.path;
-                    item.fileName = mp4Name;
-                } else {
-                    NSLog(@"MediaUploadPreprocessor: refusing to swap to 0-byte compressed video %@", mp4Name);
-                    [NCLog log:[NSString stringWithFormat:@"ShareItemController: refusing 0-byte compressed video %@", mp4Name]];
-                    [NSFileManager.defaultManager removeItemAtURL:mp4URL error:nil];
+        // Mirror image path: never create AVAsset / ExportSession on the main thread.
+        dispatch_async(self.preparationQueue, ^{
+            [MediaUploadPreprocessor compressVideoAtURL:sourceURL
+                                       toDestinationURL:mp4URL
+                                               settings:settings
+                                            cancelToken:token
+                                               progress:^(float fraction) {
+                if (progress) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        progress(fraction);
+                    });
                 }
-            } else {
-                [NSFileManager.defaultManager removeItemAtURL:mp4URL error:nil];
-            }
-            if (completion) {
-                completion();
-            }
-        }];
+            } completion:^(BOOL success) {
+                void (^finishItem)(void) = ^{
+                    if (success) {
+                        NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:mp4URL.path error:nil];
+                        unsigned long long written = [attrs fileSize];
+                        if (written > 0) {
+                            if (![item.filePath isEqualToString:mp4URL.path]) {
+                                [NSFileManager.defaultManager removeItemAtURL:item.fileURL error:nil];
+                            }
+                            item.fileURL = mp4URL;
+                            item.filePath = mp4URL.path;
+                            item.fileName = mp4Name;
+                        } else {
+                            NSLog(@"MediaUploadPreprocessor: refusing to swap to 0-byte compressed video %@", mp4Name);
+                            [NCLog log:[NSString stringWithFormat:@"ShareItemController: refusing 0-byte compressed video %@", mp4Name]];
+                            [NSFileManager.defaultManager removeItemAtURL:mp4URL error:nil];
+                        }
+                    } else {
+                        [NSFileManager.defaultManager removeItemAtURL:mp4URL error:nil];
+                    }
+                    if (completion) {
+                        completion();
+                    }
+                };
+                if ([NSThread isMainThread]) {
+                    finishItem();
+                } else {
+                    dispatch_async(dispatch_get_main_queue(), finishItem);
+                }
+            }];
+        });
         return;
     }
 
@@ -787,14 +804,18 @@
         return;
     }
 
-    NSInteger totalToCompress = 0;
+    // Build the work list first — only items that need compression.
+    NSMutableArray<ShareItem *> *itemsToCompress = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *levelsToCompress = [NSMutableArray array];
     for (ShareItem *item in items) {
         MediaUploadCompressionLevel level = levelProvider ? (MediaUploadCompressionLevel)levelProvider(item) : MediaUploadCompressionLevelNone;
         if (level != MediaUploadCompressionLevelNone) {
-            totalToCompress += 1;
+            [itemsToCompress addObject:item];
+            [levelsToCompress addObject:@(level)];
         }
     }
 
+    NSInteger totalToCompress = (NSInteger)itemsToCompress.count;
     if (totalToCompress == 0) {
         [NCLog log:@"ShareItemController: prepareItemsForUpload — nothing to compress"];
         if (progress) {
@@ -809,28 +830,69 @@
     [self.activePreparationToken cancel];
     self.activePreparationToken = [[MediaUploadPreparationToken alloc] init];
 
-    [NCLog log:[NSString stringWithFormat:@"ShareItemController: prepareItemsForUpload — compressing %ld item(s)", (long)totalToCompress]];
+    [NCLog log:[NSString stringWithFormat:@"ShareItemController: prepareItemsForUpload — compressing %ld item(s) serially", (long)totalToCompress]];
+
+    // Largest first while memory is freshest (after preview release).
+    NSMutableArray<NSNumber *> *order = [NSMutableArray arrayWithCapacity:(NSUInteger)totalToCompress];
+    for (NSInteger i = 0; i < totalToCompress; i++) {
+        [order addObject:@(i)];
+    }
+    [order sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+        ShareItem *ia = itemsToCompress[a.integerValue];
+        ShareItem *ib = itemsToCompress[b.integerValue];
+        unsigned long long sa = [[NSFileManager.defaultManager attributesOfItemAtPath:ia.filePath error:nil] fileSize];
+        unsigned long long sb = [[NSFileManager.defaultManager attributesOfItemAtPath:ib.filePath error:nil] fileSize];
+        if (sa < sb) { return NSOrderedDescending; }
+        if (sa > sb) { return NSOrderedAscending; }
+        return NSOrderedSame;
+    }];
+    NSMutableArray<ShareItem *> *sortedItems = [NSMutableArray arrayWithCapacity:(NSUInteger)totalToCompress];
+    NSMutableArray<NSNumber *> *sortedLevels = [NSMutableArray arrayWithCapacity:(NSUInteger)totalToCompress];
+    for (NSNumber *idx in order) {
+        [sortedItems addObject:itemsToCompress[idx.integerValue]];
+        [sortedLevels addObject:levelsToCompress[idx.integerValue]];
+    }
+    [itemsToCompress setArray:sortedItems];
+    [levelsToCompress setArray:sortedLevels];
+
+    // Multi-video: ExportSession on a dedicated serial queue + full session teardown between files
+    // (public AVFoundation pattern — main-thread session churn correlated with Nth-file process death).
+    unsigned long long totalBytes = 0;
+    for (ShareItem *item in itemsToCompress) {
+        totalBytes += [[NSFileManager.defaultManager attributesOfItemAtPath:item.filePath error:nil] fileSize];
+    }
+    BOOL heavyBatch = (totalToCompress >= 2 && totalBytes >= 40ULL * 1024ULL * 1024ULL);
+    if (heavyBatch) {
+        self.batchVideoMaxEdgeCap = 640;
+        MediaUploadPreprocessor.preferExportSession = YES;
+        [NCLog log:[NSString stringWithFormat:@"ShareItemController: batch ExportSession serial teardown (items=%ld total=%.1f MB edgeCap=640)",
+                    (long)totalToCompress, totalBytes / 1048576.0]];
+    } else if (totalToCompress >= 2) {
+        self.batchVideoMaxEdgeCap = 720;
+        MediaUploadPreprocessor.preferExportSession = YES;
+        [NCLog log:[NSString stringWithFormat:@"ShareItemController: batch ExportSession serial teardown (items=%ld edgeCap=720)",
+                    (long)totalToCompress]];
+    } else {
+        self.batchVideoMaxEdgeCap = 0;
+        MediaUploadPreprocessor.preferExportSession = NO;
+    }
 
     if (progress) {
         progress(0.0f);
     }
 
-    dispatch_group_t group = dispatch_group_create();
+    // One encode at a time. Parallel AVAssetWriter sessions jetsam the process when several
+    // large videos (e.g. screen recordings) are selected — seen as an instant relaunch mid-prepare.
+    __weak typeof(self) weakSelf = self;
     __block NSInteger completedCount = 0;
-    // Track in-flight item fractions so multi-item prepare can show continuous progress.
-    NSMutableDictionary<NSNumber *, NSNumber *> *itemFractions = [NSMutableDictionary dictionary];
-    __block NSInteger nextItemIndex = 0;
+    __block float currentItemFraction = 0.0f;
 
     void (^reportOverall)(void) = ^{
         void (^emit)(void) = ^{
             if (!progress) {
                 return;
             }
-            __block float sum = (float)completedCount;
-            [itemFractions enumerateKeysAndObjectsUsingBlock:^(NSNumber *key, NSNumber *value, BOOL *stop) {
-                sum += value.floatValue;
-            }];
-            float overall = MIN(1.0f, sum / (float)totalToCompress);
+            float overall = MIN(1.0f, ((float)completedCount + currentItemFraction) / (float)totalToCompress);
             progress(overall);
         };
         if ([NSThread isMainThread]) {
@@ -840,54 +902,109 @@
         }
     };
 
-    for (ShareItem *item in items) {
-        MediaUploadCompressionLevel level = levelProvider ? (MediaUploadCompressionLevel)levelProvider(item) : MediaUploadCompressionLevelNone;
-        if (level == MediaUploadCompressionLevelNone) {
-            continue;
+    BOOL usedExportBatch = heavyBatch || (totalToCompress >= 2);
+    void (^finishAll)(void) = ^{
+        void (^done)(void) = ^{
+            typeof(self) strongSelf = weakSelf;
+            BOOL cancelled = strongSelf.activePreparationToken.isCancelled;
+            strongSelf.activePreparationToken = nil;
+            strongSelf.batchVideoMaxEdgeCap = 0;
+            MediaUploadPreprocessor.preferExportSession = NO;
+            // Sync — async NCLog often never flushes when jetsam hits the upload handoff.
+            [NCLog logSync:[NSString stringWithFormat:@"ShareItemController: prepareItemsForUpload — finished (cancelled=%d)", cancelled]];
+            // Do NOT call shareItemControllerItemsChanged here. Reloading the pager regenerates
+            // full-screen video thumbnails right after encode and jetsams multi-video sends.
+            // ShareConfirmation starts upload from the completion callback instead.
+            if (completion) {
+                completion();
+            }
+        };
+        // Final mediaserverd cooldown off-main before upload handoff.
+        // Multi-video ExportSession batches were dying ~5s after the last ACTUAL with no
+        // "finished" line (async log + MemoryGate spinning on available==0).
+        dispatch_async(weakSelf.preparationQueue ?: dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [NCLog logSync:[NSString stringWithFormat:@"ShareItemController: prepare handoff drain (exportBatch=%d avail=%.0f MB)",
+                            usedExportBatch, [MediaUploadMemoryGateObjC availableMegabytes]]];
+            if (usedExportBatch) {
+                [MediaUploadMemoryGateObjC drainAfterExportBatch];
+            } else {
+                [MediaUploadMemoryGateObjC waitForHeadroom];
+            }
+            [NCLog logSync:@"ShareItemController: prepare handoff → main"];
+            dispatch_async(dispatch_get_main_queue(), done);
+        });
+    };
+
+    __block void (^processNext)(NSInteger index) = nil;
+    processNext = ^(NSInteger index) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+        if (strongSelf.activePreparationToken.isCancelled || index >= totalToCompress) {
+            // CRITICAL: call finishAll BEFORE clearing processNext.
+            // processNext is the last owner of finishAll (prepareItemsForUpload already returned).
+            // `processNext = nil; finishAll();` was use-after-free — silent relaunch after the
+            // last encode (seen as die after "after compress N/N → next", never "handoff drain").
+            [NCLog logSync:[NSString stringWithFormat:@"ShareItemController: prepare serial done (index=%ld) → finishAll", (long)index]];
+            void (^finish)(void) = [finishAll copy];
+            processNext = nil;
+            finish();
+            return;
         }
 
-        NSNumber *itemKey = @(nextItemIndex);
-        nextItemIndex += 1;
-        itemFractions[itemKey] = @0;
+        ShareItem *item = itemsToCompress[index];
+        MediaUploadCompressionLevel level = (MediaUploadCompressionLevel)levelsToCompress[index].integerValue;
+        currentItemFraction = 0.0f;
+        reportOverall();
 
-        dispatch_group_enter(group);
-        [self beginPreparingItem];
-        [NCLog log:[NSString stringWithFormat:@"ShareItemController: compressing %@ at level %ld", item.fileName, (long)level]];
-        [self compressItem:item withLevel:level progress:^(float fraction) {
-            void (^update)(void) = ^{
-                itemFractions[itemKey] = @(MAX(0.0f, MIN(1.0f, fraction)));
-                reportOverall();
-            };
-            if ([NSThread isMainThread]) {
-                update();
-            } else {
-                dispatch_async(dispatch_get_main_queue(), update);
-            }
+        id<ShareItemControllerDelegate> delegate = strongSelf.delegate;
+        if ([delegate respondsToSelector:@selector(shareItemControllerShouldReleaseHeavyPreviews:)]) {
+            [delegate shareItemControllerShouldReleaseHeavyPreviews:strongSelf];
+        }
+
+        [strongSelf beginPreparingItem];
+        [NCLog log:[NSString stringWithFormat:@"ShareItemController: compressing %@ at level %ld (%ld/%ld) avail=%.0f MB",
+                    item.fileName, (long)level, (long)(index + 1), (long)totalToCompress,
+                    [MediaUploadMemoryGateObjC availableMegabytes]]];
+
+        [strongSelf compressItem:item withLevel:level progress:^(float fraction) {
+            currentItemFraction = MAX(0.0f, MIN(1.0f, fraction));
+            reportOverall();
         } completion:^{
-            void (^finish)(void) = ^{
-                [itemFractions removeObjectForKey:itemKey];
-                completedCount += 1;
-                reportOverall();
-                [self endPreparingItem];
-                dispatch_group_leave(group);
-            };
-            if ([NSThread isMainThread]) {
-                finish();
-            } else {
-                dispatch_async(dispatch_get_main_queue(), finish);
+            // Drain autoreleased AVFoundation buffers off the main thread before the next encode.
+            typeof(self) queueSelf = weakSelf;
+            dispatch_queue_t prepQueue = queueSelf.preparationQueue;
+            if (!prepQueue) {
+                processNext(index + 1);
+                return;
             }
+            dispatch_async(prepQueue, ^{
+                @autoreleasepool {
+                    // Extra mediaserverd drain between serial encodes (in addition to ExportSession teardown).
+                    if (MediaUploadPreprocessor.preferExportSession) {
+                        [NSThread sleepForTimeInterval:0.35];
+                    } else {
+                        [MediaUploadMemoryGateObjC waitForHeadroom];
+                    }
+                }
+                [NCLog logSync:[NSString stringWithFormat:@"ShareItemController: after compress %ld/%ld → next",
+                                (long)(index + 1), (long)totalToCompress]];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    typeof(self) innerSelf = weakSelf;
+                    [NCLog logSync:[NSString stringWithFormat:@"ShareItemController: main after compress %ld/%ld",
+                                    (long)(index + 1), (long)totalToCompress]];
+                    [innerSelf endPreparingItem];
+                    completedCount += 1;
+                    currentItemFraction = 0.0f;
+                    reportOverall();
+                    processNext(index + 1);
+                });
+            });
         }];
-    }
+    };
 
-    dispatch_group_notify(group, dispatch_get_main_queue(), ^{
-        BOOL cancelled = self.activePreparationToken.isCancelled;
-        self.activePreparationToken = nil;
-        [NCLog log:[NSString stringWithFormat:@"ShareItemController: prepareItemsForUpload — finished (cancelled=%d)", cancelled]];
-        [self.delegate shareItemControllerItemsChanged:self];
-        if (completion) {
-            completion();
-        }
-    });
+    processNext(0);
 }
 
 @end

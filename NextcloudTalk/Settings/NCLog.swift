@@ -50,30 +50,47 @@
         let currentQueueName = Thread.current.queueName
 
         backgroundLogQueue.async {
-            do {
-                let now = Date()
+            appendLogLine(message, queueName: currentQueueName, logfilePath: logfilePath)
+        }
+    }
 
-                var logMessage = "\(logLineDateFormatter.string(from: now)) "
-                logMessage += "(\(currentQueueName)): \(message)\n"
+    /// Writes immediately — use on jetsam-prone paths where async `log` may never flush.
+    @objc public static func logSync(_ message: String) {
+        guard let logfilePath else {
+            NSLog("%@", message)
+            return
+        }
+        let currentQueueName = Thread.current.queueName
+        // Serialize with the async logger so lines stay ordered.
+        backgroundLogQueue.sync {
+            appendLogLine(message, queueName: currentQueueName, logfilePath: logfilePath)
+        }
+    }
 
-                let dateString = fileNameDateFormatter.string(from: now)
-                let logFileName = "debug-\(dateString).log"
-                let fullPath = logfilePath.appendingPathComponent(logFileName).path
+    private static func appendLogLine(_ message: String, queueName: String, logfilePath: URL) {
+        do {
+            let now = Date()
 
-                if let fileHandle = FileHandle(forWritingAtPath: fullPath) {
-                    fileHandle.seekToEndOfFile()
-                    // UTF-8 will never be nil
-                    try fileHandle.write(contentsOf: logMessage.data(using: .utf8)!)
-                    try fileHandle.close()
-                } else {
-                    try logMessage.write(toFile: fullPath, atomically: false, encoding: .utf8)
-                }
+            var logMessage = "\(logLineDateFormatter.string(from: now)) "
+            logMessage += "(\(queueName)): \(message)\n"
 
-                NSLog("%@", logMessage)
-            } catch {
-                NSLog("Exception in NCLog.log: %@", error.localizedDescription)
-                NSLog("Message: %@", message)
+            let dateString = fileNameDateFormatter.string(from: now)
+            let logFileName = "debug-\(dateString).log"
+            let fullPath = logfilePath.appendingPathComponent(logFileName).path
+
+            if let fileHandle = FileHandle(forWritingAtPath: fullPath) {
+                fileHandle.seekToEndOfFile()
+                // UTF-8 will never be nil
+                try fileHandle.write(contentsOf: logMessage.data(using: .utf8)!)
+                try fileHandle.close()
+            } else {
+                try logMessage.write(toFile: fullPath, atomically: false, encoding: .utf8)
             }
+
+            NSLog("%@", logMessage)
+        } catch {
+            NSLog("Exception in NCLog.log: %@", error.localizedDescription)
+            NSLog("Message: %@", message)
         }
     }
 

@@ -490,124 +490,105 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
 
     // MARK: - Title menu
 
-    private func getActiveAccountMenuOptions() -> UIMenu {
+    /// Eager menu (no `UIDeferredMenuElement`) so the avatar menu opens at full size —
+    /// deferred network/account loads used to expand mid-animation and look bouncy.
+    private func getActiveAccountMenuOptions() -> UIMenu? {
         let activeAccount = NCDatabaseManager.sharedInstance().activeAccount()
         let serverCapabilities = NCDatabaseManager.sharedInstance().serverCapabilities(forAccountId: activeAccount.accountId)
 
-        let userStatusDeferred = UIDeferredMenuElement.uncached { [weak self] completion in
-            guard let self else {
-                completion([])
-                return
-            }
-
-            if serverCapabilities == nil || !(serverCapabilities?.userStatus ?? false) {
-                completion([])
-                return
-            }
-
-            NCAPIController.sharedInstance().getUserStatus(forAccount: activeAccount) { userStatus in
-                guard let userStatus else {
-                    completion([])
-                    return
-                }
-
-                let userStatusImage = userStatus.getSFUserStatusIcon()
-                let vc = UserStatusSwiftUIViewFactory.create(userStatus: userStatus, delegate: self)
-
-                let onlineOption = UIAction(title: userStatus.readableUserStatusOrMessage(), image: userStatusImage, identifier: nil) { _ in
-                    self.present(vc, animated: true)
-                }
-
-                self.activeUserStatus = userStatus
-                self.updateProfileButtonImage()
-
-                completion([onlineOption])
-            }
+        guard serverCapabilities?.userStatus == true else {
+            return nil
         }
 
-        return UIMenu(title: "", image: nil, identifier: nil, options: .displayInline, children: [userStatusDeferred])
+        let status = activeUserStatus
+        let title = status?.readableUserStatusOrMessage() ?? NSLocalizedString("Status", comment: "")
+        let image = status?.getSFUserStatusIcon()
+
+        let onlineOption = UIAction(title: title, image: image, identifier: nil) { [weak self] _ in
+            guard let self else { return }
+            let userStatus = self.activeUserStatus ?? NCUserStatus()
+            let vc = UserStatusSwiftUIViewFactory.create(userStatus: userStatus, delegate: self)
+            self.present(vc, animated: true)
+            self.updateUserStatus()
+        }
+
+        return UIMenu(title: "", image: nil, identifier: nil, options: .displayInline, children: [onlineOption])
     }
 
-    private func getInactiveAccountMenuOptions() -> UIDeferredMenuElement {
-        // We use a deferred action here to always have an up-to-date list of inactive accounts and their notifications
-        let inactiveAccountMenuDeferred = UIDeferredMenuElement.uncached { [weak self] completion in
-            guard let self else {
-                completion([])
-                return
-            }
+    private func getInactiveAccountMenuOptions() -> UIMenu? {
+        var inactiveAccounts: [UIMenuElement] = []
 
-            var inactiveAccounts: [UIMenuElement] = []
+        for account in NCDatabaseManager.sharedInstance().inactiveAccounts() {
+            let accountName = account.userDisplayName
+            var accountImage = NCAPIController.sharedInstance().userProfileImage(forAccount: account, withStyle: self.traitCollection.userInterfaceStyle)
 
-            for account in NCDatabaseManager.sharedInstance().inactiveAccounts() {
-                let accountName = account.userDisplayName
-                var accountImage = NCAPIController.sharedInstance().userProfileImage(forAccount: account, withStyle: self.traitCollection.userInterfaceStyle)
+            if var image = accountImage {
+                image = NCUtils.roundedImage(fromImage: image)
 
-                if var image = accountImage {
-                    image = NCUtils.roundedImage(fromImage: image)
+                // Draw a red circle to the image in case we have unread notifications for that account
+                if account.unreadNotification {
+                    UIGraphicsBeginImageContextWithOptions(CGSize(width: 82, height: 82), false, 3)
+                    let context = UIGraphicsGetCurrentContext()
+                    image.draw(in: CGRect(x: 0, y: 4, width: 78, height: 78))
+                    context?.saveGState()
 
-                    // Draw a red circle to the image in case we have unread notifications for that account
-                    if account.unreadNotification {
-                        UIGraphicsBeginImageContextWithOptions(CGSize(width: 82, height: 82), false, 3)
-                        let context = UIGraphicsGetCurrentContext()
-                        image.draw(in: CGRect(x: 0, y: 4, width: 78, height: 78))
-                        context?.saveGState()
+                    context?.setFillColor(UIColor.systemRed.cgColor)
+                    context?.fillEllipse(in: CGRect(x: 52, y: 0, width: 30, height: 30))
 
-                        context?.setFillColor(UIColor.systemRed.cgColor)
-                        context?.fillEllipse(in: CGRect(x: 52, y: 0, width: 30, height: 30))
+                    image = UIGraphicsGetImageFromCurrentImageContext() ?? image
 
-                        image = UIGraphicsGetImageFromCurrentImageContext() ?? image
-
-                        UIGraphicsEndImageContext()
-                    }
-
-                    accountImage = image
+                    UIGraphicsEndImageContext()
                 }
 
-                let switchAccountAction = UIAction(title: accountName, image: accountImage, identifier: nil) { _ in
-                    NCSettingsController.sharedInstance().setActiveAccountWithAccountId(account.accountId)
-                }
-
-                if account.unreadBadgeNumber > 0 {
-                    switchAccountAction.subtitle = String.localizedStringWithFormat(NSLocalizedString("%ld notifications", comment: ""), account.unreadBadgeNumber)
-                } else {
-                    switchAccountAction.subtitle = account.server.replacingOccurrences(of: "https://", with: "")
-                }
-
-                inactiveAccounts.append(switchAccountAction)
+                accountImage = image
             }
 
-            if !inactiveAccounts.isEmpty {
-                let activeAccount = NCDatabaseManager.sharedInstance().activeAccount()
-                var accountImage = NCAPIController.sharedInstance().userProfileImage(forAccount: activeAccount, withStyle: self.traitCollection.userInterfaceStyle)
-                if let image = accountImage {
-                    accountImage = NCUtils.roundedImage(fromImage: image)
-                }
-                let activeAccountAction = UIAction(title: activeAccount.userDisplayName, image: accountImage, identifier: nil) { _ in }
-                activeAccountAction.subtitle = activeAccount.server.replacingOccurrences(of: "https://", with: "")
-                activeAccountAction.state = .on
-                inactiveAccounts.insert(activeAccountAction, at: 0)
+            let switchAccountAction = UIAction(title: accountName, image: accountImage, identifier: nil) { _ in
+                NCSettingsController.sharedInstance().setActiveAccountWithAccountId(account.accountId)
             }
 
-            let inactiveAccountsMenu = UIMenu(title: "", image: nil, identifier: nil, options: .displayInline, children: inactiveAccounts)
-            if #available(iOS 17.4, *) {
-                let displayPreferences = UIMenuDisplayPreferences()
-                displayPreferences.maximumNumberOfTitleLines = 1
-
-                inactiveAccountsMenu.displayPreferences = displayPreferences
+            if account.unreadBadgeNumber > 0 {
+                switchAccountAction.subtitle = String.localizedStringWithFormat(NSLocalizedString("%ld notifications", comment: ""), account.unreadBadgeNumber)
+            } else {
+                switchAccountAction.subtitle = account.server.replacingOccurrences(of: "https://", with: "")
             }
 
-            completion([inactiveAccountsMenu])
+            inactiveAccounts.append(switchAccountAction)
         }
 
-        return inactiveAccountMenuDeferred
+        guard !inactiveAccounts.isEmpty else {
+            return nil
+        }
+
+        let activeAccount = NCDatabaseManager.sharedInstance().activeAccount()
+        var accountImage = NCAPIController.sharedInstance().userProfileImage(forAccount: activeAccount, withStyle: self.traitCollection.userInterfaceStyle)
+        if let image = accountImage {
+            accountImage = NCUtils.roundedImage(fromImage: image)
+        }
+        let activeAccountAction = UIAction(title: activeAccount.userDisplayName, image: accountImage, identifier: nil) { _ in }
+        activeAccountAction.subtitle = activeAccount.server.replacingOccurrences(of: "https://", with: "")
+        activeAccountAction.state = .on
+        inactiveAccounts.insert(activeAccountAction, at: 0)
+
+        let inactiveAccountsMenu = UIMenu(title: "", image: nil, identifier: nil, options: .displayInline, children: inactiveAccounts)
+        if #available(iOS 17.4, *) {
+            let displayPreferences = UIMenuDisplayPreferences()
+            displayPreferences.maximumNumberOfTitleLines = 1
+            inactiveAccountsMenu.displayPreferences = displayPreferences
+        }
+
+        return inactiveAccountsMenu
     }
 
     private func updateAccountPickerMenu() {
         var accountPickerMenu: [UIMenuElement] = []
 
-        // When no elements are returned by the deferred menu, the entries / inline-menu will be hidden
-        accountPickerMenu.append(getActiveAccountMenuOptions())
-        accountPickerMenu.append(getInactiveAccountMenuOptions())
+        if let statusMenu = getActiveAccountMenuOptions() {
+            accountPickerMenu.append(statusMenu)
+        }
+        if let accountsMenu = getInactiveAccountMenuOptions() {
+            accountPickerMenu.append(accountsMenu)
+        }
 
         var optionItems: [UIMenuElement] = []
 
@@ -1173,6 +1154,7 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
             if let userStatus {
                 self?.activeUserStatus = userStatus
                 self?.updateProfileButtonImage()
+                self?.updateAccountPickerMenu()
             }
         }
     }
@@ -1185,6 +1167,10 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
             } else {
                 settingsButton.legacyBadgeValue = "\(inactiveUnreadCount)"
             }
+        }
+        // Keep account-switcher badge counts in the menu in sync without deferred reload jumps.
+        if profileButton != nil {
+            updateAccountPickerMenu()
         }
     }
 

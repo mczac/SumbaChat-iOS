@@ -105,10 +105,16 @@ class NotificationService: UNNotificationServiceExtension {
         }
 
         if pushNotification.type == .adminNotification {
-            // Test notification send through "occ notification:test-push --talk <userid>"
-            // No need to increase the badge or query the server about it
-
+            // System announcement / occ notification:test-push --talk
+            // Keep badge unchanged; still play sound and brand the alert like chat pushes.
+            self.bestAttemptContent?.title = "SumbaChat"
+            self.bestAttemptContent?.subtitle = "System announcement"
             self.bestAttemptContent?.body = pushNotification.subject
+            self.bestAttemptContent?.sound = .default
+            self.bestAttemptContent?.threadIdentifier = "system-announcements"
+            if let iconAttachment = self.systemAnnouncementIconAttachment() {
+                self.bestAttemptContent?.attachments = [iconAttachment]
+            }
             self.showBestAttemptNotification()
             return
         }
@@ -264,6 +270,14 @@ class NotificationService: UNNotificationServiceExtension {
         } else {
             self.contentHandler?(bestAttemptContent)
         }
+    }
+
+    /// Bundled SumbaChat mark shown as the notification attachment on system announcements.
+    private func systemAnnouncementIconAttachment() -> UNNotificationAttachment? {
+        guard let image = UIImage(named: "SystemAnnouncementIcon") else {
+            return nil
+        }
+        return getNotificationAttachment(fromImage: image, forAccountId: "system-announcement")
     }
 
     private func getNotificationAttachment(fromImage image: UIImage, forAccountId accountId: String) -> UNNotificationAttachment? {

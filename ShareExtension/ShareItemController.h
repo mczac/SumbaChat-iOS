@@ -17,6 +17,9 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)shareItemControllerPreparingItemsChanged:(ShareItemController *)shareItemController;
 /// Called when one or more attachments could not be loaded (e.g. iCloud not available).
 - (void)shareItemController:(ShareItemController *)shareItemController didFailToStageItemsWithNames:(NSArray<NSString *> *)fileNames;
+@optional
+/// Drop decoded pager bitmaps between serial encodes (jetsam mitigation).
+- (void)shareItemControllerShouldReleaseHeavyPreviews:(ShareItemController *)shareItemController;
 
 @end
 

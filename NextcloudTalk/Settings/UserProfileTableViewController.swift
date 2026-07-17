@@ -227,7 +227,7 @@ extension UserProfileTableViewController {
     // MARK: Header View Setup
 
     func setupViewForSection(headerView: inout HeaderWithButton, title: String, buttonTag: Int, enabled: Bool?, scopeForImage: String) {
-        headerView.label.text = title.uppercased()
+        headerView.label.text = title
         headerView.button.tag = buttonTag
         if let enabled = enabled {
             headerView.button.isEnabled = enabled

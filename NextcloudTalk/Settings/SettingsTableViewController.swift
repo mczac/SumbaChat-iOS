@@ -46,10 +46,8 @@ enum AboutSection: Int {
     case kAboutSectionSourceCode
 }
 
-class SettingsTableViewController: UITableViewController, UITextFieldDelegate, UserStatusViewDelegate, CallsFromOldAccountViewControllerDelegate {
+class SettingsTableViewController: UITableViewController, UITextFieldDelegate, UserStatusViewDelegate, CallsFromOldAccountViewControllerDelegate, DetailedOptionsSelectorTableViewControllerDelegate {
     let kPhoneTextFieldTag = 99
-
-    let iconConfiguration = UIImage.SymbolConfiguration(pointSize: 18)
 
     var activeUserStatus: NCUserStatus?
     var readStatusSwitch = UISwitch()
@@ -403,69 +401,75 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
 
     // MARK: - Configuration
 
+    private let mediaUploadModeSenderId = "mediaUploadMode"
+    private let videoResolutionSenderId = "videoResolution"
+
     func presentUploadMediaModeSelector() {
-        let indexPath = self.getIndexPathForConfigurationOption(option: ConfigurationSectionOption.kConfigurationSectionOptionUploadMedia)
         let currentMode = MediaUploadMode(rawValue: Int(NCUserDefaults.mediaUploadMode())) ?? .automatic
-
-        let optionsActionSheet = UIAlertController(title: NSLocalizedString("Media Compression", comment: ""), message: nil, preferredStyle: .actionSheet)
-
         let modes: [(MediaUploadMode, String)] = [
             (.noCompression, NSLocalizedString("None", comment: "No media compression")),
             (.automatic, NSLocalizedString("Automatic", comment: "Automatic media compression")),
             (.chooseOnUpload, NSLocalizedString("Manual", comment: "Choose compression level when uploading"))
         ]
 
-        for (mode, title) in modes {
-            let action = UIAlertAction(title: title, style: .default) { _ in
-                NCUserDefaults.setMediaUploadMode(mode.rawValue)
-                self.tableView.beginUpdates()
-                self.tableView.reloadRows(at: [indexPath], with: .none)
-                self.tableView.endUpdates()
-            }
-
-            if mode == currentMode {
-                action.setValue(UIImage(named: "checkmark")?.withRenderingMode(_: .alwaysOriginal), forKey: "image")
-            }
-            optionsActionSheet.addAction(action)
+        let options: [DetailedOption] = modes.map { mode, title in
+            let option = DetailedOption()
+            option.identifier = "\(mode.rawValue)"
+            option.title = title
+            option.selected = mode == currentMode
+            return option
         }
 
-        optionsActionSheet.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel, handler: nil))
-        optionsActionSheet.popoverPresentationController?.sourceView = self.tableView
-        optionsActionSheet.popoverPresentationController?.sourceRect = self.tableView.rectForRow(at: indexPath)
-
-        self.present(optionsActionSheet, animated: true, completion: nil)
+        guard let selector = DetailedOptionsSelectorTableViewController(options: options,
+                                                                        forSenderIdentifier: mediaUploadModeSenderId,
+                                                                        andStyle: .insetGrouped) else { return }
+        selector.title = NSLocalizedString("Media Compression", comment: "")
+        selector.delegate = self
+        navigationController?.pushViewController(selector, animated: true)
     }
 
     func presentVideoResoultionsSelector() {
-        let videoConfIndexPath = self.getIndexPathForConfigurationOption(option: ConfigurationSectionOption.kConfigurationSectionOptionVideo)
         let videoResolutions = NCSettingsController.sharedInstance().videoSettingsModel.availableVideoResolutions()
         let storedResolution = NCSettingsController.sharedInstance().videoSettingsModel.currentVideoResolutionSettingFromStore()
 
-        let optionsActionSheet = UIAlertController(title: NSLocalizedString("Video Call Quality", comment: ""), message: nil, preferredStyle: .actionSheet)
-
-        for resolution in videoResolutions {
-            let readableResolution = NCSettingsController.sharedInstance().videoSettingsModel.readableResolution(resolution)
-            let isStoredResolution = resolution == storedResolution
-            let action = UIAlertAction(title: readableResolution, style: .default) { _ in
-                NCSettingsController.sharedInstance().videoSettingsModel.storeVideoResolutionSetting(resolution)
-                self.tableView.beginUpdates()
-                self.tableView.reloadRows(at: [videoConfIndexPath], with: .none)
-                self.tableView.endUpdates()
-            }
-
-            if isStoredResolution {
-                action.setValue(UIImage(named: "checkmark")?.withRenderingMode(_: .alwaysOriginal), forKey: "image")
-            }
-            optionsActionSheet.addAction(action)
+        let options: [DetailedOption] = videoResolutions.map { resolution in
+            let option = DetailedOption()
+            option.identifier = resolution
+            option.title = NCSettingsController.sharedInstance().videoSettingsModel.readableResolution(resolution)
+            option.selected = resolution == storedResolution
+            return option
         }
 
-        optionsActionSheet.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel, handler: nil))
+        guard let selector = DetailedOptionsSelectorTableViewController(options: options,
+                                                                        forSenderIdentifier: videoResolutionSenderId,
+                                                                        andStyle: .insetGrouped) else { return }
+        selector.title = NSLocalizedString("Video Call Quality", comment: "")
+        selector.delegate = self
+        navigationController?.pushViewController(selector, animated: true)
+    }
 
-        // Presentation on iPads
-        optionsActionSheet.popoverPresentationController?.sourceView = self.tableView
-        optionsActionSheet.popoverPresentationController?.sourceRect = self.tableView.rectForRow(at: videoConfIndexPath)
+    func detailedOptionsSelector(_ viewController: DetailedOptionsSelectorTableViewController!,
+                                 didSelectOptionWithIdentifier option: DetailedOption!) {
+        guard let option else { return }
+        let senderId = viewController.senderId ?? ""
 
-        self.present(optionsActionSheet, animated: true, completion: nil)
+        if senderId == mediaUploadModeSenderId,
+           let raw = Int(option.identifier ?? ""),
+           let mode = MediaUploadMode(rawValue: raw) {
+            NCUserDefaults.setMediaUploadMode(mode.rawValue)
+            let indexPath = getIndexPathForConfigurationOption(option: .kConfigurationSectionOptionUploadMedia)
+            tableView.reloadRows(at: [indexPath], with: .none)
+        } else if senderId == videoResolutionSenderId, let resolution = option.identifier {
+            NCSettingsController.sharedInstance().videoSettingsModel.storeVideoResolutionSetting(resolution)
+            let indexPath = getIndexPathForConfigurationOption(option: .kConfigurationSectionOptionVideo)
+            tableView.reloadRows(at: [indexPath], with: .none)
+        }
+
+        navigationController?.popViewController(animated: true)
+    }
+
+    func detailedOptionsSelectorWasCancelled(_ viewController: DetailedOptionsSelectorTableViewController!) {
+        navigationController?.popViewController(animated: true)
     }
 
     @objc func contactSyncValueChanged(_ sender: Any?) {
@@ -660,7 +664,7 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
 
         switch settingsSection {
         case SettingsSection.kSettingsSectionOtherAccounts.rawValue:
-            return NSLocalizedString("Other Accounts", comment: "")
+            return NSLocalizedString("Other accounts", comment: "")
         case SettingsSection.kSettingsSectionConfiguration.rawValue:
             return NSLocalizedString("Compression", comment: "")
         case SettingsSection.kSettingsSectionDebug.rawValue:
@@ -670,9 +674,12 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         case SettingsSection.kSettingsSectionAbout.rawValue:
             return NSLocalizedString("About", comment: "")
         default:
-            break
+            return nil
         }
-        return nil
+    }
+
+    override func tableView(_ tableView: UITableView, willDisplayHeaderView view: UIView, forSection section: Int) {
+        applyAppleStyleSectionHeader(view, title: self.tableView(tableView, titleForHeaderInSection: section))
     }
 
     override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
@@ -680,9 +687,9 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         let settingsSection = sections[section]
 
         if settingsSection == SettingsSection.kSettingsSectionAbout.rawValue {
-            let appName = (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)!
-
-            return "\(appName) \(NCAppBranding.getAppVersionString())\n\(copyright)\n\(licenseNotice)"
+            let version = NCAppBranding.getAppVersionString() ?? ""
+            let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+            return "\(copyright), version \(version), build \(build)\n\(licenseNotice)"
         }
 
         if settingsSection == SettingsSection.kSettingsSectionAccountSettings.rawValue && contactSyncSwitch.isOn {
@@ -750,11 +757,11 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
             return sectionConfigurationCell(for: indexPath)
 
         case SettingsSection.kSettingsSectionDebug.rawValue:
-            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "DebugCompressionCell", style: .subtitle)
-            cell.textLabel?.text = NSLocalizedString("Compression Debug", comment: "")
-            cell.detailTextLabel?.text = NSLocalizedString("Engine, caps, Low/Medium/High", comment: "")
+            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "DebugCompressionCell", style: .default)
+            cell.textLabel?.text = NSLocalizedString("Media Compression Settings", comment: "")
+            cell.detailTextLabel?.text = nil
             cell.accessoryType = .disclosureIndicator
-            cell.setSettingsImage(image: UIImage(systemName: "wrench.and.screwdriver", withConfiguration: iconConfiguration))
+            cell.setColoredSettingsIcon(systemName: "slider.horizontal.3", backgroundColor: SettingsIconColor.orange)
             return cell
 
         case SettingsSection.kSettingsSectionAdvanced.rawValue:
@@ -880,7 +887,7 @@ extension SettingsTableViewController {
         case AccountSettingsOptions.kAccountSettingsReadStatusPrivacy.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: userSettingsCellIdentifier, style: .subtitle)
             cell.textLabel?.text = NSLocalizedString("Read status", comment: "")
-            cell.setSettingsImage(image: UIImage(named: "check-all"))
+            cell.setColoredSettingsIcon(image: UIImage(named: "check-all"), backgroundColor: SettingsIconColor.red)
             cell.accessoryView = readStatusSwitch
             readStatusSwitch.isOn = !(serverCapabilities?.readStatusPrivacy ?? true)
             cell.selectionStyle = .none
@@ -889,7 +896,7 @@ extension SettingsTableViewController {
         case AccountSettingsOptions.kAccountSettingsTypingPrivacy.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: userSettingsCellIdentifier, style: .subtitle)
             cell.textLabel?.text = NSLocalizedString("Typing indicator", comment: "")
-            cell.setSettingsImage(image: UIImage(systemName: "rectangle.and.pencil.and.ellipsis")?.applyingSymbolConfiguration(iconConfiguration))
+            cell.setColoredSettingsIcon(systemName: "rectangle.and.pencil.and.ellipsis", backgroundColor: SettingsIconColor.red)
             cell.accessoryView = typingIndicatorSwitch
             typingIndicatorSwitch.isOn = !(serverCapabilities?.typingPrivacy ?? true)
             cell.selectionStyle = .none
@@ -906,7 +913,7 @@ extension SettingsTableViewController {
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: userSettingsCellIdentifier, style: .subtitle)
             cell.textLabel?.text = NSLocalizedString("Phone number integration", comment: "")
             cell.detailTextLabel?.text = NSLocalizedString("Match system contacts", comment: "")
-            cell.setSettingsImage(image: UIImage(systemName: "iphone")?.applyingSymbolConfiguration(iconConfiguration))
+            cell.setColoredSettingsIcon(systemName: "iphone", backgroundColor: SettingsIconColor.green)
             cell.accessoryView = contactSyncSwitch
             contactSyncSwitch.isOn = NCSettingsController.sharedInstance().isContactSyncEnabled()
             cell.selectionStyle = .none
@@ -915,7 +922,7 @@ extension SettingsTableViewController {
         case AccountSettingsOptions.kAccountSettingsRecents.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: userSettingsCellIdentifier, style: .default)
             cell.textLabel?.text = NSLocalizedString("Include calls in call history", comment: "")
-            cell.setSettingsImage(image: UIImage(systemName: "clock.arrow.circlepath")?.applyingSymbolConfiguration(iconConfiguration))
+            cell.setColoredSettingsIcon(systemName: "clock.arrow.circlepath", backgroundColor: SettingsIconColor.green)
             cell.selectionStyle = .none
             cell.accessoryView = includeInRecentsSwitch
             includeInRecentsSwitch.isOn = NCUserDefaults.includeCallsInRecents()
@@ -950,37 +957,31 @@ extension SettingsTableViewController {
     }
 
     func sectionConfigurationCell(for indexPath: IndexPath) -> UITableViewCell {
-        let configurationCellIdentifier = "ConfigurationCellIdentifier"
+        // value1 style is fixed at creation — keep a dedicated reuse id for selection rows.
+        let configurationValueCellIdentifier = "ConfigurationValueCellIdentifier"
 
         let options = getConfigurationSectionOptions()
         let option = options[indexPath.row]
 
         switch option {
         case ConfigurationSectionOption.kConfigurationSectionOptionUploadMedia.rawValue:
-            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: configurationCellIdentifier, style: .default)
+            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: configurationValueCellIdentifier, style: .value1)
             cell.textLabel?.text = NSLocalizedString("Media Compression", comment: "")
-            cell.setSettingsImage(image: UIImage(systemName: "arrow.up.circle")?.applyingSymbolConfiguration(iconConfiguration))
-
-            let modeLabel = UILabel()
-            modeLabel.text = self.readableMediaUploadMode(MediaUploadMode(rawValue: Int(NCUserDefaults.mediaUploadMode())) ?? .automatic)
-            modeLabel.textColor = .secondaryLabel
-            modeLabel.sizeToFit()
-            cell.accessoryView = modeLabel
-
+            cell.setColoredSettingsIcon(systemName: "arrow.up.circle", backgroundColor: SettingsIconColor.blue)
+            cell.detailTextLabel?.text = self.readableMediaUploadMode(MediaUploadMode(rawValue: Int(NCUserDefaults.mediaUploadMode())) ?? .automatic)
+            cell.detailTextLabel?.textColor = .secondaryLabel
+            cell.accessoryType = .disclosureIndicator
             return cell
 
         case ConfigurationSectionOption.kConfigurationSectionOptionVideo.rawValue:
-            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: configurationCellIdentifier, style: .default)
+            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: configurationValueCellIdentifier, style: .value1)
             cell.textLabel?.text = NSLocalizedString("Video Call Quality", comment: "")
-            cell.setSettingsImage(image: UIImage(systemName: "video")?.applyingSymbolConfiguration(iconConfiguration))
+            cell.setColoredSettingsIcon(systemName: "video", backgroundColor: SettingsIconColor.green)
 
             let resolution = NCSettingsController.sharedInstance().videoSettingsModel.currentVideoResolutionSettingFromStore()
-            let resolutionLabel = UILabel()
-            resolutionLabel.text = NCSettingsController.sharedInstance().videoSettingsModel.readableResolution(resolution)
-            resolutionLabel.textColor = .secondaryLabel
-            resolutionLabel.sizeToFit()
-            cell.accessoryView = resolutionLabel
-
+            cell.detailTextLabel?.text = NCSettingsController.sharedInstance().videoSettingsModel.readableResolution(resolution)
+            cell.detailTextLabel?.textColor = .secondaryLabel
+            cell.accessoryType = .disclosureIndicator
             return cell
 
         default:
@@ -1011,14 +1012,14 @@ extension SettingsTableViewController {
         case AdvancedSectionOption.kAdvancedSectionOptionDiagnostics.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: advancedCellIdentifier, style: .default)
             cell.textLabel?.text = NSLocalizedString("Diagnostics", comment: "")
-            cell.setSettingsImage(image: UIImage(systemName: "gear")?.applyingSymbolConfiguration(iconConfiguration))
+            cell.setColoredSettingsIcon(systemName: "gear", backgroundColor: SettingsIconColor.orange)
             cell.accessoryType = .disclosureIndicator
             return cell
 
         case AdvancedSectionOption.kAdvancedSectionOptionCallFromOldAccount.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: advancedCellIdentifier, style: .default)
             cell.textLabel?.text = NSLocalizedString("Calls from old accounts", comment: "")
-            cell.setSettingsImage(image: UIImage(systemName: "exclamationmark.triangle.fill")?.applyingSymbolConfiguration(iconConfiguration))
+            cell.setColoredSettingsIcon(systemName: "exclamationmark.triangle.fill", backgroundColor: SettingsIconColor.yellow)
             cell.accessoryType = .disclosureIndicator
             return cell
 
@@ -1029,7 +1030,7 @@ extension SettingsTableViewController {
 
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: advancedCellIdentifier, style: .default)
             cell.textLabel?.text = NSLocalizedString("Cached images", comment: "")
-            cell.setSettingsImage(image: UIImage(systemName: "photo")?.applyingSymbolConfiguration(iconConfiguration))
+            cell.setColoredSettingsIcon(systemName: "photo", backgroundColor: SettingsIconColor.blue)
 
             let byteCounterLabel = UILabel()
             byteCounterLabel.text = byteFormatter.string(fromByteCount: Int64(self.totalImageCacheSize))
@@ -1046,7 +1047,7 @@ extension SettingsTableViewController {
 
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: advancedCellIdentifier, style: .default)
             cell.textLabel?.text = NSLocalizedString("Cached files", comment: "")
-            cell.setSettingsImage(image: UIImage(systemName: "doc")?.applyingSymbolConfiguration(iconConfiguration))
+            cell.setColoredSettingsIcon(systemName: "doc", backgroundColor: SettingsIconColor.blue)
 
             let byteCounterLabel = UILabel()
             byteCounterLabel.text = byteFormatter.string(fromByteCount: Int64(self.totalFileCacheSize))
@@ -1071,13 +1072,15 @@ extension SettingsTableViewController {
         case AboutSection.kAboutSectionPrivacy.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: aboutCellIdentifier, style: .default)
             cell.textLabel?.text = NSLocalizedString("Privacy", comment: "")
-            cell.setSettingsImage(image: UIImage(systemName: "lock.shield")?.applyingSymbolConfiguration(iconConfiguration))
+            cell.setColoredSettingsIcon(systemName: "lock.shield", backgroundColor: SettingsIconColor.gray)
+            cell.accessoryType = .disclosureIndicator
             return cell
 
         case AboutSection.kAboutSectionSourceCode.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: aboutCellIdentifier, style: .default)
             cell.textLabel?.text = NSLocalizedString("Get source code", comment: "")
-            cell.setSettingsImage(image: UIImage(named: "github"))
+            cell.setColoredSettingsIcon(image: UIImage(named: "github"), backgroundColor: SettingsIconColor.purple)
+            cell.accessoryType = .disclosureIndicator
             return cell
 
         default:

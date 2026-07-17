@@ -137,7 +137,7 @@ final class UIRoomTest: XCTestCase {
         // Send a test message
         let testMessage = "TestMessage - DeAlloc"
         let toolbar = app.otherElements["SLKTextInputbar"]
-        let textView = toolbar.textViews["Write message, @ to mention someone …"]
+        let textView = toolbar.textViews["Message"]
         XCTAssert(textView.waitForExistence(timeout: TestConstants.timeoutShort))
         textView.tap()
         app.typeText(testMessage)
@@ -217,7 +217,7 @@ final class UIRoomTest: XCTestCase {
         let replyMessage = "ReplyMessage"
 
         let toolbar = app.otherElements["SLKTextInputbar"]
-        let textView = toolbar.textViews["Write message, @ to mention someone …"]
+        let textView = toolbar.textViews["Message"]
         XCTAssert(textView.waitForExistence(timeout: TestConstants.timeoutShort))
         textView.tap()
         app.typeText(testMessage)
@@ -253,7 +253,7 @@ final class UIRoomTest: XCTestCase {
 
         // Select a mention
         let toolbar = app.otherElements["SLKTextInputbar"]
-        let textView = toolbar.textViews["Write message, @ to mention someone …"]
+        let textView = toolbar.textViews["Message"]
         XCTAssert(textView.waitForExistence(timeout: TestConstants.timeoutShort))
         textView.tap()
         textView.typeText("@")
@@ -358,7 +358,7 @@ final class UIRoomTest: XCTestCase {
 
         // Check that there's no inputbar
         let toolbar = app.otherElements["SLKTextInputbar"]
-        let textView = toolbar.textViews["Write message, @ to mention someone …"]
+        let textView = toolbar.textViews["Message"]
         XCTAssert(!textView.exists)
     }
 
@@ -397,7 +397,7 @@ final class UIRoomTest: XCTestCase {
         // Verify that we cannot send messages (no chat permission)
         // The toolbar/text input should not be present when user cannot chat
         let toolbar = app.otherElements["SLKTextInputbar"]
-        let textView = toolbar.textViews["Write message, @ to mention someone …"]
+        let textView = toolbar.textViews["Message"]
         XCTAssertFalse(textView.exists, "Text input should not exist when user cannot chat")
     }
 }

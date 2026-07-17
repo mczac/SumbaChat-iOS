@@ -57,9 +57,15 @@ import MBProgressHUD
     private var uploadErrors: [String] = []
     private var uploadSuccess: [ShareItem] = []
     private var chosenCompressionLevel: MediaUploadCompressionLevel = .medium
-    private var isPreparingForUpload = false
+    private var isPreparingForUpload = false {
+        didSet { self.updateSheetDismissLock() }
+    }
     /// True from Send until upload finishes/fails — blocks double-Send (seen on iOS 18 Manual).
-    private var isUploadingMedia = false
+    private var isUploadingMedia = false {
+        didSet { self.updateSheetDismissLock() }
+    }
+    /// Skip QL / large image decode while compressing or uploading (jetsam mitigation).
+    private var suppressMediaPreviews = false
     /// Set when the user hits Cancel during prepare/upload — prepare completion must not start PUT.
     private var mediaFlowCancelled = false
     /// In-flight NextcloudKit upload tasks so Cancel can stop the network side too.
@@ -211,7 +217,7 @@ import MBProgressHUD
             button.tag = level.rawValue
             button.titleLabel?.numberOfLines = 2
             button.titleLabel?.textAlignment = .center
-            button.titleLabel?.font = .preferredFont(forTextStyle: .caption2)
+            button.titleLabel?.lineBreakMode = .byWordWrapping
             button.layer.cornerRadius = 10
             button.layer.borderWidth = 1
             button.addTarget(self, action: #selector(compressionOptionPressed(_:)), for: .touchUpInside)
@@ -224,10 +230,10 @@ import MBProgressHUD
     private lazy var compressionTitleLabel: UILabel = {
         let label = UILabel()
         label.translatesAutoresizingMaskIntoConstraints = false
-        label.text = NSLocalizedString("Compression settings", comment: "").uppercased(with: .current)
-        let footnoteSize = UIFont.preferredFont(forTextStyle: .footnote).pointSize
-        label.font = .systemFont(ofSize: footnoteSize, weight: .medium)
-        label.textColor = .secondaryLabel
+        label.text = NSLocalizedString("Compression & Est. Size", comment: "Share sheet section header for compression chips and size estimates").uppercased(with: .current)
+        let baseSize = UIFont.preferredFont(forTextStyle: .footnote).pointSize
+        label.font = .systemFont(ofSize: baseSize + 1, weight: .semibold)
+        label.textColor = .label
         return label
     }()
 
@@ -235,7 +241,7 @@ import MBProgressHUD
         let stack = UIStackView(arrangedSubviews: [self.compressionTitleLabel, self.compressionOptionsView])
         stack.axis = .vertical
         stack.alignment = .fill
-        stack.spacing = 8
+        stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.isHidden = true
         return stack
@@ -259,6 +265,7 @@ import MBProgressHUD
         collectionView.delegate = self
         collectionView.dataSource = self
         collectionView.isPagingEnabled = true
+        collectionView.showsHorizontalScrollIndicator = false
         collectionView.showsVerticalScrollIndicator = false
         collectionView.backgroundColor = .systemBackground
         return collectionView
@@ -306,12 +313,12 @@ import MBProgressHUD
             self.shareTextView.bottomAnchor.constraint(equalTo: self.shareContentView.safeAreaLayoutGuide.bottomAnchor, constant: -20)
         ])
 
-        // iOS 26 floating toolbar buttons hang below the toolbar's layout frame; keep clear space.
+        // Keep chips close to the toolbar (iOS 18 look); leave a little room for iOS 26 glass buttons.
         let compressionTopSpacing: CGFloat = {
             if #available(iOS 26, *) {
-                return 28
+                return 10
             }
-            return 12
+            return 8
         }()
 
         NSLayoutConstraint.activate([
@@ -375,6 +382,7 @@ import MBProgressHUD
             self.shareCollectionView.isHidden = true
             self.itemToolbar.isHidden = true
             self.compressionSectionView.isHidden = true
+            self.compressionSectionHeightConstraint?.constant = 0
             self.shareTextView.isHidden = false
             self.shareTextView.text = sharedText
 
@@ -396,6 +404,7 @@ import MBProgressHUD
             self.shareCollectionView.isHidden = true
             self.itemToolbar.isHidden = true
             self.compressionSectionView.isHidden = true
+            self.compressionSectionHeightConstraint?.constant = 0
             self.shareTextView.isHidden = false
             self.shareTextView.isUserInteractionEnabled = false
             self.shareTextView.text = objectShareMessage.parsedMessage().string
@@ -566,9 +575,18 @@ import MBProgressHUD
         self.uploadTasks.removeAll()
         self.isPreparingForUpload = false
         self.isUploadingMedia = false
+        self.suppressMediaPreviews = false
+        self.shareCollectionView.isUserInteractionEnabled = true
         self.compressionOptionsView.isUserInteractionEnabled = true
         self.hideProgressHUD()
         self.updateSendButtonEnabledState()
+    }
+
+    /// Swipe-to-dismiss does not run Cancel — block it while prepare/upload is in flight.
+    private func updateSheetDismissLock() {
+        let locked = self.isPreparingForUpload || self.isUploadingMedia
+        self.isModalInPresentation = locked
+        self.navigationController?.isModalInPresentation = locked
     }
 
     func sendButtonPressed() {
@@ -616,6 +634,7 @@ import MBProgressHUD
         self.mediaFlowCancelled = false
         self.uploadTasks.removeAll()
         self.isUploadingMedia = true
+        self.suppressMediaPreviews = true
         self.updateSendButtonEnabledState()
 
         // Media uses the center HUD only — no nav-bar spinner (avoids double spinners).
@@ -623,13 +642,15 @@ import MBProgressHUD
 
         if mode == .noCompression {
             NCLog.log("Media upload: skipping compression (No Compression)")
-            self.showProgressHUD(phase: .uploading(count: mediaCount), progress: 0, overMedia: true)
+            self.showProgressHUD(phase: .uploading(count: mediaCount), progress: 0, overMedia: !self.shareCollectionView.isHidden)
             self.uploadAndShareFiles()
             return
         }
 
         self.isPreparingForUpload = true
         self.textView.resignFirstResponder()
+        // Keep pager + current previews on screen. Block new QL/decode only (jetsam was from regen, not static thumbs).
+        self.shareCollectionView.isUserInteractionEnabled = false
         self.showProgressHUD(phase: .preparing, progress: 0, overMedia: true)
         NCLog.log("Media upload: preparing \(mediaCount) item(s) for compression")
 
@@ -668,21 +689,42 @@ import MBProgressHUD
             self.applyUploadProgressColors(to: self.hud)
         }, completion: { [weak self] in
             guard let self else { return }
-            self.isPreparingForUpload = false
+            // Keep isPreparingForUpload true until upload path is entered — no preview regen window.
             if self.mediaFlowCancelled {
-                NCLog.log("Media upload: prepare finished after cancel — skipping upload")
+                NCLog.logSync("Media upload: prepare finished after cancel — skipping upload")
+                self.isPreparingForUpload = false
                 self.isUploadingMedia = false
+                self.suppressMediaPreviews = false
+                self.shareCollectionView.isUserInteractionEnabled = true
                 self.compressionOptionsView.isUserInteractionEnabled = true
                 self.hideProgressHUD()
                 self.updateSendButtonEnabledState()
                 return
             }
-            NCLog.log("Media upload: prepare finished, starting upload of \(self.shareItemController.shareItems.count) item(s)")
+            NCLog.logSync("Media upload: prepare finished, starting upload of \(self.shareItemController.shareItems.count) item(s)")
             self.hud?.progress = self.prepareProgressShare
             self.showProgressHUD(phase: .uploading(count: self.shareItemController.shareItems.count),
                                  progress: self.prepareProgressShare,
                                  overMedia: true)
-            self.uploadAndShareFiles()
+            // Brief yield so AVFoundation / HUD layout settle before kicking off N parallel PUTs.
+            // Keep isPreparingForUpload true across this gap (together with isUploadingMedia).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                guard let self else { return }
+                if self.mediaFlowCancelled {
+                    NCLog.logSync("Media upload: upload start skipped — cancelled during handoff")
+                    self.isPreparingForUpload = false
+                    self.isUploadingMedia = false
+                    self.suppressMediaPreviews = false
+                    self.shareCollectionView.isUserInteractionEnabled = true
+                    self.compressionOptionsView.isUserInteractionEnabled = true
+                    self.hideProgressHUD()
+                    self.updateSendButtonEnabledState()
+                    return
+                }
+                NCLog.logSync("Media upload: handoff → uploadAndShareFiles")
+                self.isPreparingForUpload = false
+                self.uploadAndShareFiles()
+            }
         })
     }
 
@@ -713,25 +755,30 @@ import MBProgressHUD
     }
 
     private func updateCompressionOptionsUI() {
-        // Wait until at least one item is staged so we don't overlap the toolbar with empty Zero KB chips.
-        // Also wait until provider load + staging finish — mid-load chips jetsam / show fake sizes.
-        let loadingDone = !self.shareItemController.isBusyLoadingMedia
-        let showQuality = self.mediaUploadMode == .chooseOnUpload
-            && self.shareType == .item
-            && !self.shareItemController.shareItems.isEmpty
-            && loadingDone
+        // Keep the section visible (and height reserved) for Manual mode so chips appearing
+        // later don't shift the media pager. While staging, show disabled chips with "–".
+        let showQuality = self.mediaUploadMode == .chooseOnUpload && self.shareType == .item
 
         self.compressionSectionView.isHidden = !showQuality
-        self.compressionSectionHeightConstraint?.constant = showQuality ? 88 : 0
+        self.compressionSectionHeightConstraint?.constant = showQuality ? 90 : 0
 
         guard showQuality else {
             self.view.layoutIfNeeded()
             return
         }
 
-        // Per-item: compress estimate if we would compress, else original (same as Send skip).
+        let loading = self.shareItemController.isBusyLoadingMedia
         let items = self.shareItemController.shareItems
         let urls = items.compactMap(\.fileURL)
+
+        // Estimates need staged files — avoid mid-copy JPEG/AVAsset work.
+        guard !loading, !urls.isEmpty else {
+            self.applyCompressionChipTitles(estimates: [:], enabled: [], sizesReady: false)
+            self.view.layoutIfNeeded()
+            return
+        }
+
+        // Per-item: compress estimate if we would compress, else original (same as Send skip).
         let totals = MediaUploadPreprocessor.cheapEstimatedByteCounts(forFileURLs: urls)
         let estimates: [MediaUploadCompressionLevel: Int64] = [
             .none: totals.none,
@@ -752,35 +799,68 @@ import MBProgressHUD
         }
 
         NCLog.log("Media upload: Choose-on-upload chips for \(items.count) item(s) — none=\(totals.none) low=\(totals.low) medium=\(totals.medium) high=\(totals.high) enabled=\(enabled.map(\.rawValue).sorted()) (see MediaUploadHeuristic lines for per-item rates/sizes)")
-        self.applyCompressionChipTitles(estimates: estimates, enabled: enabled)
+        self.applyCompressionChipTitles(estimates: estimates, enabled: enabled, sizesReady: true)
         self.view.layoutIfNeeded()
     }
 
     private func applyCompressionChipTitles(estimates: [MediaUploadCompressionLevel: Int64],
-                                            enabled: Set<MediaUploadCompressionLevel>) {
+                                            enabled: Set<MediaUploadCompressionLevel>,
+                                            sizesReady: Bool) {
         let elementColor = NCAppBranding.elementColor()
+        let levelFont = UIFont.systemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .bold)
+        let sizeFont = UIFont.preferredFont(forTextStyle: .caption2)
+
         for case let button as UIButton in self.compressionOptionsView.arrangedSubviews {
             guard let level = MediaUploadCompressionLevel(rawValue: button.tag) else { continue }
-            let estimated = estimates[level] ?? 0
-            let title = "\(self.title(for: level))\n\(self.sizeLabel(for: level, estimated: estimated))"
-            button.setTitle(title, for: .normal)
+            let levelTitle = self.title(for: level).uppercased(with: .current)
+            let sizeTitle: String
+            let isEnabled: Bool
+            if sizesReady {
+                let estimated = estimates[level] ?? 0
+                sizeTitle = self.sizeLabel(for: level, estimated: estimated)
+                isEnabled = enabled.contains(level)
+            } else {
+                sizeTitle = "–"
+                isEnabled = false
+            }
 
-            let isEnabled = enabled.contains(level)
             button.isEnabled = isEnabled
             button.alpha = isEnabled ? 1.0 : 0.4
 
             let selected = isEnabled && level == self.chosenCompressionLevel
+            let titleColor: UIColor
             if selected {
                 button.backgroundColor = elementColor
                 button.layer.borderColor = elementColor.cgColor
-                button.setTitleColor(.white, for: .normal)
+                titleColor = .white
             } else {
                 button.backgroundColor = .secondarySystemBackground
                 button.layer.borderColor = UIColor.separator.cgColor
-                button.setTitleColor(isEnabled ? .label : .tertiaryLabel, for: .normal)
+                titleColor = isEnabled ? .label : .tertiaryLabel
             }
+
+            let attributed = NSMutableAttributedString()
+            attributed.append(NSAttributedString(string: levelTitle + "\n", attributes: [
+                .font: levelFont,
+                .foregroundColor: titleColor,
+                .paragraphStyle: Self.centeredChipParagraphStyle
+            ]))
+            attributed.append(NSAttributedString(string: sizeTitle, attributes: [
+                .font: sizeFont,
+                .foregroundColor: titleColor,
+                .paragraphStyle: Self.centeredChipParagraphStyle
+            ]))
+            button.setAttributedTitle(attributed, for: .normal)
+            button.setTitleColor(titleColor, for: .normal)
         }
     }
+
+    private static let centeredChipParagraphStyle: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        style.lineBreakMode = .byWordWrapping
+        return style
+    }()
 
     private func configureCompressionUI() {
         MediaUploadAutomaticPolicy.startMonitoringIfNeeded()
@@ -807,10 +887,9 @@ import MBProgressHUD
 
         var details: String {
             switch self {
-            case .loadingMedia:
-                return ""
-            case .preparing:
-                // Keep a second line so label Y matches the Uploading phase.
+            case .loadingMedia, .preparing:
+                // Keep a second line so spinner/ring + labels stay vertically centered
+                // across Loading / Preparing / Uploading (same bezel height).
                 return "\u{00a0}"
             case .uploading(let count):
                 if count == 1 {
@@ -824,30 +903,15 @@ import MBProgressHUD
         }
     }
 
-    private func styleStagingHUD(_ hud: MBProgressHUD) {
-        hud.bezelView.style = .solidColor
-        hud.bezelView.color = .clear
-        hud.bezelView.layer.borderWidth = 0
-        hud.bezelView.layer.shadowOpacity = 0
-        hud.backgroundView.color = .clear
-        hud.backgroundView.style = .solidColor
-        hud.isSquare = false
-        hud.minSize = .zero
-        hud.contentColor = .label
-        hud.label.textColor = .label
-        hud.detailsLabel.textColor = .secondaryLabel
-        hud.detailsLabel.text = nil
-        hud.removeFromSuperViewOnHide = true
-    }
-
-    private func styleUploadHUD(_ hud: MBProgressHUD) {
+    /// Shared card for Loading / Preparing / Uploading so the cover size does not jump.
+    private func styleMediaProgressHUD(_ hud: MBProgressHUD) {
         hud.bezelView.style = .solidColor
         hud.bezelView.color = .systemBackground
-        // Default MBProgressHUD margin is 20. Prior value was 30; add more inset
-        // (+10 horizontal / +20 vertical intent — single margin uses the larger vertical bump).
+        // Extra inset keeps indicator + two label lines centered in a stable square.
         hud.margin = 50
         hud.isSquare = true
-        hud.minSize = CGSize(width: 150, height: 150)
+        hud.minSize = CGSize(width: 160, height: 160)
+        hud.offset = .zero
         hud.bezelView.layer.cornerRadius = 14
         // Allow shadow to render outside the bezel; solid fill still covers content.
         hud.bezelView.clipsToBounds = false
@@ -865,32 +929,43 @@ import MBProgressHUD
         hud.removeFromSuperViewOnHide = true
     }
 
+    private func thickAnnularProgressView(for hud: MBProgressHUD) -> ThickAnnularProgressView {
+        if let existing = hud.customView as? ThickAnnularProgressView {
+            return existing
+        }
+        let ring = ThickAnnularProgressView(frame: CGRect(x: 0, y: 0, width: 37, height: 37))
+        hud.customView = ring
+        return ring
+    }
+
+    private func loadingSpinnerView(for hud: MBProgressHUD) -> UIActivityIndicatorView {
+        if let existing = hud.customView as? UIActivityIndicatorView {
+            return existing
+        }
+        let spinner = UIActivityIndicatorView(style: .large)
+        spinner.frame = CGRect(x: 0, y: 0, width: 37, height: 37)
+        spinner.color = .label
+        spinner.hidesWhenStopped = false
+        spinner.startAnimating()
+        hud.customView = spinner
+        return spinner
+    }
+
     private func applyUploadProgressColors(to hud: MBProgressHUD?) {
         guard let hud else { return }
         let completed = NCAppBranding.elementColor()
         let remaining = UIColor.tertiarySystemFill
 
-        for subview in hud.bezelView.subviews {
-            guard let progressView = subview as? MBRoundProgressView else { continue }
-            progressView.progressTintColor = completed
-            progressView.backgroundTintColor = remaining
-            progressView.setNeedsDisplay()
-        }
+        let ring = thickAnnularProgressView(for: hud)
+        ring.progressTintColor = completed
+        ring.backgroundTintColor = remaining
+        ring.setNeedsDisplay()
     }
 
-    private func thickenAnnularStroke(in hud: MBProgressHUD) {
-        func bumpLineWidth(in layer: CALayer) {
-            if let shape = layer as? CAShapeLayer, shape.fillColor == nil || shape.fillColor == UIColor.clear.cgColor {
-                shape.lineWidth = max(shape.lineWidth, 3) + 1
-            }
-            layer.sublayers?.forEach { bumpLineWidth(in: $0) }
-        }
-        bumpLineWidth(in: hud.bezelView.layer)
-    }
-
-    /// - Parameter overMedia: Pin the HUD to the media preview so upload progress is centered on the image/video.
+    /// - Parameter overMedia: Pin the HUD to the media preview so progress is centered on the image/video.
     private func showProgressHUD(phase: UploadHUDPhase, progress: Float?, indeterminate: Bool = false, overMedia: Bool = false) {
-        let hostView: UIView = overMedia ? self.shareCollectionView : self.view
+        let pinToMedia = overMedia && !self.shareCollectionView.isHidden
+        let hostView: UIView = pinToMedia ? self.shareCollectionView : self.view
 
         if let existing = self.hud, existing.superview !== hostView {
             existing.hide(animated: false)
@@ -905,23 +980,22 @@ import MBProgressHUD
             self.hud = hud
         }
 
+        self.styleMediaProgressHUD(hud)
+        hud.mode = .customView
+        hud.label.text = phase.title
+        hud.detailsLabel.text = phase.details
+
         if indeterminate {
-            self.styleStagingHUD(hud)
-            hud.mode = .indeterminate
-            hud.label.text = phase.title
-            hud.detailsLabel.text = nil
+            _ = self.loadingSpinnerView(for: hud)
         } else {
-            self.styleUploadHUD(hud)
-            hud.mode = .annularDeterminate
+            // Custom annular ring — MBRoundProgressView hardcodes 2pt; we use 4pt (double).
+            let ring = self.thickAnnularProgressView(for: hud)
             if let progress {
+                ring.progress = progress
                 hud.progress = progress
             }
-            hud.label.text = phase.title
-            hud.detailsLabel.text = phase.details
-            // Progress view is created when mode is set; color it after layout.
             DispatchQueue.main.async {
                 self.applyUploadProgressColors(to: hud)
-                self.thickenAnnularStroke(in: hud)
             }
         }
     }
@@ -1052,7 +1126,7 @@ import MBProgressHUD
             return
         }
 
-        NCLog.log("Media upload: uploadAndShareFiles started (\(self.shareItemController.shareItems.count) item(s))")
+        NCLog.logSync("Media upload: uploadAndShareFiles started (\(self.shareItemController.shareItems.count) item(s))")
 
         // Hide keyboard before upload to correctly display the HUD
         self.textView.resignFirstResponder()
@@ -1061,7 +1135,9 @@ import MBProgressHUD
 
         let count = self.shareItemController.shareItems.count
         let prepareShare = self.mediaUploadMode == .noCompression ? Float(0) : self.prepareProgressShare
-        self.showProgressHUD(phase: .uploading(count: count), progress: prepareShare, overMedia: true)
+        // Prefer root view when the media pager is hidden (compression/upload jetsam path).
+        let pinToMedia = !self.shareCollectionView.isHidden
+        self.showProgressHUD(phase: .uploading(count: count), progress: prepareShare, overMedia: pinToMedia)
 
         self.uploadGroup = DispatchGroup()
         self.uploadErrors = []
@@ -1086,6 +1162,8 @@ import MBProgressHUD
                 if self.mediaFlowCancelled {
                     DispatchQueue.main.async {
                         self.isUploadingMedia = false
+                        self.suppressMediaPreviews = false
+                        self.shareCollectionView.isUserInteractionEnabled = true
                         bgTask.stopBackgroundTask()
                     }
                     return
@@ -1095,6 +1173,8 @@ import MBProgressHUD
                     DispatchQueue.main.async {
                         self.isUploadingMedia = false
                         self.isPreparingForUpload = false
+                        self.suppressMediaPreviews = false
+                        self.shareCollectionView.isUserInteractionEnabled = true
                         self.compressionOptionsView.isUserInteractionEnabled = true
                         self.hideProgressHUD()
                         self.updateSendButtonEnabledState()
@@ -1167,6 +1247,8 @@ import MBProgressHUD
         self.uploadGroup.notify(queue: .main) {
             self.isUploadingMedia = false
             self.isPreparingForUpload = false
+            self.suppressMediaPreviews = false
+            self.shareCollectionView.isUserInteractionEnabled = true
             self.uploadTasks.removeAll()
             self.compressionOptionsView.isUserInteractionEnabled = true
             self.hideProgressHUD()
@@ -1356,14 +1438,13 @@ import MBProgressHUD
             if let image = info[.originalImage] as? UIImage {
                 self.dismiss(animated: true) {
                     self.shareItemController.addItem(with: image)
-                    self.collectionViewScrollToEnd()
+                    // Stay on the current page — no animated jump to the newly added item.
                 }
             }
         } else if mediaType == "public.movie" {
             if let videoUrl = info[.mediaURL] as? URL {
                 self.dismiss(animated: true) {
                     self.shareItemController.addItem(with: videoUrl)
-                    self.collectionViewScrollToEnd()
                 }
             }
         }
@@ -1387,8 +1468,7 @@ import MBProgressHUD
         for documentURL in urls {
             self.shareItemController.addItem(with: documentURL)
         }
-
-        self.collectionViewScrollToEnd()
+        // Stay on the current page while additional files stage in.
     }
 
     // MARK: - ScrollView/CollectionView
@@ -1399,17 +1479,26 @@ import MBProgressHUD
 
         let item = self.shareItemController.shareItems[indexPath.row]
 
-        // Setting placeholder here in case we can't generate any other preview
-        cell.setPlaceHolderImage(item.placeholderImage)
-        cell.setPlaceHolderText(item.fileName)
-
         let extensionName = item.fileURL?.pathExtension.lowercased() ?? ""
         let isVideo = MediaUploadPreprocessor.isVideo(fileExtension: extensionName)
         cell.setShowsVideoIndicator(isVideo)
 
+        // During Send, keep whatever preview is already on screen — do not clear or re-decode.
+        if self.suppressMediaPreviews || self.isPreparingForUpload || self.isUploadingMedia {
+            if cell.previewView.image == nil {
+                cell.setPlaceHolderImage(item.placeholderImage)
+                cell.setPlaceHolderText(item.fileName)
+            }
+            return cell
+        }
+
+        // Setting placeholder here in case we can't generate any other preview
+        cell.setPlaceHolderImage(item.placeholderImage)
+        cell.setPlaceHolderText(item.fileName)
+
         if let fileURL = item.fileURL, NCUtils.isImage(fileExtension: fileURL.pathExtension) {
-            // Share Extension has a tight memory budget — keep preview decode modest.
-            let maxDimension: CGFloat = Bundle.main.bundlePath.hasSuffix(".appex") ? 1024 : 2048
+            // Keep preview decode modest — multi-attachment sheets already hold several bitmaps.
+            let maxDimension: CGFloat = 1024
             if let image = MediaUploadPreprocessor.previewImage(at: fileURL, maxDimension: maxDimension) {
                 cell.setPreviewImage(image)
             } else if let image = self.shareItemController.getImageFrom(item) {
@@ -1425,17 +1514,34 @@ import MBProgressHUD
     }
 
     func generatePreview(for cell: ShareConfirmationCollectionViewCell, with collectionView: UICollectionView, with item: ShareItem) {
-        let size = CGSize(width: collectionView.bounds.width, height: collectionView.bounds.height)
-        let scale = self.view.window?.screen.scale ?? UIScreen.main.scale
+        // Cap thumb size — full collection bounds × screen scale was retaining ~10MB+ bitmaps per video page.
+        let maxSide: CGFloat = 320
+        let bounds = collectionView.bounds
+        let longSide = max(bounds.width, bounds.height)
+        let scaleFactor = longSide > maxSide ? maxSide / longSide : 1
+        let size = CGSize(
+            width: max(1, (bounds.width * scaleFactor).rounded(.down)),
+            height: max(1, (bounds.height * scaleFactor).rounded(.down))
+        )
+        let scale: CGFloat = 1
 
         // updateHandler might be called multiple times, starting from low quality representation to high-quality
         let request = QLThumbnailGenerator.Request(fileAt: item.fileURL, size: size, scale: scale, representationTypes: [.lowQualityThumbnail, .thumbnail])
-        QLThumbnailGenerator.shared.generateRepresentations(for: request) { thumbnail, _, error in
+        QLThumbnailGenerator.shared.generateRepresentations(for: request) { [weak self] thumbnail, _, error in
             guard error == nil, let thumbnail else { return }
 
             DispatchQueue.main.async {
+                guard let self, !self.suppressMediaPreviews, !self.isPreparingForUpload, !self.isUploadingMedia else { return }
                 cell.setPreviewImage(thumbnail.uiImage)
             }
+        }
+    }
+
+    /// Frees heavy pager bitmaps before / during serial video encode.
+    func releaseDecodedPreviewsForCompression() {
+        guard let collectionView else { return }
+        for case let cell as ShareConfirmationCollectionViewCell in collectionView.visibleCells {
+            cell.releaseDecodedPreview()
         }
     }
 
@@ -1467,43 +1573,63 @@ import MBProgressHUD
         self.updatePageControlPage()
     }
 
+    /// Used when the user explicitly adds another attachment (camera / Files).
+    /// Intentionally does not scroll — new items stage silently on the current page.
     func collectionViewScrollToEnd() {
-        if let item = self.shareItemController.shareItems.last {
-            self.scroll(to: item, animated: true)
-        }
+        // Kept for ObjC / callers; scrolling to the new last page caused a visible “fly-in” glitch.
     }
 
     func scroll(to item: ShareItem, animated: Bool) {
-        DispatchQueue.main.async {
-            if let indexForItem = self.shareItemController.shareItems.firstIndex(of: item) {
-                let indexPath = IndexPath(row: indexForItem, section: 0)
+        guard let indexForItem = self.shareItemController.shareItems.firstIndex(of: item) else { return }
+        self.scrollToPage(indexForItem, animated: animated)
+    }
 
-                self.shareCollectionView.scrollToItem(at: indexPath, at: [], animated: animated)
+    private func currentPageIndex() -> Int {
+        let width = self.shareCollectionView.bounds.width
+        guard width > 0.5 else {
+            return self.pageControl.currentPage
+        }
+        return Int(round(self.shareCollectionView.contentOffset.x / width))
+    }
+
+    private func scrollToPage(_ page: Int, animated: Bool) {
+        let count = self.shareItemController.shareItems.count
+        guard count > 0 else { return }
+        let clamped = min(max(page, 0), count - 1)
+        let indexPath = IndexPath(item: clamped, section: 0)
+
+        let apply = {
+            self.shareCollectionView.scrollToItem(at: indexPath, at: .centeredHorizontally, animated: animated)
+            self.pageControl.currentPage = clamped
+            if !animated {
+                self.updateToolbarForCurrentItem()
             }
+        }
+
+        if Thread.isMainThread {
+            apply()
+        } else {
+            DispatchQueue.main.async(execute: apply)
         }
     }
 
     func getCurrentShareItem() -> ShareItem? {
-        let currentIndex = Int(self.shareCollectionView.contentOffset.x / self.shareCollectionView.frame.size.width)
-
-        if currentIndex >= self.shareItemController.shareItems.count {
-            return nil
-        }
-
-        return self.shareItemController.shareItems[currentIndex]
+        let items = self.shareItemController.shareItems
+        guard !items.isEmpty else { return nil }
+        let currentIndex = min(max(self.currentPageIndex(), 0), items.count - 1)
+        return items[currentIndex]
     }
 
     // MARK: - PageControl
 
     func pageControlValueChanged() {
-        let indexPath = IndexPath(row: self.pageControl.currentPage, section: 0)
-        self.shareCollectionView.scrollToItem(at: indexPath, at: [], animated: true)
+        self.scrollToPage(self.pageControl.currentPage, animated: true)
     }
 
     func updatePageControlPage() {
         // see: https://stackoverflow.com/a/46181277/2512312
         DispatchQueue.main.async {
-            self.pageControl.currentPage = Int(self.shareCollectionView.contentOffset.x / self.shareCollectionView.frame.width)
+            self.pageControl.currentPage = self.currentPageIndex()
             self.updateToolbarForCurrentItem()
         }
     }
@@ -1553,6 +1679,11 @@ import MBProgressHUD
 
     // MARK: - ShareItemController Delegate
 
+    public func shareItemControllerShouldReleaseHeavyPreviews(_ shareItemController: ShareItemController) {
+        // Intentionally no-op: clearing pager bitmaps blanked the UI during Send. Memory is
+        // mitigated by serial ExportSession + capping how many videos we re-encode per batch.
+    }
+
     public func shareItemControllerItemsChanged(_ shareItemController: ShareItemController) {
         DispatchQueue.main.async {
             // Never dismiss while provider load / staging is still in flight (empty sheet during iCloud).
@@ -1576,17 +1707,42 @@ import MBProgressHUD
                     self.dismiss(animated: true)
                 }
             } else if !shareItemController.shareItems.isEmpty {
-                self.shareCollectionView.reloadData()
-
-                // Make sure all changes are fully populated before we update our UI elements
-                self.shareCollectionView.layoutIfNeeded()
-                self.updateToolbarForCurrentItem()
-                // Don't refresh chip labels mid-Send — prepare replaces files and would show nonsense sizes.
-                if !self.isPreparingForUpload && !self.isUploadingMedia {
-                    self.updateCompressionOptionsUI()
+                // Mid-Send compress rewrites file URLs — skip pager reload (thumbnail regen jetsams).
+                if self.isPreparingForUpload || self.isUploadingMedia {
+                    self.updateToolbarForCurrentItem()
+                    self.textDidUpdate(false)
+                    self.updateSendButtonEnabledState()
+                    self.updateStagingProgressHUD()
+                    return
                 }
-                self.pageControl.numberOfPages = shareItemController.shareItems.count
-                self.collectionViewScrollToEnd()
+
+                let newCount = shareItemController.shareItems.count
+                let previousItemCount = self.shareCollectionView.numberOfItems(inSection: 0)
+                // Stay on the page the user is viewing (default first). Never jump to the last item
+                // as files stage — animated pager jumps looked like media “flying in”.
+                let preservedPage = previousItemCount == 0 ? 0 : self.currentPageIndex()
+                let targetPage = min(max(preservedPage, 0), newCount - 1)
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                UIView.performWithoutAnimation {
+                    self.shareCollectionView.reloadData()
+                    self.shareCollectionView.collectionViewLayout.invalidateLayout()
+                    self.shareCollectionView.layoutIfNeeded()
+                    self.pageControl.numberOfPages = newCount
+                    let width = self.shareCollectionView.bounds.width
+                    if width > 0.5, newCount > 0 {
+                        self.shareCollectionView.setContentOffset(
+                            CGPoint(x: CGFloat(targetPage) * width, y: 0),
+                            animated: false
+                        )
+                    }
+                    self.pageControl.currentPage = targetPage
+                    self.updateToolbarForCurrentItem()
+                }
+                CATransaction.commit()
+
+                self.updateCompressionOptionsUI()
 
                 // Update the text input to check if sending is (not-)possible
                 self.textDidUpdate(false)
@@ -1666,13 +1822,13 @@ import MBProgressHUD
         }
 
         if self.shareItemController.isBusyLoadingMedia {
-            // Element-style: spinner for the whole provider → local-copy window (avoids empty sheet).
+            // Same solid card + size as Preparing/Uploading, centered on the media pager.
             self.showProgressHUD(phase: .loadingMedia,
                                  progress: nil,
                                  indeterminate: true,
-                                 overMedia: false)
-        } else if self.hud?.mode == .indeterminate {
-            // Load/staging finished — dismiss spinner whether or not items appeared.
+                                 overMedia: !self.shareCollectionView.isHidden)
+        } else if self.hud != nil {
+            // Load/staging finished — dismiss whether or not items appeared.
             self.hideProgressHUD()
         }
 
@@ -1719,4 +1875,59 @@ import MBProgressHUD
         }
     }
 
+}
+
+/// MBRoundProgressView hardcodes a 2pt annular stroke; double that for the upload HUD ring.
+private final class ThickAnnularProgressView: MBRoundProgressView {
+    private let strokeWidth: CGFloat = 4
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isAnnular = true
+        backgroundColor = .clear
+        isOpaque = false
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        isAnnular = true
+        backgroundColor = .clear
+        isOpaque = false
+    }
+
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: 37, height: 37)
+    }
+
+    override func draw(_ rect: CGRect) {
+        let lineWidth = strokeWidth
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let radius = (bounds.width - lineWidth) / 2
+        let startAngle = -CGFloat.pi / 2
+
+        let backgroundPath = UIBezierPath(
+            arcCenter: center,
+            radius: radius,
+            startAngle: startAngle,
+            endAngle: startAngle + 2 * .pi,
+            clockwise: true
+        )
+        backgroundPath.lineWidth = lineWidth
+        backgroundPath.lineCapStyle = .butt
+        backgroundTintColor.setStroke()
+        backgroundPath.stroke()
+
+        let endAngle = startAngle + CGFloat(progress) * 2 * .pi
+        let progressPath = UIBezierPath(
+            arcCenter: center,
+            radius: radius,
+            startAngle: startAngle,
+            endAngle: endAngle,
+            clockwise: true
+        )
+        progressPath.lineWidth = lineWidth
+        progressPath.lineCapStyle = .square
+        progressTintColor.setStroke()
+        progressPath.stroke()
+    }
 }
