@@ -17,7 +17,26 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
         case actions
     }
 
+    /// Rows for a profile when engine is AVAssetWriter.
+    private enum WriterProfileRow: Int, CaseIterable {
+        case jpegQuality
+        case imageMaxEdge
+        case videoRate
+        case videoMaxMB
+        case videoMaxEdge
+        case videoFPS
+    }
+
+    /// Rows for a profile when engine is ExportSession — video is preset-only.
+    private enum PresetProfileRow: Int, CaseIterable {
+        case jpegQuality
+        case imageMaxEdge
+        case exportPreset
+    }
+
     private var settings: MediaUploadDebugSettings
+
+    private var usesWriter: Bool { settings.usesAssetWriter }
 
     init() {
         self.settings = MediaUploadDebugSettings.shared()
@@ -58,7 +77,8 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
         switch Section(rawValue: section)! {
         case .engine: return 1
         case .caps: return 2
-        case .low, .medium, .high: return 7
+        case .low, .medium, .high:
+            return usesWriter ? WriterProfileRow.allCases.count : PresetProfileRow.allCases.count
         case .actions: return 1
         }
     }
@@ -77,11 +97,14 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
         switch Section(rawValue: section)! {
         case .engine:
-            return NSLocalizedString("AVAssetWriter uses bitrate / size / fps. ExportSession uses Apple size/quality presets (fallback on Writer failure).", comment: "")
+            return NSLocalizedString("AVAssetWriter: bitrate, size, FPS. ExportSession: pick an Apple preset per level (rate/size/FPS knobs hidden).", comment: "")
         case .caps:
             return NSLocalizedString("Per-file max (X) and package max (Y). Package total always wins. Values in megabytes.", comment: "")
         case .low, .medium, .high:
-            return NSLocalizedString("Video rate is MB/s. Max MB caps long clips. Preset used when engine is ExportSession.", comment: "")
+            if usesWriter {
+                return NSLocalizedString("Video rate is MB/s. Max MB caps long clips. Image settings always apply.", comment: "")
+            }
+            return NSLocalizedString("Video uses the ExportSession preset only. Image JPEG settings still apply.", comment: "")
         default:
             return nil
         }
@@ -93,10 +116,11 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
         cell.accessoryType = .none
         cell.selectionStyle = .default
         cell.textLabel?.numberOfLines = 2
+        cell.textLabel?.textColor = .label
 
         switch Section(rawValue: indexPath.section)! {
         case .engine:
-            cell.textLabel?.text = settings.usesAssetWriter ? "AVAssetWriter (precise)" : "AVAssetExportSession (presets)"
+            cell.textLabel?.text = usesWriter ? "AVAssetWriter (precise)" : "AVAssetExportSession (presets)"
             cell.accessoryType = .disclosureIndicator
         case .caps:
             if indexPath.row == 0 {
@@ -120,15 +144,50 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
 
     private func configureProfileRow(_ cell: UITableViewCell, profile: MediaUploadProfileConfig, row: Int) {
         cell.accessoryType = .disclosureIndicator
-        switch row {
-        case 0: cell.textLabel?.text = "JPEG quality: \(profile.imageJPEGQuality)"
-        case 1: cell.textLabel?.text = "Image max edge: \(profile.imageMaxDimension) px"
-        case 2: cell.textLabel?.text = String(format: "Video rate: %.3f MB/s", profile.videoRateMBps)
-        case 3: cell.textLabel?.text = String(format: "Video max: %.1f MB", Double(profile.videoMaxBytes) / 1_048_576)
-        case 4: cell.textLabel?.text = "Video max edge: \(profile.videoMaxEdge) px"
-        case 5: cell.textLabel?.text = String(format: "Video FPS: %.0f", profile.videoFPS)
-        case 6: cell.textLabel?.text = "Export preset: \(profile.exportPreset)"
-        default: cell.textLabel?.text = nil
+        if usesWriter {
+            guard let writerRow = WriterProfileRow(rawValue: row) else {
+                cell.textLabel?.text = nil
+                return
+            }
+            switch writerRow {
+            case .jpegQuality:
+                cell.textLabel?.text = "JPEG quality: \(profile.imageJPEGQuality)"
+            case .imageMaxEdge:
+                cell.textLabel?.text = "Image max edge: \(profile.imageMaxDimension) px"
+            case .videoRate:
+                cell.textLabel?.text = String(format: "Video rate: %.3f MB/s", profile.videoRateMBps)
+            case .videoMaxMB:
+                cell.textLabel?.text = String(format: "Video max: %.1f MB", Double(profile.videoMaxBytes) / 1_048_576)
+            case .videoMaxEdge:
+                cell.textLabel?.text = "Video max edge: \(profile.videoMaxEdge) px"
+            case .videoFPS:
+                cell.textLabel?.text = String(format: "Video FPS: %.0f", profile.videoFPS)
+            }
+        } else {
+            guard let presetRow = PresetProfileRow(rawValue: row) else {
+                cell.textLabel?.text = nil
+                return
+            }
+            switch presetRow {
+            case .jpegQuality:
+                cell.textLabel?.text = "JPEG quality: \(profile.imageJPEGQuality)"
+            case .imageMaxEdge:
+                cell.textLabel?.text = "Image max edge: \(profile.imageMaxDimension) px"
+            case .exportPreset:
+                cell.textLabel?.text = "Video preset: \(readablePreset(profile.exportPreset))"
+            }
+        }
+    }
+
+    private func readablePreset(_ key: String) -> String {
+        switch key {
+        case "low": return "LowQuality"
+        case "medium": return "MediumQuality"
+        case "480p": return "640×480"
+        case "540p": return "960×540"
+        case "720p": return "1280×720"
+        case "1080p": return "1920×1080"
+        default: return key
         }
     }
 
@@ -164,47 +223,64 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
 
     private func editProfile(_ keyPath: ReferenceWritableKeyPath<MediaUploadDebugSettings, MediaUploadProfileConfig>, row: Int) {
         var profile = settings[keyPath: keyPath]
-        switch row {
-        case 0:
-            promptInt(title: "JPEG quality (1–100)", current: profile.imageJPEGQuality) {
-                profile.imageJPEGQuality = min(100, max(1, $0))
-                self.settings[keyPath: keyPath] = profile
-                self.tableView.reloadData()
+        if usesWriter {
+            guard let writerRow = WriterProfileRow(rawValue: row) else { return }
+            switch writerRow {
+            case .jpegQuality:
+                promptInt(title: "JPEG quality (1–100)", current: profile.imageJPEGQuality) {
+                    profile.imageJPEGQuality = min(100, max(1, $0))
+                    self.settings[keyPath: keyPath] = profile
+                    self.tableView.reloadData()
+                }
+            case .imageMaxEdge:
+                promptInt(title: "Image max edge (px)", current: profile.imageMaxDimension) {
+                    profile.imageMaxDimension = min(8192, max(320, $0))
+                    self.settings[keyPath: keyPath] = profile
+                    self.tableView.reloadData()
+                }
+            case .videoRate:
+                promptDouble(title: "Video rate (MB/s)", current: profile.videoRateMBps) {
+                    profile.videoRateMBps = max(0.01, $0)
+                    self.settings[keyPath: keyPath] = profile
+                    self.tableView.reloadData()
+                }
+            case .videoMaxMB:
+                promptDouble(title: "Video max (MB)", current: Double(profile.videoMaxBytes) / 1_048_576) {
+                    profile.videoMaxBytes = Int64(max(1, $0) * 1_048_576)
+                    self.settings[keyPath: keyPath] = profile
+                    self.tableView.reloadData()
+                }
+            case .videoMaxEdge:
+                promptInt(title: "Video max edge (px)", current: profile.videoMaxEdge) {
+                    profile.videoMaxEdge = min(3840, max(320, $0))
+                    self.settings[keyPath: keyPath] = profile
+                    self.tableView.reloadData()
+                }
+            case .videoFPS:
+                promptDouble(title: "Video FPS", current: profile.videoFPS) {
+                    profile.videoFPS = min(60, max(1, $0))
+                    self.settings[keyPath: keyPath] = profile
+                    self.tableView.reloadData()
+                }
             }
-        case 1:
-            promptInt(title: "Image max edge (px)", current: profile.imageMaxDimension) {
-                profile.imageMaxDimension = min(8192, max(320, $0))
-                self.settings[keyPath: keyPath] = profile
-                self.tableView.reloadData()
+        } else {
+            guard let presetRow = PresetProfileRow(rawValue: row) else { return }
+            switch presetRow {
+            case .jpegQuality:
+                promptInt(title: "JPEG quality (1–100)", current: profile.imageJPEGQuality) {
+                    profile.imageJPEGQuality = min(100, max(1, $0))
+                    self.settings[keyPath: keyPath] = profile
+                    self.tableView.reloadData()
+                }
+            case .imageMaxEdge:
+                promptInt(title: "Image max edge (px)", current: profile.imageMaxDimension) {
+                    profile.imageMaxDimension = min(8192, max(320, $0))
+                    self.settings[keyPath: keyPath] = profile
+                    self.tableView.reloadData()
+                }
+            case .exportPreset:
+                presentPresetPicker(for: keyPath)
             }
-        case 2:
-            promptDouble(title: "Video rate (MB/s)", current: profile.videoRateMBps) {
-                profile.videoRateMBps = max(0.01, $0)
-                self.settings[keyPath: keyPath] = profile
-                self.tableView.reloadData()
-            }
-        case 3:
-            promptDouble(title: "Video max (MB)", current: Double(profile.videoMaxBytes) / 1_048_576) {
-                profile.videoMaxBytes = Int64(max(1, $0) * 1_048_576)
-                self.settings[keyPath: keyPath] = profile
-                self.tableView.reloadData()
-            }
-        case 4:
-            promptInt(title: "Video max edge (px)", current: profile.videoMaxEdge) {
-                profile.videoMaxEdge = min(3840, max(320, $0))
-                self.settings[keyPath: keyPath] = profile
-                self.tableView.reloadData()
-            }
-        case 5:
-            promptDouble(title: "Video FPS", current: profile.videoFPS) {
-                profile.videoFPS = min(60, max(1, $0))
-                self.settings[keyPath: keyPath] = profile
-                self.tableView.reloadData()
-            }
-        case 6:
-            presentPresetPicker(for: keyPath)
-        default:
-            break
         }
     }
 
@@ -227,12 +303,19 @@ final class MediaUploadCompressionDebugViewController: UITableViewController {
     }
 
     private func presentPresetPicker(for keyPath: ReferenceWritableKeyPath<MediaUploadDebugSettings, MediaUploadProfileConfig>) {
-        let presets = ["low", "medium", "480p", "540p", "720p", "1080p"]
-        let sheet = UIAlertController(title: "Export preset", message: nil, preferredStyle: .actionSheet)
-        for preset in presets {
-            sheet.addAction(UIAlertAction(title: preset, style: .default) { _ in
+        let presets: [(String, String)] = [
+            ("low", "LowQuality"),
+            ("medium", "MediumQuality"),
+            ("480p", "640×480"),
+            ("540p", "960×540"),
+            ("720p", "1280×720"),
+            ("1080p", "1920×1080")
+        ]
+        let sheet = UIAlertController(title: "Video preset", message: nil, preferredStyle: .actionSheet)
+        for (key, title) in presets {
+            sheet.addAction(UIAlertAction(title: title, style: .default) { _ in
                 var profile = self.settings[keyPath: keyPath]
-                profile.exportPreset = preset
+                profile.exportPreset = key
                 self.settings[keyPath: keyPath] = profile
                 self.tableView.reloadData()
             })
