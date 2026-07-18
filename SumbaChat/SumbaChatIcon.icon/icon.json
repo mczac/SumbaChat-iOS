@@ -1,0 +1,36 @@
+{
+  "fill" : {
+    "solid" : "display-p3:0.00000,0.49412,0.98431,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "SumbaChat-icon.png",
+          "name" : "SumbaChat-icon",
+          "position" : {
+            "scale" : 100,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.35
+      },
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

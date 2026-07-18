@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2023 Nextcloud GmbH and Nextcloud contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+matrix:
+- name: English localizable file
+  aspell:
+    lang: en
+    d: en_US
+  dictionary:
+    wordlists:
+      - .pyspelling.wordlist.txt
+  sources:
+  - SumbaChat/en.lproj/Localizable.strings 

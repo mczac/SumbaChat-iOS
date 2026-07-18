@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2017 Nextcloud GmbH and Nextcloud contributors
+# SPDX-FileCopyrightText: 2026 Ivan Cursoroff and Peter Zakharov
+# SPDX-License-Identifier: GPL-3.0-or-later
+Pods
+Podfile.lock
+SumbaChat.xcodeproj/xcuserdata
+SumbaChat.xcworkspace/xcuserdata
+# Keep schemes / Package.resolved tracked; ignore other shareddata noise if present
+SumbaChat.xcodeproj/project.xcworkspace/xcuserdata
+SumbaChat.xcworkspace/xcshareddata/swiftpm/configuration
+ThirdParty/WebRTC.xcframework
+.DS_Store
+testResult.xcresult
+dictionary.dic
+DerivedData
+build
+
+# Local deployment hosts / push proxies — never commit (see NCAppBrandingLocal.example.h)
+SumbaChat/Settings/NCAppBrandingLocal.h

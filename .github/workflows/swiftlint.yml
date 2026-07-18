@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2022 Nextcloud GmbH and Nextcloud contributors
+# SPDX-License-Identifier: MIT
+
+name: SwiftLint
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  SwiftLint:
+    runs-on: ubuntu-latest
+    
+    steps:
+     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+       with:
+         persist-credentials: false
+       
+     - name: GitHub Action for SwiftLint
+       uses: norio-nomura/action-swiftlint@9f4dcd7fd46b4e75d7935cf2f4df406d5cae3684 # v3.2.1
+

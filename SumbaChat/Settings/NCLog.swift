@@ -1,0 +1,149 @@
+//
+// SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursoroff and Peter Zakharov
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+
+@objcMembers public class NCLog: NSObject {
+
+    private static let backgroundLogQueue = DispatchQueue(label: "\(bundleIdentifier).backgroundLogQueue", qos: .background)
+
+    /// `CFBundleVersion` (build) — cached so every line can tag the binary that wrote it.
+    private static let buildNumber: String = {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String)
+            .flatMap { $0.isEmpty ? nil : $0 } ?? "?"
+    }()
+
+    private static let logLineDateFormatter: DateFormatter = {
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        // Trailing Z marks UTC for server-log reconciliation.
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS'Z'"
+
+        return dateFormatter
+    }()
+
+    private static let fileNameDateFormatter: DateFormatter = {
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        dateFormatter.dateFormat = "yyyy-MM-dd"
+
+        return dateFormatter
+    }()
+
+    private static var logfilePath: URL? = {
+        let fileManager = FileManager.default
+        let logDir: URL
+
+        if let groupContainer = fileManager.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
+            logDir = groupContainer.appendingPathComponent("logs")
+        } else if let documentDir = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first {
+            logDir = documentDir.appendingPathComponent("logs")
+        } else {
+            return nil
+        }
+
+        let logPath = logDir.path
+
+        // Allow writing to files while the app is in the background
+        if !fileManager.fileExists(atPath: logPath) {
+            try? fileManager.createDirectory(atPath: logPath, withIntermediateDirectories: true, attributes: [FileAttributeKey.protectionKey: FileProtectionType.none])
+        }
+
+        return logDir
+    }()
+
+    public static func log(_ message: String) {
+        guard let logfilePath else { return }
+
+        // Determine the queue here, as otherwise it will be always the backgroundQueue
+        let currentQueueName = Thread.current.queueName
+
+        backgroundLogQueue.async {
+            appendLogLine(message, queueName: currentQueueName, logfilePath: logfilePath)
+        }
+    }
+
+    /// Writes immediately — use on jetsam-prone paths where async `log` may never flush.
+    @objc public static func logSync(_ message: String) {
+        guard let logfilePath else {
+            NSLog("%@", message)
+            return
+        }
+        let currentQueueName = Thread.current.queueName
+        // Serialize with the async logger so lines stay ordered.
+        backgroundLogQueue.sync {
+            appendLogLine(message, queueName: currentQueueName, logfilePath: logfilePath)
+        }
+    }
+
+    private static func appendLogLine(_ message: String, queueName: String, logfilePath: URL) {
+        do {
+            let now = Date()
+
+            var logMessage = "\(logLineDateFormatter.string(from: now)) "
+            logMessage += "[b\(buildNumber)] (\(queueName)): \(message)\n"
+
+            let dateString = fileNameDateFormatter.string(from: now)
+            let logFileName = "debug-\(dateString).log"
+            let fullPath = logfilePath.appendingPathComponent(logFileName).path
+
+            if let fileHandle = FileHandle(forWritingAtPath: fullPath) {
+                fileHandle.seekToEndOfFile()
+                // UTF-8 will never be nil
+                try fileHandle.write(contentsOf: logMessage.data(using: .utf8)!)
+                try fileHandle.close()
+            } else {
+                try logMessage.write(toFile: fullPath, atomically: false, encoding: .utf8)
+            }
+
+            NSLog("%@", logMessage)
+        } catch {
+            NSLog("Exception in NCLog.log: %@", error.localizedDescription)
+            NSLog("Message: %@", message)
+        }
+    }
+
+    public static func getLogfiles() -> [URL] {
+        guard let logfilePath else { return [] }
+
+        let fileManager = FileManager.default
+
+        guard let files = try? fileManager.contentsOfDirectory(at: logfilePath, includingPropertiesForKeys: nil)
+        else { return [] }
+
+        // Sort descending by file name so the most recent logfile is listed first
+        return files
+            .filter { $0.lastPathComponent.hasPrefix("debug-") && $0.lastPathComponent.hasSuffix(".log") }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+    }
+
+    public static func removeOldLogfiles() {
+        guard let logfilePath else { return }
+
+        let logPath = logfilePath.path
+        let fileManager = FileManager.default
+
+        var dayComponent = DateComponents()
+        dayComponent.day = -10
+
+        guard let enumerator = fileManager.enumerator(atPath: logPath),
+              let thresholdDate = Calendar.current.date(byAdding: dayComponent, to: Date())
+        else { return }
+
+        while let file = enumerator.nextObject() as? String {
+            let filePathURL = logfilePath.appendingPathComponent(file)
+            let filePath = filePathURL.path
+
+            guard let creationDate = (try? FileManager.default.attributesOfItem(atPath: filePath))?[.creationDate] as? Date
+            else { continue }
+
+            if creationDate.compare(thresholdDate) == .orderedAscending && file.hasPrefix("debug-") && file.hasSuffix(".log") {
+                NSLog("Deleting old logfile %@", filePath)
+                try? fileManager.removeItem(atPath: filePath)
+            }
+        }
+    }
+}

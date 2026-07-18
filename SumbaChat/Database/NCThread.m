@@ -1,0 +1,178 @@
+/**
+ * SPDX-FileCopyrightText: 2025 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+#import "NCThread.h"
+
+#import "NCChatMessage.h"
+#import "SumbaChat-Swift.h"
+
+@interface NCThread () {
+    NCChatMessage *firstMessageFromDict;
+    NCChatMessage *lastMessageFromDict;
+}
+
+@end
+
+@implementation NCThread
+
++ (NSString *)primaryKey {
+    return @"internalId";
+}
+
++ (nullable instancetype)threadWithDictionary:(NSDictionary *)threadInfoDict andAccountId:(NSString *)accountId
+{
+    if (!threadInfoDict || ![threadInfoDict isKindOfClass:[NSDictionary class]]) {
+        return nil;
+    }
+
+    NSDictionary *threadDict = [threadInfoDict objectForKey:@"thread"];
+    NSDictionary *threadAttendeeDict = [threadInfoDict objectForKey:@"attendee"];
+
+    NCThread *thread = [[NCThread alloc] init];
+    thread.accountId = accountId;
+    thread.roomToken = [threadDict objectForKey:@"roomToken"];
+    thread.threadId = [[threadDict objectForKey:@"id"] integerValue];
+    thread.internalId = [NSString stringWithFormat:@"%@@%@@%ld", accountId, thread.roomToken, (long)thread.threadId];
+    thread.title = [threadDict objectForKey:@"title"];
+    thread.lastActivity = [[threadDict objectForKey:@"lastActivity"] integerValue];
+    thread.numReplies = [[threadDict objectForKey:@"numReplies"] integerValue];
+    thread.notificationLevel = [[threadAttendeeDict objectForKey:@"notificationLevel"] integerValue];
+
+    NCChatMessage *firstMessage = [NCChatMessage messageWithDictionary:[threadInfoDict objectForKey:@"first"] andAccountId:accountId];
+    thread->firstMessageFromDict = firstMessage;
+    thread.firstMessageId = firstMessage.internalId;
+
+    NCChatMessage *lastMessage = [NCChatMessage messageWithDictionary:[threadInfoDict objectForKey:@"last"] andAccountId:accountId];
+    thread->lastMessageFromDict = lastMessage;
+    thread.lastMessageId = lastMessage.internalId;
+
+    return thread;
+}
+
++ (nullable instancetype)createThreadFromMessage:(NCChatMessage *)message andAccountId:(NSString *)accountId
+{
+    if (![message.systemMessage isEqualToString:@"thread_created"]) {
+        return nil;
+    }
+
+    NCThread *managedThread = [NCThread objectsWhere:@"accountId = %@ AND roomToken = %@ AND threadId = %ld", message.accountId, message.token, (long)message.threadId].firstObject;
+    if (managedThread) {
+        return nil;
+    }
+
+    NCThread *thread = [[NCThread alloc] init];
+    thread.accountId = message.accountId;
+    thread.roomToken = message.token;
+    thread.threadId = message.threadId;
+    thread.title = message.threadTitle;
+    thread.internalId = [NSString stringWithFormat:@"%@@%@@%ld", accountId, thread.roomToken, (long)thread.threadId];
+
+    thread.firstMessageId = message.parentId;
+
+    thread.updatedWithMessageId = message.messageId;
+
+    return thread;
+}
+
++ (void)updateThread:(NCThread *)managedThread withThread:(NCThread *)thread
+{
+    managedThread.title = thread.title;
+    managedThread.lastActivity = thread.lastActivity;
+    managedThread.numReplies = thread.numReplies;
+    managedThread.notificationLevel = thread.notificationLevel;
+    managedThread.firstMessageId = thread.firstMessageId;
+    managedThread.lastMessageId = thread.lastMessageId;
+}
+
++ (void)updateThreadWithThreadMessage:(NCChatMessage *)message
+{
+    NCThread *managedThread = [NCThread objectsWhere:@"accountId = %@ AND roomToken = %@ AND threadId = %ld", message.accountId, message.token, (long)message.threadId].firstObject;
+
+    // Do not update if there is no thread stored yet or the thread has been updated by a newer message
+    if (!managedThread || managedThread.updatedWithMessageId > message.messageId) {
+        return;
+    }
+
+    // Only update the thread data if there is any data (e.g. omit chat relay messages without thread data)
+    BOOL hasTitle = message.threadTitle.length > 0;
+    BOOL hasReplies = message.threadReplies > 0;
+
+    if (!hasTitle && !hasReplies) {
+        return;
+    }
+
+    managedThread.updatedWithMessageId = message.messageId;
+
+    if (hasTitle) {
+        managedThread.title = message.threadTitle;
+    }
+    if (hasReplies) {
+        managedThread.numReplies = message.threadReplies;
+    }
+
+    // Keep the thread's original message in sync with the same values
+    NCChatMessage *originalMessage = [NCChatMessage objectsWhere:@"accountId = %@ AND token = %@ AND messageId = %ld", message.accountId, message.token, (long)message.threadId].firstObject;
+    if (originalMessage) {
+        if (hasTitle) {
+            originalMessage.threadTitle = message.threadTitle;
+        }
+        if (hasReplies) {
+            originalMessage.threadReplies = message.threadReplies;
+        }
+    }
+}
+
++ (nullable instancetype)threadWithThreadId:(NSInteger)threadId inRoom:(NSString *)roomToken forAccountId:(NSString *)accountId
+{
+    NCThread *managedThread = [NCThread objectsWhere:@"accountId = %@ AND roomToken = %@ AND threadId = %ld", accountId, roomToken, (long)threadId].firstObject;
+    if (managedThread) {
+        return [[NCThread alloc] initWithValue:managedThread];
+    }
+    return nil;
+}
+
++ (void)storeOrUpdateThreads:(NSArray *)threads
+{
+    BGTaskHelper *bgTask = [BGTaskHelper startBackgroundTaskWithName:@"storeOrUpdateThreadsx" expirationHandler:nil];
+    RLMRealm *realm = [RLMRealm defaultRealm];
+    [realm transactionWithBlock:^{
+        for (NCThread *thread in threads) {
+            NCThread *managedThread = [NCThread objectsWhere:@"internalId = %@", thread.internalId].firstObject;
+            if (managedThread) {
+                [self updateThread:managedThread withThread:thread];
+            } else {
+                [realm addObject:thread];
+            }
+        }
+    }];
+    [bgTask stopBackgroundTask];
+}
+
+- (NCChatMessage *)firstMessage
+{
+    NCChatMessage *managedMessage = [NCChatMessage objectsWhere:@"internalId = %@", self.firstMessageId].firstObject;
+    if (managedMessage) {
+        return [[NCChatMessage alloc] initWithValue:managedMessage];
+    }
+
+    return self->firstMessageFromDict;
+}
+
+- (NCChatMessage *)lastMessage
+{
+    NCChatMessage *managedMessage = [NCChatMessage objectsWhere:@"internalId = %@", self.lastMessageId].firstObject;
+    if (managedMessage) {
+        return [[NCChatMessage alloc] initWithValue:managedMessage];
+    }
+
+    return self->lastMessageFromDict;
+}
+
+- (BOOL)isThreadOwner:(TalkAccount *)account
+{
+    return [[self firstMessage] isMessageFrom:account.userId];
+}
+
+@end
