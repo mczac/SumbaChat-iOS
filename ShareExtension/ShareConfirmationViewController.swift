@@ -1,5 +1,6 @@
 //
 // SPDX-FileCopyrightText: 2020 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
@@ -9,7 +10,6 @@ import QuickLook
 import SwiftyAttributes
 import TOCropViewController
 import AVFoundation
-import MBProgressHUD
 
 @objc public protocol ShareConfirmationViewControllerDelegate {
     @objc func shareConfirmationViewControllerDidFail(_ viewController: ShareConfirmationViewController)
@@ -39,6 +39,7 @@ import MBProgressHUD
         // Stage originals; compress on Send based on user Upload Media mode.
         let controller = ShareItemController(mediaUploadCompressionSettings: MediaUploadCompressionSettings(level: .none))
         controller.delegate = self
+        controller.accountId = self.account.accountId
 
         return controller
     }()
@@ -50,7 +51,7 @@ import MBProgressHUD
     private var shareContentView = UIView()
     private var shareSilently = false
     private var imagePicker: UIImagePickerController?
-    private var hud: MBProgressHUD?
+    private var progressAlert: MediaUploadProgressAlert?
     private var objectShareMessage: NCChatMessage?
     private var uploadGroup = DispatchGroup()
     private var uploadFailed = false
@@ -76,8 +77,12 @@ import MBProgressHUD
     private var finishingSuccessfulUpload = false
     /// Avoid stacking multiple "couldn't load" alerts while several attachments fail.
     private var isPresentingStagingFailureAlert = false
-    /// Share of the annular ring reserved for compression prepare (often longer than upload).
+    /// Share of the determinate bar reserved for compression prepare (often longer than upload).
     private let prepareProgressShare: Float = 0.55
+    /// True while Send has swapped compose UI for the progress surface.
+    private var isInSendProgressMode = false
+    /// Keeps App Group `.upload-session` fresh during long compose (Settings/idle protection).
+    private var uploadSessionHeartbeatTimer: Timer?
 
     private enum ShareConfirmationType {
         case text
@@ -484,6 +489,7 @@ import MBProgressHUD
 
         // Provider load may have started before presentation — re-assert Loading media… HUD.
         self.updateStagingProgressHUD()
+        self.startUploadSessionHeartbeat()
 
         if self.shareType == .text {
             // When we are sharing a text, we want to start editing right away
@@ -491,10 +497,39 @@ import MBProgressHUD
         }
     }
 
+    public override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        self.stopUploadSessionHeartbeat()
+    }
+
+    private func startUploadSessionHeartbeat() {
+        self.stopUploadSessionHeartbeat()
+        MediaUploadDiskStore.touchUploadSession()
+        let interval = MediaUploadDiskStore.uploadSessionHeartbeatInterval
+        let timer = Timer(timeInterval: interval, repeats: true) { _ in
+            MediaUploadDiskStore.touchUploadSession()
+        }
+        // Avoid coalescing with tracking runs that can delay fire while scrolling.
+        timer.tolerance = min(30, interval / 5)
+        RunLoop.main.add(timer, forMode: .common)
+        self.uploadSessionHeartbeatTimer = timer
+    }
+
+    private func stopUploadSessionHeartbeat() {
+        self.uploadSessionHeartbeatTimer?.invalidate()
+        self.uploadSessionHeartbeatTimer = nil
+    }
+
     public override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
         super.viewWillTransition(to: size, with: coordinator)
 
         if self.shareType == .text {
+            return
+        }
+
+        // Don't flash the media pager back on while Preparing/Uploading.
+        if self.isInSendProgressMode || self.isPreparingForUpload || self.isUploadingMedia {
+            self.shareCollectionView.collectionViewLayout.invalidateLayout()
             return
         }
 
@@ -561,7 +596,19 @@ import MBProgressHUD
     }
 
     func cancelButtonPressed() {
+        // Telegram-style: abort in-flight work (if any) and leave the flow (chat / host app).
+        let wasUploading = self.isUploadingMedia || !self.uploadTasks.isEmpty
+        self.stopUploadSessionHeartbeat()
         self.cancelMediaFlowIfNeeded()
+        if wasUploading {
+            // Let cancelled URLSession tasks release upload/ paths before force wipe.
+            MediaUploadDiskStore.scheduleClearSessionScratchCaches(
+                reason: "sheet-dismiss",
+                afterDelay: MediaUploadDiskStore.scratchClearAfterCancelDelay
+            )
+        } else {
+            MediaUploadDiskStore.clearSessionScratchCaches(reason: "sheet-dismiss", wait: false)
+        }
         self.delegate?.shareConfirmationViewControllerDidCancel(self)
     }
 
@@ -570,6 +617,7 @@ import MBProgressHUD
         guard self.isPreparingForUpload || self.isUploadingMedia else { return }
 
         NCLog.log("Media upload: user cancelled during prepare/upload")
+        MediaUploadTrace.log("SEND cancel abort — leave flow")
         self.mediaFlowCancelled = true
         self.shareItemController.cancelPreparation()
         for task in self.uploadTasks {
@@ -578,10 +626,47 @@ import MBProgressHUD
         self.uploadTasks.removeAll()
         self.isPreparingForUpload = false
         self.isUploadingMedia = false
+        self.isInSendProgressMode = false
+        self.suppressMediaPreviews = false
+        self.hideProgressAlert()
+        self.updateSendButtonEnabledState()
+    }
+
+    /// Hide compose chrome and drop heavy preview bitmaps for the Send → progress surface.
+    private func enterSendProgressMode() {
+        self.isInSendProgressMode = true
+        self.textView.resignFirstResponder()
+        self.setTextInputbarHidden(true, animated: false)
+        self.shareContentView.isHidden = true
+        self.navigationItem.rightBarButtonItem = nil
+        self.suppressMediaPreviews = true
+        for item in self.shareItemController.shareItems {
+            item.placeholderImage = nil
+        }
+        MediaUploadTrace.logSync("SEND progress-mode compose hidden items=\(self.shareItemController.shareItems.count)")
+    }
+
+    /// Restore compose after a failed send (Cancel/success dismiss instead).
+    private func exitSendProgressMode() {
+        guard self.isInSendProgressMode else { return }
+        self.isInSendProgressMode = false
+        self.shareContentView.isHidden = false
         self.suppressMediaPreviews = false
         self.shareCollectionView.isUserInteractionEnabled = true
         self.compressionOptionsView.isUserInteractionEnabled = true
-        self.hideProgressHUD()
+
+        let captionAllowed = NCDatabaseManager.sharedInstance().serverHasTalkCapability(.mediaCaption, forAccountId: account.accountId)
+            && self.shareType == .item
+        if captionAllowed {
+            self.setTextInputbarHidden(false, animated: false)
+        } else {
+            self.setTextInputbarHidden(true, animated: false)
+            self.navigationItem.rightBarButtonItem = self.sendButton
+            if #unavailable(iOS 26) {
+                self.navigationItem.rightBarButtonItem?.tintColor = NCAppBranding.themeTextColor()
+            }
+        }
+        self.shareCollectionView.reloadData()
         self.updateSendButtonEnabledState()
     }
 
@@ -632,30 +717,32 @@ import MBProgressHUD
 
         let mode = self.mediaUploadMode
         let mediaCount = self.shareItemController.shareItems.count
-        NCLog.log("Media upload Send: mode=\(mode.rawValue) items=\(mediaCount)")
+        let debug = MediaUploadDebugSettings.shared()
+        MediaUploadTrace.logSync("SEND begin mode=\(MediaUploadTrace.modeName(mode)) items=\(mediaCount) settings={\(MediaUploadTrace.settingsSnapshot())}")
 
         self.mediaFlowCancelled = false
         self.uploadTasks.removeAll()
         self.isUploadingMedia = true
-        self.suppressMediaPreviews = true
         self.updateSendButtonEnabledState()
+        // Keep cross-process staging lock fresh for the duration of Send.
+        MediaUploadDiskStore.touchUploadSession()
 
-        // Media uses the center HUD only — no nav-bar spinner (avoids double spinners).
-        self.compressionOptionsView.isUserInteractionEnabled = false
+        // Drop compose UI (memory + cleaner progress surface). Cancel leaves the flow.
+        self.enterSendProgressMode()
 
         if mode == .noCompression {
-            NCLog.log("Media upload: skipping compression (No Compression)")
-            self.showProgressHUD(phase: .uploading(count: mediaCount), progress: 0, overMedia: !self.shareCollectionView.isHidden)
+            MediaUploadTrace.log("SEND decision=skip-compress (No Compression) — upload originals")
+            for item in self.shareItemController.shareItems {
+                let bytes = MediaUploadPreprocessor.fileSizePublic(at: item.fileURL)
+                MediaUploadTrace.log("PLAN \(item.fileName ?? "unknown") level=none(original) original=\(MediaUploadTrace.mb(bytes)) estimate=n/a")
+            }
+            self.showProgressAlert(phase: .uploading(count: mediaCount), progress: 0, indeterminate: false)
             self.uploadAndShareFiles()
             return
         }
 
         self.isPreparingForUpload = true
-        self.textView.resignFirstResponder()
-        // Keep pager + current previews on screen. Block new QL/decode only (jetsam was from regen, not static thumbs).
-        self.shareCollectionView.isUserInteractionEnabled = false
-        self.showProgressHUD(phase: .preparing(count: mediaCount), progress: 0, overMedia: true)
-        NCLog.log("Media upload: preparing \(mediaCount) item(s) for compression")
+        self.showProgressAlert(phase: .preparing(count: mediaCount), progress: 0, indeterminate: false)
 
         let chosenLevel = self.chosenCompressionLevel
         let autoURLs = self.shareItemController.shareItems.compactMap(\.fileURL)
@@ -665,6 +752,33 @@ import MBProgressHUD
         var autoLevelByPath: [String: MediaUploadCompressionLevel] = [:]
         for (url, level) in zip(autoURLs, autoLevels) {
             autoLevelByPath[url.path] = level
+        }
+
+        if mode == .chooseOnUpload {
+            MediaUploadTrace.log("SEND decision=manual chip=\(MediaUploadTrace.levelName(chosenLevel))")
+        } else if mode == .automatic {
+            let cap = MediaUploadAutomaticPolicy.automaticFileMaxBytes
+            MediaUploadTrace.log(String(format:
+                "SEND decision=automatic cap=%@ photoMargin=%.0f%% videoMargin=%.0f%% (accept if estimate×(1+margin)<cap)",
+                MediaUploadTrace.mb(cap),
+                debug.automaticPhotoEstimateMarginPercent,
+                debug.automaticVideoEstimateMarginPercent))
+        }
+
+        for item in self.shareItemController.shareItems {
+            guard let fileURL = item.fileURL else { continue }
+            let level: MediaUploadCompressionLevel
+            switch mode {
+            case .chooseOnUpload: level = chosenLevel
+            case .automatic: level = autoLevelByPath[fileURL.path] ?? .medium
+            default: level = .none
+            }
+            let original = MediaUploadPreprocessor.fileSizePublic(at: fileURL)
+            let estimate = level == .none
+                ? original
+                : MediaUploadPreprocessor.estimatedByteCount(at: fileURL, level: level)
+            let name = item.fileName ?? "unknown"
+            MediaUploadTrace.log("PLAN \(name) level=\(MediaUploadTrace.levelName(level)) original=\(MediaUploadTrace.mb(original)) estimate=\(MediaUploadTrace.mb(estimate))")
         }
 
         self.shareItemController.prepareItemsForUpload(levelProvider: { item in
@@ -688,8 +802,7 @@ import MBProgressHUD
             }
         }, progress: { [weak self] fraction in
             guard let self, !self.mediaFlowCancelled else { return }
-            self.hud?.progress = fraction * self.prepareProgressShare
-            self.applyUploadProgressColors(to: self.hud)
+            self.progressAlert?.setProgress(fraction * self.prepareProgressShare, animated: true)
         }, completion: { [weak self] in
             guard let self else { return }
             // Keep isPreparingForUpload true until upload path is entered — no preview regen window.
@@ -697,19 +810,21 @@ import MBProgressHUD
                 NCLog.logSync("Media upload: prepare finished after cancel — skipping upload")
                 self.isPreparingForUpload = false
                 self.isUploadingMedia = false
+                self.isInSendProgressMode = false
                 self.suppressMediaPreviews = false
-                self.shareCollectionView.isUserInteractionEnabled = true
-                self.compressionOptionsView.isUserInteractionEnabled = true
-                self.hideProgressHUD()
+                self.hideProgressAlert()
                 self.updateSendButtonEnabledState()
                 return
             }
-            NCLog.logSync("Media upload: prepare finished, starting upload of \(self.shareItemController.shareItems.count) item(s)")
-            self.hud?.progress = self.prepareProgressShare
-            self.showProgressHUD(phase: .uploading(count: self.shareItemController.shareItems.count),
-                                 progress: self.prepareProgressShare,
-                                 overMedia: true)
-            // Brief yield so AVFoundation / HUD layout settle before kicking off N parallel PUTs.
+            for item in self.shareItemController.shareItems {
+                let bytes = MediaUploadPreprocessor.fileSizePublic(at: item.fileURL)
+                MediaUploadTrace.logSync("PREPARE done \(item.fileName ?? "unknown") uploadBytes=\(MediaUploadTrace.mb(bytes))")
+            }
+            MediaUploadTrace.logSync("PREPARE finished → upload \(self.shareItemController.shareItems.count) item(s) (maxConcurrentPUTs=\(MediaUploadDiskStore.maxConcurrentUploads))")
+            self.showProgressAlert(phase: .uploading(count: self.shareItemController.shareItems.count),
+                                   progress: self.prepareProgressShare,
+                                   indeterminate: false)
+            // Brief yield so AVFoundation settles before kicking off N parallel PUTs.
             // Keep isPreparingForUpload true across this gap (together with isUploadingMedia).
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
                 guard let self else { return }
@@ -717,10 +832,9 @@ import MBProgressHUD
                     NCLog.logSync("Media upload: upload start skipped — cancelled during handoff")
                     self.isPreparingForUpload = false
                     self.isUploadingMedia = false
+                    self.isInSendProgressMode = false
                     self.suppressMediaPreviews = false
-                    self.shareCollectionView.isUserInteractionEnabled = true
-                    self.compressionOptionsView.isUserInteractionEnabled = true
-                    self.hideProgressHUD()
+                    self.hideProgressAlert()
                     self.updateSendButtonEnabledState()
                     return
                 }
@@ -781,7 +895,7 @@ import MBProgressHUD
             return
         }
 
-        // Per-item: compress estimate if we would compress, else original (same as Send skip).
+        // One estimate pass for chip sizes + enablement (avoids 6× MediaUploadHeuristic per level).
         let totals = MediaUploadPreprocessor.cheapEstimatedByteCounts(forFileURLs: urls)
         let estimates: [MediaUploadCompressionLevel: Int64] = [
             .none: totals.none,
@@ -789,19 +903,33 @@ import MBProgressHUD
             .medium: totals.medium,
             .high: totals.high
         ]
-
-        let enabled: Set<MediaUploadCompressionLevel> = Set(
-            [MediaUploadCompressionLevel.none, .low, .medium, .high].filter {
-                MediaUploadDebugSettings.compressionLevelLikelyUseful($0, forFileURLs: urls)
-            }
-        )
+        let enabled = MediaUploadPreprocessor.compressionLevelsUsefulFromEstimates(totals)
 
         // If the selected level can't shrink, fall back to None.
         if !enabled.contains(self.chosenCompressionLevel) {
+            MediaUploadTrace.log("CHIPS selected=\(MediaUploadTrace.levelName(self.chosenCompressionLevel)) not useful → fall back to none")
             self.chosenCompressionLevel = .none
         }
 
-        NCLog.log("Media upload: Choose-on-upload chips for \(items.count) item(s) — none=\(totals.none) low=\(totals.low) medium=\(totals.medium) high=\(totals.high) enabled=\(enabled.map(\.rawValue).sorted()) (see MediaUploadHeuristic lines for per-item rates/sizes)")
+        MediaUploadTrace.log(String(format:
+            "CHIPS bag n=%ld totals none=%@ low=%@ med=%@ high=%@ enabled=%@ selected=%@",
+            items.count,
+            MediaUploadTrace.mb(totals.none),
+            MediaUploadTrace.mb(totals.low),
+            MediaUploadTrace.mb(totals.medium),
+            MediaUploadTrace.mb(totals.high),
+            enabled.map { MediaUploadTrace.levelName($0) }.sorted().joined(separator: ","),
+            MediaUploadTrace.levelName(self.chosenCompressionLevel)))
+        for url in urls {
+            let per = MediaUploadPreprocessor.cheapEstimatedByteCounts(at: url)
+            MediaUploadTrace.log(String(format:
+                "CHIPS item %@ original=%@ est low=%@ med=%@ high=%@",
+                url.lastPathComponent,
+                MediaUploadTrace.mb(per.none),
+                MediaUploadTrace.mb(per.low),
+                MediaUploadTrace.mb(per.medium),
+                MediaUploadTrace.mb(per.high)))
+        }
         self.applyCompressionChipTitles(estimates: estimates, enabled: enabled, sizesReady: true)
         self.view.layoutIfNeeded()
     }
@@ -895,11 +1023,8 @@ import MBProgressHUD
         var details: String {
             switch self {
             case .loadingMedia:
-                // Keep a second line so spinner + labels stay vertically centered
-                // across Loading / Preparing / Uploading (same bezel height).
-                return "\u{00a0}"
+                return NSLocalizedString("Please wait…", comment: "Detail under Loading media progress alert")
             case .preparing(let count), .uploading(let count):
-                // Identical subtitle for Preparing and Uploading — no layout shift on handoff.
                 if count == 1 {
                     return NSLocalizedString("1 media file", comment: "Upload progress detail for a single file")
                 }
@@ -911,108 +1036,29 @@ import MBProgressHUD
         }
     }
 
-    /// Shared card for Loading / Preparing / Uploading so the cover size does not jump.
-    private func styleMediaProgressHUD(_ hud: MBProgressHUD) {
-        hud.bezelView.style = .solidColor
-        hud.bezelView.color = .systemBackground
-        // Extra inset keeps indicator + two label lines centered in a stable square.
-        hud.margin = 50
-        hud.isSquare = true
-        hud.minSize = CGSize(width: 160, height: 160)
-        hud.offset = .zero
-        hud.bezelView.layer.cornerRadius = 14
-        // Allow shadow to render outside the bezel; solid fill still covers content.
-        hud.bezelView.clipsToBounds = false
-        hud.bezelView.layer.masksToBounds = false
-        hud.bezelView.layer.borderWidth = 1
-        hud.bezelView.layer.borderColor = UIColor.separator.cgColor
-        hud.bezelView.layer.shadowColor = UIColor.black.cgColor
-        hud.bezelView.layer.shadowOpacity = 0.18
-        hud.bezelView.layer.shadowRadius = 14
-        hud.bezelView.layer.shadowOffset = CGSize(width: 0, height: 6)
-        hud.contentColor = .label
-        hud.label.textColor = .label
-        hud.detailsLabel.textColor = .secondaryLabel
-        hud.detailsLabel.numberOfLines = 1
-        hud.removeFromSuperViewOnHide = true
-    }
-
-    private func thickAnnularProgressView(for hud: MBProgressHUD) -> ThickAnnularProgressView {
-        if let existing = hud.customView as? ThickAnnularProgressView {
-            return existing
-        }
-        let ring = ThickAnnularProgressView(frame: CGRect(x: 0, y: 0, width: 37, height: 37))
-        hud.customView = ring
-        return ring
-    }
-
-    private func loadingSpinnerView(for hud: MBProgressHUD) -> UIActivityIndicatorView {
-        if let existing = hud.customView as? UIActivityIndicatorView {
-            return existing
-        }
-        let spinner = UIActivityIndicatorView(style: .large)
-        spinner.frame = CGRect(x: 0, y: 0, width: 37, height: 37)
-        spinner.color = .label
-        spinner.hidesWhenStopped = false
-        spinner.startAnimating()
-        hud.customView = spinner
-        return spinner
-    }
-
-    private func applyUploadProgressColors(to hud: MBProgressHUD?) {
-        guard let hud else { return }
-        let completed = NCAppBranding.elementColor()
-        let remaining = UIColor.tertiarySystemFill
-
-        let ring = thickAnnularProgressView(for: hud)
-        ring.progressTintColor = completed
-        ring.backgroundTintColor = remaining
-        ring.setNeedsDisplay()
-    }
-
-    /// - Parameter overMedia: Pin the HUD to the media preview so progress is centered on the image/video.
-    private func showProgressHUD(phase: UploadHUDPhase, progress: Float?, indeterminate: Bool = false, overMedia: Bool = false) {
-        let pinToMedia = overMedia && !self.shareCollectionView.isHidden
-        let hostView: UIView = pinToMedia ? self.shareCollectionView : self.view
-
-        if let existing = self.hud, existing.superview !== hostView {
-            existing.hide(animated: false)
-            self.hud = nil
-        }
-
-        let hud: MBProgressHUD
-        if let existing = self.hud {
-            hud = existing
+    private func showProgressAlert(phase: UploadHUDPhase, progress: Float?, indeterminate: Bool) {
+        let alert: MediaUploadProgressAlert
+        if let existing = self.progressAlert {
+            alert = existing
         } else {
-            hud = MBProgressHUD.showAdded(to: hostView, animated: true)
-            self.hud = hud
+            alert = MediaUploadProgressAlert()
+            alert.onCancel = { [weak self] in
+                self?.cancelButtonPressed()
+            }
+            self.progressAlert = alert
+            alert.present(on: self.view, animated: true)
         }
 
-        self.styleMediaProgressHUD(hud)
-        hud.mode = .customView
-        // Keep title/details lengths stable so Preparing → Uploading does not reflow the card.
-        hud.label.text = phase.title
-        hud.detailsLabel.text = phase.details
-        hud.detailsLabel.isHidden = false
-
-        if indeterminate {
-            _ = self.loadingSpinnerView(for: hud)
-        } else {
-            // Custom annular ring — MBRoundProgressView hardcodes 2pt; we use 4pt (double).
-            let ring = self.thickAnnularProgressView(for: hud)
-            if let progress {
-                ring.progress = progress
-                hud.progress = progress
-            }
-            DispatchQueue.main.async {
-                self.applyUploadProgressColors(to: hud)
-            }
-        }
+        alert.update(title: phase.title,
+                     message: phase.details,
+                     progress: progress,
+                     indeterminate: indeterminate,
+                     showsCancel: true)
     }
 
-    private func hideProgressHUD() {
-        self.hud?.hide(animated: true)
-        self.hud = nil
+    private func hideProgressAlert() {
+        self.progressAlert?.dismiss(animated: true)
+        self.progressAlert = nil
     }
 
     // MARK: - Add additional items
@@ -1108,7 +1154,7 @@ import MBProgressHUD
     }
 
     func updateHudProgress() {
-        guard let hud = self.hud else { return }
+        guard self.progressAlert != nil else { return }
 
         DispatchQueue.main.async {
             var progress: CGFloat = 0.0
@@ -1121,7 +1167,7 @@ import MBProgressHUD
 
             let uploadFraction = items > 0 ? Float(progress / CGFloat(items)) : 0
             let prepareShare = self.mediaUploadMode == .noCompression ? 0 : self.prepareProgressShare
-            hud.progress = prepareShare + (1 - prepareShare) * uploadFraction
+            self.progressAlert?.setProgress(prepareShare + (1 - prepareShare) * uploadFraction, animated: true)
         }
     }
 
@@ -1138,16 +1184,13 @@ import MBProgressHUD
 
         NCLog.logSync("Media upload: uploadAndShareFiles started (\(self.shareItemController.shareItems.count) item(s))")
 
-        // Hide keyboard before upload to correctly display the HUD
         self.textView.resignFirstResponder()
 
         NCIntentController.sharedInstance().donateSendMessageIntent(for: self.room)
 
         let count = self.shareItemController.shareItems.count
         let prepareShare = self.mediaUploadMode == .noCompression ? Float(0) : self.prepareProgressShare
-        // Prefer root view when the media pager is hidden (compression/upload jetsam path).
-        let pinToMedia = !self.shareCollectionView.isHidden
-        self.showProgressHUD(phase: .uploading(count: count), progress: prepareShare, overMedia: pinToMedia)
+        self.showProgressAlert(phase: .uploading(count: count), progress: prepareShare, indeterminate: false)
 
         self.uploadGroup = DispatchGroup()
         self.uploadErrors = []
@@ -1183,11 +1226,8 @@ import MBProgressHUD
                     DispatchQueue.main.async {
                         self.isUploadingMedia = false
                         self.isPreparingForUpload = false
-                        self.suppressMediaPreviews = false
-                        self.shareCollectionView.isUserInteractionEnabled = true
-                        self.compressionOptionsView.isUserInteractionEnabled = true
-                        self.hideProgressHUD()
-                        self.updateSendButtonEnabledState()
+                        self.hideProgressAlert()
+                        self.exitSendProgressMode()
                         bgTask.stopBackgroundTask()
                         let alert = UIAlertController(
                             title: NSLocalizedString("Upload failed", comment: ""),
@@ -1257,29 +1297,27 @@ import MBProgressHUD
         self.uploadGroup.notify(queue: .main) {
             self.isUploadingMedia = false
             self.isPreparingForUpload = false
-            self.suppressMediaPreviews = false
-            self.shareCollectionView.isUserInteractionEnabled = true
             self.uploadTasks.removeAll()
-            self.compressionOptionsView.isUserInteractionEnabled = true
-            self.hideProgressHUD()
-            self.updateSendButtonEnabledState()
+            self.hideProgressAlert()
 
             if self.mediaFlowCancelled {
                 NCLog.log("Media upload: upload group finished after cancel — suppressing result UI")
+                self.isInSendProgressMode = false
                 bgTask.stopBackgroundTask()
                 return
             }
 
             // TODO: Do error reporting per item
             if self.uploadErrors.isEmpty {
+                self.isInSendProgressMode = false
                 self.finishingSuccessfulUpload = true
                 self.shareItemController.removeAllItems()
                 self.finishingSuccessfulUpload = false
                 self.delegate?.shareConfirmationViewControllerDidFinish(self)
             } else {
-                // We remove the successfully uploaded items, so only the failed ones are kept
+                // Keep failed items and restore compose so the user can retry or Cancel out.
                 self.shareItemController.remove(self.uploadSuccess)
-                // Refresh chip labels from whatever is left (failed items only).
+                self.exitSendProgressMode()
                 self.updateCompressionOptionsUI()
 
                 let alert = UIAlertController(title: NSLocalizedString("Upload failed", comment: ""),
@@ -1301,59 +1339,101 @@ import MBProgressHUD
             return
         }
 
-        NextcloudKit.shared.upload(serverUrlFileName: fileServerURL, fileNameLocalPath: item.filePath) { task in
-            NCLog.log("Media upload: upload task created for \(item.fileName)")
-            self.uploadTasks.append(task)
+        // Bound concurrent PUTs (encodes are already serial).
+        let uploadName = item.fileName ?? "unknown"
+        let localBytes = MediaUploadPreprocessor.fileSizePublic(at: URL(fileURLWithPath: item.filePath))
+        MediaUploadUploadGate.shared.acquire(label: uploadName) { finished in
             if self.mediaFlowCancelled {
-                task.cancel()
-            }
-        } progressHandler: { progress in
-            guard !self.mediaFlowCancelled else { return }
-            item.uploadProgress = progress.fractionCompleted
-            self.updateHudProgress()
-        } completionHandler: { _, _, _, _, _, _, nkError in
-            if self.mediaFlowCancelled {
+                finished()
                 self.uploadGroup.leave()
                 return
             }
-            if nkError.errorCode == 0 {
-                NCLog.log("Media upload: \(item.fileName) PUT completed, verifying remote size at \(fileServerURL)")
-                NCAPIController.sharedInstance().verifyUploadedFileSize(atServerURL: fileServerURL,
-                                                                          minimumBytes: 1,
-                                                                          forAccount: self.account) { verified, remoteBytes, verifyError in
-                    guard verified else {
-                        let reason = verifyError ?? String.localizedStringWithFormat(
-                            NSLocalizedString("Server stored “%@” as empty (%lld bytes).", comment: "Upload rejected after PROPFIND shows 0 bytes"),
-                            item.fileName,
-                            remoteBytes
-                        )
-                        NCLog.log("Media upload: PROPFIND rejected \(item.fileName) — \(reason)")
-                        self.uploadErrors.append(reason)
-                        self.uploadGroup.leave()
-                        return
-                    }
 
-                    NCLog.log("Media upload: \(item.fileName) verified on server (\(remoteBytes) bytes)")
-                    self.postUploadedFileToRoom(filePath: filePath, draftFolderPath: draftFolderPath, item: item)
+            MediaUploadTrace.log("UPLOAD start \(uploadName) \(MediaUploadTrace.mb(localBytes)) → \(fileServerURL)")
+            NextcloudKit.shared.upload(serverUrlFileName: fileServerURL, fileNameLocalPath: item.filePath) { task in
+                NCLog.log("Media upload: upload task created for \(uploadName)")
+                self.uploadTasks.append(task)
+                if self.mediaFlowCancelled {
+                    task.cancel()
                 }
-            } else if nkError.errorCode == 404 || nkError.errorCode == 409 {
-                NCAPIController.sharedInstance().checkOrCreateAttachmentFolder(forAccount: self.account) { created, _ in
-                    if created {
-                        self.uploadFile(to: fileServerURL, with: filePath, draftFolderPath: nil, with: item)
-                    } else {
-                        self.uploadErrors.append(nkError.errorDescription)
-                        self.uploadGroup.leave()
+            } progressHandler: { progress in
+                guard !self.mediaFlowCancelled else { return }
+                item.uploadProgress = progress.fractionCompleted
+                self.updateHudProgress()
+            } completionHandler: { _, _, _, _, _, _, nkError in
+                defer { finished() }
+
+                if self.mediaFlowCancelled {
+                    self.uploadGroup.leave()
+                    return
+                }
+                if nkError.errorCode == 0 {
+                    NCLog.log("Media upload: \(uploadName) PUT completed, verifying remote size at \(fileServerURL)")
+                    NCAPIController.sharedInstance().verifyUploadedFileSize(atServerURL: fileServerURL,
+                                                                              minimumBytes: 1,
+                                                                              forAccount: self.account) { verified, remoteBytes, remoteDate, verifyError in
+                        // Cancel can land after PUT while PROPFIND is in flight — do not promote/share.
+                        if self.mediaFlowCancelled {
+                            MediaUploadTrace.log("UPLOAD abort \(uploadName) after PROPFIND (cancelled)")
+                            self.uploadGroup.leave()
+                            return
+                        }
+                        guard verified else {
+                            let reason = verifyError ?? String.localizedStringWithFormat(
+                                NSLocalizedString("Server stored “%@” as empty (%lld bytes).", comment: "Upload rejected after PROPFIND shows 0 bytes"),
+                                uploadName,
+                                remoteBytes
+                            )
+                            MediaUploadTrace.log("UPLOAD FAIL \(uploadName) PROPFIND \(reason)")
+                            NCLog.log("Media upload: PROPFIND rejected \(uploadName) — \(reason)")
+                            self.uploadErrors.append(reason)
+                            self.uploadGroup.leave()
+                            return
+                        }
+
+                        MediaUploadTrace.log("UPLOAD OK \(uploadName) local=\(MediaUploadTrace.mb(localBytes)) remote=\(MediaUploadTrace.mb(remoteBytes))")
+                        let serverName = (fileServerURL as NSString).lastPathComponent
+                        _ = MediaUploadDiskStore.promoteUploadedFile(atPath: item.filePath,
+                                                                 accountId: self.account.accountId,
+                                                                 serverFileName: serverName,
+                                                                 remoteBytes: remoteBytes,
+                                                                 remoteModificationDate: remoteDate)
+                        self.postUploadedFileToRoom(filePath: filePath, draftFolderPath: draftFolderPath, item: item)
                     }
+                } else if nkError.errorCode == 404 || nkError.errorCode == 409 {
+                    MediaUploadTrace.log("UPLOAD retry \(uploadName) code=\(nkError.errorCode) (ensure folder)")
+                    NCAPIController.sharedInstance().checkOrCreateAttachmentFolder(forAccount: self.account) { created, _ in
+                        if self.mediaFlowCancelled {
+                            MediaUploadTrace.log("UPLOAD abort \(uploadName) folder-retry (cancelled)")
+                            self.uploadGroup.leave()
+                            return
+                        }
+                        if created {
+                            // Retry acquires its own gate slot; release this one via defer above.
+                            self.uploadFile(to: fileServerURL, with: filePath, draftFolderPath: nil, with: item)
+                        } else {
+                            MediaUploadTrace.log("UPLOAD FAIL \(uploadName) code=\(nkError.errorCode) folder-create \(nkError.errorDescription)")
+                            self.uploadErrors.append(nkError.errorDescription)
+                            self.uploadGroup.leave()
+                        }
+                    }
+                } else {
+                    MediaUploadTrace.log("UPLOAD FAIL \(uploadName) code=\(nkError.errorCode) \(nkError.errorDescription)")
+                    NCLog.log(String(format: "Failed to upload file. Error: %@", nkError.errorDescription))
+                    self.uploadErrors.append(nkError.errorDescription)
+                    self.uploadGroup.leave()
                 }
-            } else {
-                NCLog.log(String(format: "Failed to upload file. Error: %@", nkError.errorDescription))
-                self.uploadErrors.append(nkError.errorDescription)
-                self.uploadGroup.leave()
             }
         }
     }
 
     private func postUploadedFileToRoom(filePath: String, draftFolderPath: String?, item: ShareItem) {
+        if self.mediaFlowCancelled {
+            MediaUploadTrace.log("UPLOAD abort post \(item.fileName ?? "?") (cancelled)")
+            self.uploadGroup.leave()
+            return
+        }
+
         var talkMetaData: [String: Any] = [:]
 
         let itemCaption = item.caption.trimmingCharacters(in: .whitespaces)
@@ -1376,6 +1456,12 @@ import MBProgressHUD
                                                                         referenceId: nil,
                                                                         talkMetaData: talkMetaData,
                                                                         forAccount: self.account) { error in
+                if self.mediaFlowCancelled {
+                    // Request may already have reached the server; do not count as local success.
+                    MediaUploadTrace.log("UPLOAD abort post-callback \(item.fileName ?? "?") (cancelled)")
+                    self.uploadGroup.leave()
+                    return
+                }
                 if let error {
                     NCLog.log("Failed to post attachment. Error: \(error.localizedDescription)")
                     self.uploadErrors.append(error.localizedDescription)
@@ -1392,6 +1478,11 @@ import MBProgressHUD
                                                                toRoom: self.room.token,
                                                                withTalkMetaData: talkMetaData,
                                                                withReferenceId: nil) { error in
+                if self.mediaFlowCancelled {
+                    MediaUploadTrace.log("UPLOAD abort share-callback \(item.fileName ?? "?") (cancelled)")
+                    self.uploadGroup.leave()
+                    return
+                }
                 if let error {
                     NCLog.log(String(format: "Failed to share file. Error: %@", error.localizedDescription))
                     self.uploadErrors.append(error.localizedDescription)
@@ -1701,8 +1792,34 @@ import MBProgressHUD
     // MARK: - ShareItemController Delegate
 
     public func shareItemControllerShouldReleaseHeavyPreviews(_ shareItemController: ShareItemController) {
-        // Intentionally no-op: clearing pager bitmaps blanked the UI during Send. Memory is
-        // mitigated by serial ExportSession + capping how many videos we re-encode per batch.
+        // Drop in-memory pager bitmaps (compose is hidden during Send progress mode).
+        suppressMediaPreviews = true
+        for item in shareItemController.shareItems {
+            item.placeholderImage = nil
+        }
+        if self.isInSendProgressMode {
+            MediaUploadTrace.logSync(String(format:
+                "JETSAM releaseHeavyPreviews progress-mode items=%ld avail=%.0fMB",
+                shareItemController.shareItems.count,
+                MediaUploadMemoryGateObjC.availableMegabytes()))
+            return
+        }
+        var thumbHits = 0
+        for item in shareItemController.shareItems {
+            if let path = item.filePath, let thumb = MediaUploadDiskStore.loadThumb(forStagingPath: path) {
+                item.placeholderImage = thumb
+                thumbHits += 1
+            }
+        }
+        MediaUploadTrace.logSync(String(format:
+            "JETSAM releaseHeavyPreviews items=%ld diskThumbs=%ld avail=%.0fMB",
+            shareItemController.shareItems.count,
+            thumbHits,
+            MediaUploadMemoryGateObjC.availableMegabytes()))
+        shareCollectionView.reloadData()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.suppressMediaPreviews = false
+        }
     }
 
     public func shareItemControllerItemsChanged(_ shareItemController: ShareItemController) {
@@ -1952,20 +2069,16 @@ import MBProgressHUD
     /// Progress while loading from Photos/share provider or staging into the sheet (before Send).
     private func updateStagingProgressHUD() {
         if self.isPreparingForUpload || self.isUploadingMedia {
-            // Send-path Preparing/Uploading owns the annular HUD.
+            // Send-path Preparing/Uploading owns the progress alert.
             self.updateSendButtonEnabledState()
             return
         }
 
         if self.shareItemController.isBusyLoadingMedia {
-            // Same solid card + size as Preparing/Uploading, centered on the media pager.
-            self.showProgressHUD(phase: .loadingMedia,
-                                 progress: nil,
-                                 indeterminate: true,
-                                 overMedia: !self.shareCollectionView.isHidden)
-        } else if self.hud != nil {
+            self.showProgressAlert(phase: .loadingMedia, progress: nil, indeterminate: true)
+        } else if self.progressAlert != nil {
             // Load/staging finished — dismiss whether or not items appeared.
-            self.hideProgressHUD()
+            self.hideProgressAlert()
         }
 
         self.updateSendButtonEnabledState()
@@ -2011,59 +2124,4 @@ import MBProgressHUD
         }
     }
 
-}
-
-/// MBRoundProgressView hardcodes a 2pt annular stroke; double that for the upload HUD ring.
-private final class ThickAnnularProgressView: MBRoundProgressView {
-    private let strokeWidth: CGFloat = 4
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        isAnnular = true
-        backgroundColor = .clear
-        isOpaque = false
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        isAnnular = true
-        backgroundColor = .clear
-        isOpaque = false
-    }
-
-    override var intrinsicContentSize: CGSize {
-        CGSize(width: 37, height: 37)
-    }
-
-    override func draw(_ rect: CGRect) {
-        let lineWidth = strokeWidth
-        let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let radius = (bounds.width - lineWidth) / 2
-        let startAngle = -CGFloat.pi / 2
-
-        let backgroundPath = UIBezierPath(
-            arcCenter: center,
-            radius: radius,
-            startAngle: startAngle,
-            endAngle: startAngle + 2 * .pi,
-            clockwise: true
-        )
-        backgroundPath.lineWidth = lineWidth
-        backgroundPath.lineCapStyle = .butt
-        backgroundTintColor.setStroke()
-        backgroundPath.stroke()
-
-        let endAngle = startAngle + CGFloat(progress) * 2 * .pi
-        let progressPath = UIBezierPath(
-            arcCenter: center,
-            radius: radius,
-            startAngle: startAngle,
-            endAngle: endAngle,
-            clockwise: true
-        )
-        progressPath.lineWidth = lineWidth
-        progressPath.lineCapStyle = .square
-        progressTintColor.setStroke()
-        progressPath.stroke()
-    }
 }

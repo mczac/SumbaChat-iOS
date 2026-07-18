@@ -1,5 +1,6 @@
 //
 // SPDX-FileCopyrightText: 2020 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
@@ -66,9 +67,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
                 SDImageCache.shared.diskCache.removeExpiredData()
                 NCSettingsController.sharedInstance().createAccountsFile()
 
-                for account in NCDatabaseManager.sharedInstance().allAccounts() {
-                    NCChatFileController(account: account).removeOldFilesFromCache()
-                }
+                NCChatFileController.enforceCacheSizeLimit()
+                // upload/ + thumbs/ orphans older than 30m (skips an in-flight Share Extension).
+                MediaUploadDiskStore.scheduleIdleSessionScratchCleanup()
             }
         }
 

@@ -1,5 +1,6 @@
 //
 // SPDX-FileCopyrightText: 2024 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
@@ -3074,38 +3075,43 @@ class NCAPIController: NSObject, NKCommonDelegate {
     func verifyUploadedFileSize(atServerURL serverUrlFileName: String,
                                 minimumBytes: Int64 = 1,
                                 forAccount account: TalkAccount,
-                                completionBlock: @escaping (_ verified: Bool, _ remoteBytes: Int64, _ errorDescription: String?) -> Void) {
+                                completionBlock: @escaping (_ verified: Bool, _ remoteBytes: Int64, _ remoteDate: Date?, _ errorDescription: String?) -> Void) {
         self.setupNCCommunication(forAccount: account)
 
         let options = NKRequestOptions(timeout: TimeInterval(60), queue: .main)
         NextcloudKit.shared.readFileOrFolder(serverUrlFileName: serverUrlFileName, depth: "0", showHiddenFiles: true, includeHiddenFiles: [], requestBody: nil, options: options) { _, files, _, error in
             if error.errorCode != 0 {
-                completionBlock(false, 0, error.errorDescription)
+                completionBlock(false, 0, nil, error.errorDescription)
                 return
             }
 
             guard let file = files.first else {
-                completionBlock(false, 0, "PROPFIND returned no file metadata")
+                completionBlock(false, 0, nil, "PROPFIND returned no file metadata")
                 return
             }
 
             let remoteBytes = Int64(file.size)
-            completionBlock(remoteBytes >= minimumBytes, remoteBytes, nil)
+            let remoteDate = file.date as Date?
+            completionBlock(remoteBytes >= minimumBytes, remoteBytes, remoteDate, nil)
         }
     }
 
     func checkOrCreateAttachmentFolder(forAccount account: TalkAccount, completionBlock: @escaping (_ created: Bool, _ statusCode: Int) -> Void) {
         self.setupNCCommunication(forAccount: account)
 
-        guard let attachmentFolderServerURL = self.attachmentFolderServerURL(forAccount: account)
-        else { return }
+        guard let attachmentFolderServerURL = self.attachmentFolderServerURL(forAccount: account) else {
+            completionBlock(false, 0)
+            return
+        }
 
         let options = NKRequestOptions(timeout: TimeInterval(60), queue: .main)
         NextcloudKit.shared.readFileOrFolder(serverUrlFileName: attachmentFolderServerURL, depth: "0", showHiddenFiles: true, includeHiddenFiles: [], requestBody: nil, options: options) { _, _, _, error in
-            if error.errorCode == 404 {
-                // Attachment folder does not exist
-                NextcloudKit.shared.createFolder(serverUrlFileName: attachmentFolderServerURL, options: options) { _, _, _, error in
-                    completionBlock(error.errorCode == 0, error.errorCode)
+            if error.errorCode == 0 {
+                // Folder already exists — ready for upload retry (404/409 on PUT).
+                completionBlock(true, 0)
+            } else if error.errorCode == 404 {
+                NextcloudKit.shared.createFolder(serverUrlFileName: attachmentFolderServerURL, options: options) { _, _, _, createError in
+                    completionBlock(createError.errorCode == 0, createError.errorCode)
                 }
             } else {
                 print("Error checking attachment folder: \(error.errorDescription)")

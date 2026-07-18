@@ -1,5 +1,6 @@
 //
 // SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
@@ -153,110 +154,109 @@ import UniformTypeIdentifiers
     }
 }
 
-/// Package-aware Automatic picker: per-file cap X, package cap Y (Y wins).
+/// Per-file Automatic picker (no package/bag size). Bag limit is selection count only (10).
+///
+/// Quality ladder (our Low = highest quality / mildest shrink):
+/// 1. High quality (Low) if estimate stays under cap after estimate-error margin
+/// 2. else Medium if estimate stays under cap after margin
+/// 3. else Low quality (High compression)
+///
+/// Margin (Settings debug): photos default 20%, videos 10%.
+/// Accept level when `estimate × (1 + margin/100) < max file size`.
 @objcMembers public final class MediaUploadAutomaticPolicy: NSObject {
 
-    private static let pathMonitor = NWPathMonitor()
-    private static let monitorQueue = DispatchQueue(label: "com.spl.SumbaChat.media-upload-path")
-    private static var latestPath: NWPath?
-    private static var didStartMonitor = false
-
     public static func startMonitoringIfNeeded() {
-        guard !didStartMonitor else { return }
-        didStartMonitor = true
-        pathMonitor.pathUpdateHandler = { path in
-            latestPath = path
-        }
-        pathMonitor.start(queue: monitorQueue)
+        // Kept for call sites; Automatic no longer watches network path.
     }
 
-    /// Legacy single-file API — prefers Low/Medium/High from package logic for one URL.
+    /// Legacy single-file API.
     @objc(compressionLevelForFileURL:)
     public static func compressionLevel(forFileURL fileURL: URL) -> MediaUploadCompressionLevel {
         let levels = compressionLevels(forFileURLs: [fileURL])
         return levels.first ?? .medium
     }
 
-    /// Mildest per-item levels such that estimates ≤ X and sum ≤ Y; escalate largest first; High is best effort.
+    /// Max compressed size for Automatic (default 16 MB; Settings “Automatic max file size”).
+    public static var automaticFileMaxBytes: Int64 {
+        max(Int64(1024 * 1024), MediaUploadDebugSettings.shared().perFileMaxBytes)
+    }
+
+    /// Effective ceiling used when comparing estimates: `cap / (1 + margin/100)`.
+    public static func estimateAcceptanceCeilingBytes(fileCap: Int64, marginPercent: Double) -> Int64 {
+        let margin = MediaUploadDebugSettings.clampedMarginPercent(marginPercent)
+        let divisor = 1.0 + margin / 100.0
+        guard divisor > 1.0 else { return fileCap }
+        return Int64(Double(fileCap) / divisor)
+    }
+
+    /// True when `estimate × (1 + margin/100) < fileCap`.
+    public static func estimateFitsUnderCap(_ estimateBytes: Int64, fileCap: Int64, marginPercent: Double) -> Bool {
+        guard estimateBytes > 0, fileCap > 0 else { return false }
+        let ceiling = estimateAcceptanceCeilingBytes(fileCap: fileCap, marginPercent: marginPercent)
+        return estimateBytes < ceiling
+    }
+
     public static func compressionLevels(forFileURLs fileURLs: [URL]) -> [MediaUploadCompressionLevel] {
-        startMonitoringIfNeeded()
         let debug = MediaUploadDebugSettings.shared()
-        let perFileCap = max(Int64(1024), debug.perFileMaxBytes)
-        let packageCap = max(perFileCap, debug.packageMaxBytes)
+        let fileCap = automaticFileMaxBytes
+        let photoMargin = debug.automaticPhotoEstimateMarginPercent
+        let videoMargin = debug.automaticVideoEstimateMarginPercent
 
-        var levels: [MediaUploadCompressionLevel] = fileURLs.map { url in
+        return fileURLs.map { url in
             let ext = url.pathExtension.lowercased()
-            let isMedia = NCUtils.isImage(fileExtension: ext) || MediaUploadPreprocessor.isVideo(fileExtension: ext)
-            return isMedia ? .low : .none
-        }
-
-        func estimate(at index: Int) -> Int64 {
-            let url = fileURLs[index]
-            let level = levels[index]
-            if level == .none {
-                return MediaUploadPreprocessor.fileSizePublic(at: url)
+            let isImage = NCUtils.isImage(fileExtension: ext)
+            let isVideo = MediaUploadPreprocessor.isVideo(fileExtension: ext)
+            guard isImage || isVideo else {
+                NCLog.log("MediaUploadAutomaticPolicy: \(url.lastPathComponent) → none (non-media)")
+                return .none
             }
-            return MediaUploadPreprocessor.estimatedByteCount(at: url, level: level)
-        }
 
-        func escalate(_ index: Int) -> Bool {
-            switch levels[index] {
-            case .low:
-                levels[index] = .medium
-                return true
-            case .medium:
-                levels[index] = .high
-                return true
-            default:
-                return false
+            let margin = isVideo ? videoMargin : photoMargin
+            let ceiling = estimateAcceptanceCeilingBytes(fileCap: fileCap, marginPercent: margin)
+            let original = MediaUploadPreprocessor.fileSizePublic(at: url)
+            let kind = isVideo ? "video" : "photo"
+
+            // High quality = Low compression level (mildest).
+            let highQualityBytes = MediaUploadPreprocessor.estimatedByteCount(at: url, level: .low)
+            if estimateFitsUnderCap(highQualityBytes, fileCap: fileCap, marginPercent: margin) {
+                MediaUploadTrace.log(String(format:
+                    "AUTO %@ %@ original=%@ → %@ (est=%@ < ceiling=%@; cap=%@ margin=%.0f%%)",
+                    kind, url.lastPathComponent,
+                    MediaUploadTrace.mb(original),
+                    MediaUploadTrace.levelName(.low),
+                    MediaUploadTrace.mb(highQualityBytes),
+                    MediaUploadTrace.mb(ceiling),
+                    MediaUploadTrace.mb(fileCap),
+                    margin))
+                return .low
             }
-        }
 
-        // File cap X
-        var changed = true
-        while changed {
-            changed = false
-            for i in fileURLs.indices where levels[i] != .none {
-                if estimate(at: i) > perFileCap, escalate(i) {
-                    changed = true
-                }
+            let mediumQualityBytes = MediaUploadPreprocessor.estimatedByteCount(at: url, level: .medium)
+            if estimateFitsUnderCap(mediumQualityBytes, fileCap: fileCap, marginPercent: margin) {
+                MediaUploadTrace.log(String(format:
+                    "AUTO %@ %@ original=%@ → %@ (est=%@ < ceiling=%@; cap=%@ margin=%.0f%%)",
+                    kind, url.lastPathComponent,
+                    MediaUploadTrace.mb(original),
+                    MediaUploadTrace.levelName(.medium),
+                    MediaUploadTrace.mb(mediumQualityBytes),
+                    MediaUploadTrace.mb(ceiling),
+                    MediaUploadTrace.mb(fileCap),
+                    margin))
+                return .medium
             }
-        }
 
-        // Total cap Y
-        while true {
-            let estimates = fileURLs.indices.map { estimate(at: $0) }
-            let total = estimates.reduce(Int64(0), +)
-            if total <= packageCap { break }
-
-            var bestIndex: Int?
-            var bestSize: Int64 = -1
-            for i in fileURLs.indices where levels[i] != .none && levels[i] != .high {
-                if estimates[i] > bestSize {
-                    bestSize = estimates[i]
-                    bestIndex = i
-                }
-            }
-            guard let index = bestIndex, escalate(index) else { break }
+            let lowQualityBytes = MediaUploadPreprocessor.estimatedByteCount(at: url, level: .high)
+            MediaUploadTrace.log(String(format:
+                "AUTO %@ %@ original=%@ → %@ (est=%@; ceiling=%@; cap=%@ margin=%.0f%%) best-effort",
+                kind, url.lastPathComponent,
+                MediaUploadTrace.mb(original),
+                MediaUploadTrace.levelName(.high),
+                MediaUploadTrace.mb(lowQualityBytes),
+                MediaUploadTrace.mb(ceiling),
+                MediaUploadTrace.mb(fileCap),
+                margin))
+            return .high
         }
-
-        // Cellular nudge: if still on Low for a large item, prefer Medium.
-        let path = latestPath
-        let isConstrainedCellular = path?.isExpensive == true || path?.isConstrained == true
-            || path?.usesInterfaceType(.cellular) == true
-        if isConstrainedCellular {
-            for i in fileURLs.indices where levels[i] == .low {
-                let original = MediaUploadPreprocessor.fileSizePublic(at: fileURLs[i])
-                if original > MediaUploadCompressionSettings.automaticCellularEscalateBytes {
-                    levels[i] = .medium
-                }
-            }
-        }
-
-        for (url, level) in zip(fileURLs, levels) {
-            NCLog.log("MediaUploadAutomaticPolicy: \(url.lastPathComponent) → \(level.rawValue) (X=\(perFileCap) Y=\(packageCap))")
-        }
-        return levels
     }
 }
 
@@ -305,9 +305,8 @@ import UniformTypeIdentifiers
 /// Compresses photos and videos before they are uploaded.
 @objcMembers public class MediaUploadPreprocessor: NSObject {
 
-    /// Set by ShareItemController when Send has 2+ videos.
-    /// Even if Settings chose Bitrate / AVAssetWriter, we force AVAssetExportSession for that
-    /// batch to avoid mediaserverd / jetsam memory hits that crashed multi-Writer encodes.
+    /// Legacy flag: when YES, compressVideo uses ExportSession even if Settings = Writer.
+    /// Multi-video Bitrate sends no longer set this (Telegram-style serial Writer + edge cap).
     @objc public static var preferExportSession = false
 
     /// One export at a time; asset/session created here — never on the main thread.
@@ -322,51 +321,126 @@ import UniformTypeIdentifiers
             return false
         }
 
-        guard let image = previewImage(at: sourceURL, maxDimension: settings.imageMaxDimension)
-                ?? UIImage(contentsOfFile: sourceURL.path) else {
-            NCLog.log("MediaUploadPreprocessor: failed to decode image for compression at \(sourceURL.lastPathComponent)")
-            return false
-        }
-
-        guard let jpegData = compressedJPEGData(from: image, settings: settings), !jpegData.isEmpty else {
-            NCLog.log("MediaUploadPreprocessor: JPEG encode produced empty data for \(sourceURL.lastPathComponent)")
-            return false
-        }
-
         let sourcePath = sourceURL.standardizedFileURL.path
         let destinationPath = destinationURL.standardizedFileURL.path
         let destinationIsSource = sourcePath == destinationPath
 
+        let fm = FileManager.default
+        // ImageIO finalize is non-atomic — always write a sibling temp then replace.
+        let tempURL = destinationURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(UUID().uuidString).\(destinationURL.lastPathComponent)")
+
         do {
-            if !destinationIsSource, FileManager.default.fileExists(atPath: destinationPath) {
-                try FileManager.default.removeItem(at: destinationURL)
+            // Prefer ImageIO downsample → JPEG (orientation baked in, no GPS/EXIF baggage).
+            let wroteImageIO = writeDownsampledJPEG(from: sourceURL,
+                                                    to: tempURL,
+                                                    maxDimension: settings.imageMaxDimension,
+                                                    quality: settings.imageJPEGQuality)
+            let encodePath: String
+            if wroteImageIO {
+                encodePath = "ImageIO"
+            } else {
+                try? fm.removeItem(at: tempURL)
+                MediaUploadTrace.log("ENCODE image fallback jpegData \(sourceURL.lastPathComponent)")
+                guard let image = previewImage(at: sourceURL, maxDimension: settings.imageMaxDimension)
+                        ?? UIImage(contentsOfFile: sourceURL.path) else {
+                    NCLog.log("MediaUploadPreprocessor: failed to decode image for compression at \(sourceURL.lastPathComponent)")
+                    return false
+                }
+                guard let jpegData = compressedJPEGData(from: image, settings: settings), !jpegData.isEmpty else {
+                    NCLog.log("MediaUploadPreprocessor: JPEG encode produced empty data for \(sourceURL.lastPathComponent)")
+                    return false
+                }
+                try jpegData.write(to: tempURL, options: .atomic)
+                encodePath = "jpegData"
             }
 
-            try jpegData.write(to: destinationURL, options: .atomic)
-
-            let written = fileSize(at: destinationURL)
+            let written = fileSize(at: tempURL)
             guard written > 0 else {
                 NCLog.log("MediaUploadPreprocessor: compressed image write left 0-byte file")
-                if !destinationIsSource {
-                    try? FileManager.default.removeItem(at: destinationURL)
-                }
+                try? fm.removeItem(at: tempURL)
                 return false
             }
 
-            NCLog.log(String(format:
-                "MediaUploadPreprocessor: image ACTUAL %@ %lld (%.2f MB) → %lld (%.2f MB) q=%.2f maxEdge=%.0f",
+            if destinationIsSource {
+                // Replace in place via temp sibling (never finalize ImageIO onto the live source).
+                let backupURL = destinationURL.deletingLastPathComponent()
+                    .appendingPathComponent(".\(UUID().uuidString).bak.\(destinationURL.lastPathComponent)")
+                if fm.fileExists(atPath: destinationPath) {
+                    try fm.moveItem(at: destinationURL, to: backupURL)
+                }
+                do {
+                    try fm.moveItem(at: tempURL, to: destinationURL)
+                    try? fm.removeItem(at: backupURL)
+                } catch {
+                    try? fm.removeItem(at: tempURL)
+                    if fm.fileExists(atPath: backupURL.path) {
+                        try? fm.removeItem(at: destinationURL)
+                        try? fm.moveItem(at: backupURL, to: destinationURL)
+                    }
+                    throw error
+                }
+            } else {
+                if fm.fileExists(atPath: destinationPath) {
+                    try fm.removeItem(at: destinationURL)
+                }
+                try fm.moveItem(at: tempURL, to: destinationURL)
+            }
+
+            let sourceSize = fileSize(at: sourceURL)
+            MediaUploadTrace.log(String(format:
+                "ENCODE image ACTUAL %@ %@ → %@ path=%@ q=%.2f maxEdge=%.0f",
                 sourceURL.lastPathComponent,
-                fileSize(at: sourceURL),
-                Double(fileSize(at: sourceURL)) / 1_048_576.0,
-                written,
-                Double(written) / 1_048_576.0,
+                MediaUploadTrace.mb(sourceSize),
+                MediaUploadTrace.mb(written),
+                encodePath,
                 settings.imageJPEGQuality,
                 settings.imageMaxDimension))
             return true
         } catch {
+            try? fm.removeItem(at: tempURL)
             NCLog.log("MediaUploadPreprocessor: failed to write compressed image: \(error.localizedDescription)")
             return false
         }
+    }
+
+    /// ImageIO thumbnail + JPEG destination (strips GPS / bulky metadata; applies orientation).
+    /// Caller must pass a temp URL — Finalize is not crash-atomic.
+    private static func writeDownsampledJPEG(from sourceURL: URL,
+                                             to destinationURL: URL,
+                                             maxDimension: CGFloat,
+                                             quality: CGFloat) -> Bool {
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, sourceOptions) else {
+            return false
+        }
+
+        let maxPixel = max(320, Int(maxDimension.rounded()))
+        let thumbOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: false,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) else {
+            return false
+        }
+
+        guard let dest = CGImageDestinationCreateWithURL(destinationURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
+            return false
+        }
+
+        let q = min(1, max(0.01, quality))
+        let properties: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: q
+        ]
+        // Do not copy source properties — drops GPS / large EXIF; orientation already applied via transform.
+        CGImageDestinationAddImage(dest, cgImage, properties as CFDictionary)
+        let ok = CGImageDestinationFinalize(dest)
+        if !ok {
+            try? FileManager.default.removeItem(at: destinationURL)
+        }
+        return ok
     }
 
     @objc(compressedJPEGDataFromImage:settings:)
@@ -394,59 +468,69 @@ import UniformTypeIdentifiers
                                      cancelToken: MediaUploadPreparationToken?,
                                      progress: ((Float) -> Void)?,
                                      completion: @escaping (Bool) -> Void) {
-        if cancelToken?.isCancelled == true {
-            completion(false)
-            return
-        }
-
-        guard settings.shouldCompressVideos else {
-            completion(false)
-            return
-        }
-
-        let debug = MediaUploadDebugSettings.shared()
-        // Settings Bitrate/Writer wins for a single video. Two or more videos set
-        // preferExportSession so we use ExportSession instead (jetsam / crash avoidance).
-        let useWriter = debug.usesAssetWriter && !preferExportSession
-        if useWriter, let profile = settings.profile {
-            MediaUploadVideoWriter.compress(at: sourceURL,
-                                            toDestinationURL: destinationURL,
-                                            profile: profile,
-                                            cancelToken: cancelToken,
-                                            progress: progress) { success in
-                if success {
-                    completion(true)
-                    return
+        // Telegram-style: one process-wide encode at a time.
+        MediaUploadVideoEncodeQueue.shared.enqueue { finished in
+            let finish: (Bool) -> Void = { success in
+                DispatchQueue.main.async {
+                    completion(success)
+                    // Release the global slot only after the caller has been notified.
+                    finished()
                 }
-                if cancelToken?.isCancelled == true {
-                    completion(false)
-                    return
-                }
-                NCLog.log("MediaUploadPreprocessor: Writer failed — falling back to ExportSession")
-                compressVideoWithExportSession(at: sourceURL,
-                                               toDestinationURL: destinationURL,
-                                               settings: settings,
-                                               cancelToken: cancelToken,
-                                               progress: progress,
-                                               completion: completion)
             }
-            return
-        }
 
-        if preferExportSession {
-            let writerWasChosen = debug.usesAssetWriter
-            NCLog.log("MediaUploadPreprocessor: preferExportSession — \(sourceURL.lastPathComponent)"
-                + (writerWasChosen
-                   ? " (Settings=Writer; forcing ExportSession for multi-video to avoid jetsam/crash)"
-                   : " (Settings=ExportSession)"))
-        }
+            if cancelToken?.isCancelled == true {
+                finish(false)
+                return
+            }
 
-        compressVideoWithExportSession(at: sourceURL,
-                                       toDestinationURL: destinationURL,
-                                       settings: settings,
-                                       cancelToken: cancelToken,
-                                       progress: progress,
-                                       completion: completion)
+            guard settings.shouldCompressVideos else {
+                finish(false)
+                return
+            }
+
+            let debug = MediaUploadDebugSettings.shared()
+            let useWriter = debug.usesAssetWriter && !preferExportSession
+            if useWriter, let profile = settings.profile {
+                MediaUploadTrace.log("ENCODE video path=Writer \(sourceURL.lastPathComponent)")
+                MediaUploadVideoWriter.compress(at: sourceURL,
+                                                toDestinationURL: destinationURL,
+                                                profile: profile,
+                                                cancelToken: cancelToken,
+                                                progress: progress) { success in
+                    if success {
+                        finish(true)
+                        return
+                    }
+                    if cancelToken?.isCancelled == true {
+                        finish(false)
+                        return
+                    }
+                    MediaUploadTrace.log("ENCODE video Writer→ExportSession fallback \(sourceURL.lastPathComponent)")
+                    NCLog.log("MediaUploadPreprocessor: Writer failed — falling back to ExportSession")
+                    compressVideoWithExportSession(at: sourceURL,
+                                                   toDestinationURL: destinationURL,
+                                                   settings: settings,
+                                                   cancelToken: cancelToken,
+                                                   progress: progress,
+                                                   completion: finish)
+                }
+                return
+            }
+
+            if preferExportSession {
+                MediaUploadTrace.log("ENCODE video path=ExportSession (prefer) \(sourceURL.lastPathComponent)")
+                NCLog.log("MediaUploadPreprocessor: preferExportSession — \(sourceURL.lastPathComponent)")
+            } else {
+                MediaUploadTrace.log("ENCODE video path=ExportSession \(sourceURL.lastPathComponent)")
+            }
+
+            compressVideoWithExportSession(at: sourceURL,
+                                           toDestinationURL: destinationURL,
+                                           settings: settings,
+                                           cancelToken: cancelToken,
+                                           progress: progress,
+                                           completion: finish)
+        }
     }
 
     private static func compressVideoWithExportSession(at sourceURL: URL,
@@ -534,6 +618,7 @@ import UniformTypeIdentifiers
                         case .completed:
                             guard compressedSize > 0, sourceSize == 0 || compressedSize < sourceSize else {
                                 try? FileManager.default.removeItem(at: destinationURL)
+                                MediaUploadTrace.log("ENCODE video keep-original \(sourceName) engine=ExportSession (not smaller)")
                                 NCLog.log("MediaUploadPreprocessor: compressed video was not smaller; using original")
                                 completion(false)
                                 return
@@ -541,14 +626,15 @@ import UniformTypeIdentifiers
 
                             let srcMbps = duration > 0 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: sourceSize, durationSeconds: duration) : 0
                             let outMbps = duration > 0 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: compressedSize, durationSeconds: duration) : 0
-                            NCLog.logSync(String(format:
-                                "MediaUploadPreprocessor: ExportSession ACTUAL %@ %lld (%.2f MB, %.3fMbps) → %lld (%.2f MB, %.3fMbps) preset=%@",
+                            MediaUploadTrace.logSync(String(format:
+                                "ENCODE video ACTUAL %@ %@ (%.3fMbps) → %@ (%.3fMbps) engine=ExportSession preset=%@",
                                 sourceName,
-                                sourceSize, Double(sourceSize) / 1_048_576.0, srcMbps,
-                                compressedSize, Double(compressedSize) / 1_048_576.0, outMbps,
+                                MediaUploadTrace.mb(sourceSize), srcMbps,
+                                MediaUploadTrace.mb(compressedSize), outMbps,
                                 presetName))
                             completion(true)
                         case .failed, .cancelled:
+                            MediaUploadTrace.log("ENCODE video FAIL \(sourceName) engine=ExportSession \(errorDescription ?? "unknown")")
                             NCLog.log("MediaUploadPreprocessor: video export failed: \(errorDescription ?? "unknown error")")
                             try? FileManager.default.removeItem(at: destinationURL)
                             completion(false)
@@ -645,17 +731,15 @@ import UniformTypeIdentifiers
         var low: Int64 = 0
         var medium: Int64 = 0
         var high: Int64 = 0
-        // Multi-video Send forces ExportSession (see ShareItemController preferExportSession).
-        // Chips + heuristic logs use preset guests for Low/Medium/High — not Writer rates.
-        let videoCount = fileURLs.reduce(0) { partial, url in
-            partial + (isVideo(fileExtension: url.pathExtension.lowercased()) ? 1 : 0)
-        }
-        let multiVideoUsesExportSession = videoCount >= 2
+        // Sum raw estimates only — do not re-run MediaUploadHeuristic shrink checks here
+        // (that was logging ~6 lines per level when chips also called compressionLevelLikelyUseful).
+        let usesWriter = MediaUploadDebugSettings.shared().usesAssetWriter
         let debug = MediaUploadDebugSettings.shared()
+        let shrinkThreshold = 0.90
 
         for url in fileURLs {
             var counts = cheapEstimatedByteCounts(at: url)
-            if multiVideoUsesExportSession,
+            if !usesWriter,
                isVideo(fileExtension: url.pathExtension.lowercased()),
                let duration = videoDurationSeconds(at: url), duration > 0 {
                 let original = fileSize(at: url)
@@ -675,32 +759,33 @@ import UniformTypeIdentifiers
                     durationSeconds: duration,
                     originalSize: original)
                 let cap = original > 0 ? original : max(exportLow, max(exportMedium, exportHigh))
-                // Monotonic: Low ≥ Medium ≥ High (preset guests are not always ordered).
                 counts.low = max(12_288, min(exportLow, cap))
                 counts.medium = max(12_288, min(exportMedium, counts.low))
                 counts.high = max(12_288, min(exportHigh, counts.medium))
             }
-            // Match Send: skip items that would not shrink at that level → count original size.
-            let lowBytes = MediaUploadDebugSettings.itemCompressionLikelyShrinks(
-                at: url, level: .low, forceExportSession: multiVideoUsesExportSession)
-                ? counts.low : counts.none
-            let mediumBytes = MediaUploadDebugSettings.itemCompressionLikelyShrinks(
-                at: url, level: .medium, forceExportSession: multiVideoUsesExportSession)
-                ? counts.medium : counts.none
-            let highBytes = MediaUploadDebugSettings.itemCompressionLikelyShrinks(
-                at: url, level: .high, forceExportSession: multiVideoUsesExportSession)
-                ? counts.high : counts.none
 
-            let itemLow = min(lowBytes, counts.none)
-            let itemMedium = min(mediumBytes, itemLow)
-            let itemHigh = min(highBytes, itemMedium)
+            // Chip totals: use compress estimate only when it is ≥10% smaller; else original.
+            let threshold = Int64(Double(counts.none) * shrinkThreshold)
+            let itemLow = counts.low < threshold ? counts.low : counts.none
+            let itemMedium = counts.medium < threshold ? counts.medium : counts.none
+            let itemHigh = counts.high < threshold ? counts.high : counts.none
 
             none += counts.none
-            low += itemLow
-            medium += itemMedium
-            high += itemHigh
+            low += min(itemLow, counts.none)
+            medium += min(itemMedium, min(itemLow, counts.none))
+            high += min(itemHigh, min(itemMedium, min(itemLow, counts.none)))
         }
         return LevelEstimates(none: none, low: low, medium: medium, high: high)
+    }
+
+    /// Chip enablement from already-computed totals — no extra heuristic AVAsset passes.
+    public static func compressionLevelsUsefulFromEstimates(_ totals: LevelEstimates) -> Set<MediaUploadCompressionLevel> {
+        var enabled: Set<MediaUploadCompressionLevel> = [.none]
+        let threshold = Int64(Double(totals.none) * 0.90)
+        if totals.low < threshold { enabled.insert(.low) }
+        if totals.medium < threshold { enabled.insert(.medium) }
+        if totals.high < threshold { enabled.insert(.high) }
+        return enabled
     }
 
     private static func heuristicCompressedByteCount(originalSize: Int64, level: MediaUploadCompressionLevel) -> Int64 {

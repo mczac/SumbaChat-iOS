@@ -1,6 +1,7 @@
 //
 /**
  * SPDX-FileCopyrightText: 2020 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -24,6 +25,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// Stored as MediaUploadMode raw value. Default is Automatic.
 + (void)setMediaUploadMode:(NSInteger)mode;
 + (NSInteger)mediaUploadMode;
+
+/// Max chat-file download cache size in bytes. Default 3 GB.
++ (void)setFileCacheMaxBytes:(int64_t)bytes;
++ (int64_t)fileCacheMaxBytes;
 
 @end
 

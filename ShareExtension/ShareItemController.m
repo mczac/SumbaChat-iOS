@@ -1,5 +1,6 @@
 /**
  * SPDX-FileCopyrightText: 2020 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -20,6 +21,8 @@
 @property (nonatomic, strong) NSMutableArray<NSString *> *pendingStagingFailures;
 @property (nonatomic, strong) MediaUploadPreparationToken *activePreparationToken;
 @property (nonatomic, assign) NSInteger batchVideoMaxEdgeCap;
+/// Content fingerprints already staged in this bag (dedup).
+@property (nonatomic, strong) NSMutableSet<NSString *> *stagedContentFingerprints;
 
 @end
 
@@ -38,6 +41,7 @@
         self.stagingSettings = settings ?: [[MediaUploadCompressionSettings alloc] initWithLevel:MediaUploadCompressionLevelNone];
         self.internalShareItems = [[NSMutableArray alloc] init];
         self.pendingStagingFailures = [[NSMutableArray alloc] init];
+        self.stagedContentFingerprints = [[NSMutableSet alloc] init];
         self.preparationQueue = dispatch_queue_create("com.spl.SumbaChat.media-upload-preparation", DISPATCH_QUEUE_SERIAL);
         [self initTempDirectory];
     }
@@ -50,22 +54,22 @@
 
 - (void)initTempDirectory
 {
+    // Wipe prior session upload/ + thumbs/ before staging (sync — must be empty first).
+    [MediaUploadDiskStore clearSessionScratchCachesWithReason:@"share-init" wait:YES];
+
     NSFileManager *fileManager = [NSFileManager defaultManager];
-    self.tempDirectoryPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"/upload/"];
-    
-    if (![fileManager fileExistsAtPath:self.tempDirectoryPath]) {
-        // Make sure our upload directory exists
-        [fileManager createDirectoryAtPath:self.tempDirectoryPath withIntermediateDirectories:YES attributes:nil error:nil];
-    } else {
-        // Clean up any temporary files from a previous upload
-        NSArray *previousFiles = [fileManager contentsOfDirectoryAtPath:self.tempDirectoryPath error:nil];
-        
-        for (NSString *previousFile in previousFiles) {
-            [fileManager removeItemAtPath:[self.tempDirectoryPath stringByAppendingPathComponent:previousFile] error:nil];
-        }
+    // App Group Caches (shared with main app) — falls back to tmp if group unavailable.
+    self.tempDirectoryPath = [MediaUploadDiskStore.shared uploadDirectoryPath];
+    if (![self.tempDirectoryPath hasSuffix:@"/"]) {
+        self.tempDirectoryPath = [self.tempDirectoryPath stringByAppendingString:@"/"];
     }
-    
+
+    if (![fileManager fileExistsAtPath:self.tempDirectoryPath]) {
+        [fileManager createDirectoryAtPath:self.tempDirectoryPath withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+
     self.tempDirectoryURL = [NSURL fileURLWithPath:self.tempDirectoryPath isDirectory:YES];
+    [MediaUploadDiskStore enforceUploadStagingBudget];
 }
 
 - (void)beginPreparingItem
@@ -166,16 +170,59 @@
     [NCLog log:@"ShareItemController: preparation cancelled"];
 }
 
+/// Confine staging names to a single path component under `upload/` (blocks `../` traversal).
+- (NSString *)sanitizedStagingFileName:(NSString *)fileName
+{
+    NSString *fallback = [NSString stringWithFormat:@"file-%.0f.bin", [[NSDate date] timeIntervalSince1970] * 1000];
+    if (fileName.length == 0) {
+        return fallback;
+    }
+
+    NSString *name = [fileName stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
+    name = name.lastPathComponent;
+    name = [name stringByReplacingOccurrencesOfString:@"\0" withString:@""];
+    name = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+
+    if (name.length == 0 || [name isEqualToString:@"."] || [name isEqualToString:@".."]) {
+        return fallback;
+    }
+
+    NSCharacterSet *separators = [NSCharacterSet characterSetWithCharactersInString:@"/\\"];
+    if ([name rangeOfCharacterFromSet:separators].location != NSNotFound) {
+        name = [[name componentsSeparatedByCharactersInSet:separators] componentsJoinedByString:@"_"];
+    }
+    if ([name containsString:@".."]) {
+        name = [name stringByReplacingOccurrencesOfString:@".." withString:@"_"];
+    }
+    if (name.length == 0 || [name isEqualToString:@"."] || [name isEqualToString:@".."]) {
+        return fallback;
+    }
+    return name;
+}
+
 - (NSURL *)getFileLocalURL:(NSString *)fileName
 {
-    NSURL *fileLocalURL = [self.tempDirectoryURL URLByAppendingPathComponent:fileName];
+    NSString *safeName = [self sanitizedStagingFileName:fileName];
+    NSURL *rootURL = self.tempDirectoryURL.URLByStandardizingPath;
+    NSURL *fileLocalURL = [[rootURL URLByAppendingPathComponent:safeName] URLByStandardizingPath];
+
+    // Defense in depth: never allow a resolved path outside upload staging.
+    NSString *rootPath = rootURL.path;
+    NSString *resolvedPath = fileLocalURL.path;
+    BOOL underRoot = [resolvedPath isEqualToString:rootPath]
+        || [resolvedPath hasPrefix:[rootPath stringByAppendingString:@"/"]];
+    if (!underRoot) {
+        [NCLog log:[NSString stringWithFormat:@"ShareItemController: rejected staging path escape for %@", fileName]];
+        safeName = [self sanitizedStagingFileName:@""];
+        fileLocalURL = [rootURL URLByAppendingPathComponent:safeName];
+    }
 
     if ([NSFileManager.defaultManager fileExistsAtPath:fileLocalURL.path]) {
-        NSString *extension = [fileName pathExtension];
-        NSString *nameWithoutExtension = [fileName stringByDeletingPathExtension];
-
+        NSString *extension = [safeName pathExtension];
+        NSString *nameWithoutExtension = [safeName stringByDeletingPathExtension];
         NSString *newFileName = [NSString stringWithFormat:@"%@%.f.%@", nameWithoutExtension, [[NSDate date] timeIntervalSince1970] * 1000, extension];
-        fileLocalURL = [self.tempDirectoryURL URLByAppendingPathComponent:newFileName];
+        newFileName = [self sanitizedStagingFileName:newFileName];
+        fileLocalURL = [rootURL URLByAppendingPathComponent:newFileName];
     }
 
     return fileLocalURL;
@@ -214,6 +261,27 @@
 
         if (![fm copyItemAtURL:newURL toURL:stagingURL error:&ioError]) {
             // Fallback: read bytes (some provider URLs reject copyItem).
+            // Never memory-map large / video files — Share Extension jetsam risk.
+            NSString *ext = newURL.pathExtension.lowercaseString.length
+                ? newURL.pathExtension.lowercaseString
+                : fileLocalURL.pathExtension.lowercaseString;
+            BOOL isVideo = ext.length > 0 && [MediaUploadPreprocessor isVideoFileExtension:ext];
+            NSNumber *fileSizeNum = nil;
+            [newURL getResourceValue:&fileSizeNum forKey:NSURLFileSizeKey error:nil];
+            unsigned long long knownSize = fileSizeNum != nil ? fileSizeNum.unsignedLongLongValue : 0;
+            static const unsigned long long kMappedFallbackMaxBytes = 48ULL * 1024ULL * 1024ULL;
+            if (isVideo || (knownSize > 0 && knownSize > kMappedFallbackMaxBytes)) {
+                [NCLog log:[NSString stringWithFormat:
+                    @"ShareItemController: refusing mapped staging fallback (%@ size=%llu video=%d)",
+                    ext, knownSize, isVideo ? 1 : 0]];
+                wroteBytes = NO;
+                [fm removeItemAtURL:stagingURL error:nil];
+                ioError = [NSError errorWithDomain:@"ShareItemController"
+                                              code:2
+                                          userInfo:@{NSLocalizedDescriptionKey:
+                                                         @"Provider copy failed; refusing large/video memory fallback"}];
+                return;
+            }
             NSData *data = [NSData dataWithContentsOfURL:newURL options:NSDataReadingMappedIfSafe error:&ioError];
             if (data.length == 0 || ![data writeToURL:stagingURL options:NSDataWritingAtomic error:&ioError]) {
                 wroteBytes = NO;
@@ -260,6 +328,21 @@
     return YES;
 }
 
+- (NSString *)contentFingerprintRejectingDuplicateAtURL:(NSURL *)fileLocalURL fileName:(NSString *)fileName
+{
+    NSString *fingerprint = [MediaUploadDiskStore contentFingerprintAtPath:fileLocalURL.path];
+    if (fingerprint.length == 0) {
+        return @"";
+    }
+    if ([self.stagedContentFingerprints containsObject:fingerprint]) {
+        [MediaUploadTrace log:[NSString stringWithFormat:@"CACHE dedup-skip %@ (same content already in bag)", fileName]];
+        [NSFileManager.defaultManager removeItemAtURL:fileLocalURL error:nil];
+        return nil;
+    }
+    [self.stagedContentFingerprints addObject:fingerprint];
+    return fingerprint;
+}
+
 - (void)addShareItemWithLocalURL:(NSURL *)fileLocalURL fileName:(NSString *)fileName isImage:(BOOL)fileIsImage
 {
     if (![self fileURLHasNonZeroContent:fileLocalURL]) {
@@ -269,13 +352,28 @@
         return;
     }
 
+    NSString *fingerprint = [self contentFingerprintRejectingDuplicateAtURL:fileLocalURL fileName:fileName];
+    if (!fingerprint) {
+        return;
+    }
+
     NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:fileLocalURL.path error:nil];
     NSLog(@"Adding shareItem: %@ %@ (%llu bytes)", fileName, fileLocalURL, (unsigned long long)[attrs fileSize]);
     [NCLog log:[NSString stringWithFormat:@"ShareItemController: staged %@ (%@, %llu bytes)",
                 fileName, fileLocalURL.lastPathComponent, (unsigned long long)[attrs fileSize]]];
 
     ShareItem *item = [ShareItem initWithURL:fileLocalURL withName:fileName withPlaceholderImage:[self getPlaceholderImageForFileURL:fileLocalURL] isImage:fileIsImage];
+    item.contentFingerprint = fingerprint.length > 0 ? fingerprint : nil;
+    if (fileIsImage || [NCUtils isImageWithFileExtension:fileLocalURL.pathExtension.lowercaseString]) {
+        UIImage *preview = [MediaUploadPreprocessor previewImageAtURL:fileLocalURL maxDimension:1024];
+        if (preview) {
+            [MediaUploadDiskStore storeThumbFromImage:preview forStagingPath:fileLocalURL.path];
+            item.placeholderImage = preview;
+        }
+    }
     [self.internalShareItems addObject:item];
+    // Refresh cross-process marker so long compose / multi-stage stays protected.
+    [MediaUploadDiskStore touchUploadSession];
     [self.delegate shareItemControllerItemsChanged:self];
 }
 
@@ -324,10 +422,11 @@
     // returns. Previously we dispatched the copy async and returned immediately — on
     // iOS 18 that often staged 0-byte files (placeholder preview, None=–, ~12.3 KB chips).
     // Callers that use loadFileRepresentation MUST invoke this before the handler returns.
+    NSString *safeName = [self sanitizedStagingFileName:fileName];
     __block NSURL *fileLocalURL = nil;
     void (^beginOnMain)(void) = ^{
         [self beginPreparingItem];
-        fileLocalURL = [self getFileLocalURL:fileName];
+        fileLocalURL = [self getFileLocalURL:safeName];
     };
     if ([NSThread isMainThread]) {
         beginOnMain();
@@ -352,7 +451,7 @@
     void (^finishOnMain)(void) = ^{
         if (!preparedSuccessfully) {
             NSLog(@"Failed to prepare file for sharing");
-            [NCLog log:[NSString stringWithFormat:@"ShareItemController: failed to prepare %@ for sharing", fileName]];
+            [NCLog log:[NSString stringWithFormat:@"ShareItemController: failed to prepare %@ for sharing", safeName]];
             // Do not record a user-facing failure here — callers may still fall back (e.g. UIImage).
             [self endPreparingItem];
             return;
@@ -362,16 +461,16 @@
         BOOL fileIsImage = (extension.length > 0 && [NCUtils isImageWithFileExtension:extension]);
 
         if (fileIsImage) {
-            [self finalizeImageItemFromLocalURL:fileLocalURL fileName:fileName];
+            [self finalizeImageItemFromLocalURL:fileLocalURL fileName:safeName];
             return;
         }
 
         if (extension.length > 0 && [MediaUploadPreprocessor isVideoFileExtension:extension]) {
-            [self finalizeVideoItemFromLocalURL:fileLocalURL fileName:fileName];
+            [self finalizeVideoItemFromLocalURL:fileLocalURL fileName:safeName];
             return;
         }
 
-        [self addShareItemWithLocalURL:fileLocalURL fileName:fileName isImage:fileIsImage];
+        [self addShareItemWithLocalURL:fileLocalURL fileName:safeName isImage:fileIsImage];
         [self endPreparingItem];
     };
     if ([NSThread isMainThread]) {
@@ -533,14 +632,16 @@
 
 - (void)addItemWithImageDataAndName:(NSData *)data withName:(NSString *)imageName
 {
-    NSURL *fileLocalURL = [self getFileLocalURL:imageName];
+    NSString *safeName = [self sanitizedStagingFileName:imageName];
+    NSURL *fileLocalURL = [self getFileLocalURL:safeName];
     [data writeToFile:fileLocalURL.path atomically:YES];
 
-    NSLog(@"Adding shareItem with image: %@ %@", imageName, fileLocalURL);
+    NSLog(@"Adding shareItem with image: %@ %@", safeName, fileLocalURL);
 
-    ShareItem* item = [ShareItem initWithURL:fileLocalURL withName:imageName withPlaceholderImage:[self getPlaceholderImageForFileURL:fileLocalURL] isImage:YES];
+    ShareItem* item = [ShareItem initWithURL:fileLocalURL withName:safeName withPlaceholderImage:[self getPlaceholderImageForFileURL:fileLocalURL] isImage:YES];
 
     [self.internalShareItems addObject:item];
+    [MediaUploadDiskStore touchUploadSession];
     [self.delegate shareItemControllerItemsChanged:self];
 }
 
@@ -562,16 +663,18 @@
 
 - (void)addItemWithContactDataAndName:(NSData *)data withName:(NSString *)vCardFileName
 {
-    NSURL *fileLocalURL = [self getFileLocalURL:vCardFileName];
+    NSString *safeName = [self sanitizedStagingFileName:vCardFileName];
+    NSURL *fileLocalURL = [self getFileLocalURL:safeName];
     NSString* vcString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     
     [vcString writeToFile:fileLocalURL.path atomically:YES encoding:NSUTF8StringEncoding error:nil];
         
-    NSLog(@"Adding shareItem with contact: %@ %@", vCardFileName, fileLocalURL);
+    NSLog(@"Adding shareItem with contact: %@ %@", safeName, fileLocalURL);
     
-    ShareItem* item = [ShareItem initWithURL:fileLocalURL withName:vCardFileName withPlaceholderImage:[self getPlaceholderImageForFileURL:fileLocalURL] isImage:YES];
+    ShareItem* item = [ShareItem initWithURL:fileLocalURL withName:safeName withPlaceholderImage:[self getPlaceholderImageForFileURL:fileLocalURL] isImage:YES];
 
     [self.internalShareItems addObject:item];
+    [MediaUploadDiskStore touchUploadSession];
     [self.delegate shareItemControllerItemsChanged:self];
 }
 
@@ -635,6 +738,9 @@
 
 - (void)cleanupItem:(ShareItem *)item
 {
+    if (item.contentFingerprint.length > 0) {
+        [self.stagedContentFingerprints removeObject:item.contentFingerprint];
+    }
     if ([NSFileManager.defaultManager fileExistsAtPath:item.filePath]) {
         [NSFileManager.defaultManager removeItemAtPath:item.filePath error:nil];
     }
@@ -647,10 +753,17 @@
     }
     
     [self.internalShareItems removeAllObjects];
+    [self.stagedContentFingerprints removeAllObjects];
+    // Catch orphans (encode sidecars, thumbs) after a finished send.
+    [MediaUploadDiskStore clearSessionScratchCachesWithReason:@"share-remove-all" wait:NO];
 }
 
 - (UIImage *)getPlaceholderImageForFileURL:(NSURL *)fileURL
 {
+    UIImage *thumb = [MediaUploadDiskStore loadThumbForStagingPath:fileURL.path];
+    if (thumb) {
+        return thumb;
+    }
     NSString *previewImage = [NCUtils previewImageForFileExtension:[fileURL pathExtension]];
     return [UIImage imageNamed:previewImage];
 }
@@ -667,8 +780,10 @@
     if (item.isImage && extension.length > 0 && [NCUtils isImageWithFileExtension:extension] && ![extension isEqualToString:@"gif"]) {
         // Chip may be on because another item benefits — skip this photo if it would not shrink.
         if (![MediaUploadDebugSettings itemCompressionLikelyShrinksAtURL:item.fileURL level:level]) {
-            [NCLog log:[NSString stringWithFormat:@"ShareItemController: skipping image compress for %@ (unlikely to shrink at level %ld)",
-                        item.fileName, (long)level]];
+            unsigned long long origSkip = [[NSFileManager.defaultManager attributesOfItemAtPath:item.filePath error:nil] fileSize];
+            [MediaUploadTrace log:[NSString stringWithFormat:
+                @"ENCODE skip image %@ level=%@ original=%@ reason=unlikely-to-shrink",
+                item.fileName, [MediaUploadTrace levelName:level], [MediaUploadTrace mbUInt:origSkip]]];
             if (progress) {
                 progress(1.0f);
             }
@@ -683,9 +798,42 @@
         NSURL *sourceURL = item.fileURL;
 
         dispatch_async(self.preparationQueue, ^{
-            BOOL success = [MediaUploadPreprocessor compressImageAtURL:sourceURL
-                                                      toDestinationURL:jpegURL
-                                                              settings:settings];
+            BOOL success = NO;
+            NSString *accountId = self.accountId ?: @"";
+            NSURL *cached = [MediaUploadDiskStore cachedConvertURLForSourceURL:sourceURL
+                                                                     accountId:accountId
+                                                                         level:level
+                                                                      settings:settings
+                                                               outputExtension:@"jpg"];
+            if (cached) {
+                NSError *copyError = nil;
+                [NSFileManager.defaultManager removeItemAtURL:jpegURL error:nil];
+                success = [NSFileManager.defaultManager copyItemAtURL:cached toURL:jpegURL error:&copyError];
+                if (success) {
+                    unsigned long long cachedBytes = [[NSFileManager.defaultManager attributesOfItemAtPath:jpegURL.path error:nil] fileSize];
+                    NSString *profile = [MediaUploadDiskStore profileFingerprintForLevel:level settings:settings];
+                    [MediaUploadTrace log:[NSString stringWithFormat:
+                        @"CACHE convert-HIT image %@ level=%@ result=%@ profile=%@",
+                        item.fileName, [MediaUploadTrace levelName:level], [MediaUploadTrace mbUInt:cachedBytes], profile]];
+                } else {
+                    [MediaUploadTrace log:[NSString stringWithFormat:@"CACHE convert-copy-FAIL image %@", copyError.localizedDescription ?: @""]];
+                }
+            }
+            if (!success) {
+                [MediaUploadTrace log:[NSString stringWithFormat:@"ENCODE image start %@ level=%@",
+                                       item.fileName, [MediaUploadTrace levelName:level]]];
+                success = [MediaUploadPreprocessor compressImageAtURL:sourceURL
+                                                     toDestinationURL:jpegURL
+                                                             settings:settings];
+                if (success) {
+                    [MediaUploadDiskStore storeConvertResultFrom:jpegURL
+                                                       sourceURL:sourceURL
+                                                       accountId:accountId
+                                                           level:level
+                                                        settings:settings];
+                }
+            }
+            [MediaUploadMemoryGateObjC waitForHeadroom];
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (success) {
                     NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:jpegURL.path error:nil];
@@ -700,9 +848,15 @@
                         item.fileURL = jpegURL;
                         item.filePath = jpegURL.path;
                         item.fileName = jpegURL.lastPathComponent;
+                        [MediaUploadTrace log:[NSString stringWithFormat:
+                            @"RESULT image %@ level=%@ original=%@ → result=%@ (kept compressed)",
+                            item.fileName, [MediaUploadTrace levelName:level],
+                            [MediaUploadTrace mbUInt:original], [MediaUploadTrace mbUInt:written]]];
                     } else {
-                        [NCLog log:[NSString stringWithFormat:@"ShareItemController: image compress not smaller (%llu → %llu); keeping original %@",
-                                    original, written, item.fileName]];
+                        [MediaUploadTrace log:[NSString stringWithFormat:
+                            @"RESULT image %@ level=%@ original=%@ → result=%@ (kept original, not smaller)",
+                            item.fileName, [MediaUploadTrace levelName:level],
+                            [MediaUploadTrace mbUInt:original], [MediaUploadTrace mbUInt:written]]];
                         [NSFileManager.defaultManager removeItemAtURL:jpegURL error:nil];
                     }
                 }
@@ -722,8 +876,10 @@
         // Heavy-batch ExportSession path already curated the work list; avoid another AVAsset open.
         if (!MediaUploadPreprocessor.preferExportSession
             && ![MediaUploadDebugSettings itemCompressionLikelyShrinksAtURL:item.fileURL level:level]) {
-            [NCLog log:[NSString stringWithFormat:@"ShareItemController: skipping video compress for %@ (unlikely to shrink at level %ld)",
-                        item.fileName, (long)level]];
+            unsigned long long origSkip = [[NSFileManager.defaultManager attributesOfItemAtPath:item.filePath error:nil] fileSize];
+            [MediaUploadTrace log:[NSString stringWithFormat:
+                @"ENCODE skip video %@ level=%@ original=%@ reason=unlikely-to-shrink",
+                item.fileName, [MediaUploadTrace levelName:level], [MediaUploadTrace mbUInt:origSkip]]];
             if (progress) {
                 progress(1.0f);
             }
@@ -740,6 +896,54 @@
 
         // Mirror image path: never create AVAsset / ExportSession on the main thread.
         dispatch_async(self.preparationQueue, ^{
+            NSString *accountId = self.accountId ?: @"";
+            NSURL *cached = [MediaUploadDiskStore cachedConvertURLForSourceURL:sourceURL
+                                                                     accountId:accountId
+                                                                         level:level
+                                                                      settings:settings
+                                                               outputExtension:@"mp4"];
+            if (cached) {
+                NSError *copyError = nil;
+                [NSFileManager.defaultManager removeItemAtURL:mp4URL error:nil];
+                BOOL copied = [NSFileManager.defaultManager copyItemAtURL:cached toURL:mp4URL error:&copyError];
+                if (copied) {
+                    unsigned long long cachedBytes = [[NSFileManager.defaultManager attributesOfItemAtPath:mp4URL.path error:nil] fileSize];
+                    unsigned long long origBytes = [[NSFileManager.defaultManager attributesOfItemAtPath:sourceURL.path error:nil] fileSize];
+                    NSString *profile = [MediaUploadDiskStore profileFingerprintForLevel:level settings:settings];
+                    [MediaUploadTrace log:[NSString stringWithFormat:
+                        @"CACHE convert-HIT video %@ level=%@ original=%@ result=%@ profile=%@",
+                        item.fileName, [MediaUploadTrace levelName:level],
+                        [MediaUploadTrace mbUInt:origBytes], [MediaUploadTrace mbUInt:cachedBytes], profile]];
+                    void (^finishCached)(void) = ^{
+                        NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:mp4URL.path error:nil];
+                        unsigned long long written = [attrs fileSize];
+                        if (written > 0) {
+                            if (![item.filePath isEqualToString:mp4URL.path]) {
+                                [NSFileManager.defaultManager removeItemAtURL:item.fileURL error:nil];
+                            }
+                            item.fileURL = mp4URL;
+                            item.filePath = mp4URL.path;
+                            item.fileName = mp4Name;
+                        }
+                        if (progress) {
+                            progress(1.0f);
+                        }
+                        if (completion) {
+                            completion();
+                        }
+                    };
+                    dispatch_async(dispatch_get_main_queue(), finishCached);
+                    return;
+                }
+                [MediaUploadTrace log:[NSString stringWithFormat:@"CACHE convert-copy-FAIL video %@", copyError.localizedDescription ?: @""]];
+            }
+
+            unsigned long long origBefore = [[NSFileManager.defaultManager attributesOfItemAtPath:sourceURL.path error:nil] fileSize];
+            [MediaUploadTrace log:[NSString stringWithFormat:
+                @"ENCODE video start %@ level=%@ original=%@ edgeCap=%ld",
+                item.fileName, [MediaUploadTrace levelName:level],
+                [MediaUploadTrace mbUInt:origBefore], (long)self.batchVideoMaxEdgeCap]];
+
             [MediaUploadPreprocessor compressVideoAtURL:sourceURL
                                        toDestinationURL:mp4URL
                                                settings:settings
@@ -751,6 +955,13 @@
                     });
                 }
             } completion:^(BOOL success) {
+                if (success) {
+                    [MediaUploadDiskStore storeConvertResultFrom:mp4URL
+                                                       sourceURL:sourceURL
+                                                       accountId:accountId
+                                                           level:level
+                                                        settings:settings];
+                }
                 void (^finishItem)(void) = ^{
                     if (success) {
                         NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:mp4URL.path error:nil];
@@ -762,12 +973,18 @@
                             item.fileURL = mp4URL;
                             item.filePath = mp4URL.path;
                             item.fileName = mp4Name;
+                            [MediaUploadTrace log:[NSString stringWithFormat:
+                                @"RESULT video %@ level=%@ original=%@ → result=%@ (kept compressed)",
+                                item.fileName, [MediaUploadTrace levelName:level],
+                                [MediaUploadTrace mbUInt:origBefore], [MediaUploadTrace mbUInt:written]]];
                         } else {
-                            NSLog(@"MediaUploadPreprocessor: refusing to swap to 0-byte compressed video %@", mp4Name);
-                            [NCLog log:[NSString stringWithFormat:@"ShareItemController: refusing 0-byte compressed video %@", mp4Name]];
+                            [MediaUploadTrace log:[NSString stringWithFormat:@"RESULT video %@ refused 0-byte output", mp4Name]];
                             [NSFileManager.defaultManager removeItemAtURL:mp4URL error:nil];
                         }
                     } else {
+                        [MediaUploadTrace log:[NSString stringWithFormat:
+                            @"RESULT video %@ level=%@ original=%@ → FAILED (kept original)",
+                            item.fileName, [MediaUploadTrace levelName:level], [MediaUploadTrace mbUInt:origBefore]]];
                         [NSFileManager.defaultManager removeItemAtURL:mp4URL error:nil];
                     }
                     if (completion) {
@@ -830,7 +1047,8 @@
     [self.activePreparationToken cancel];
     self.activePreparationToken = [[MediaUploadPreparationToken alloc] init];
 
-    [NCLog log:[NSString stringWithFormat:@"ShareItemController: prepareItemsForUpload — compressing %ld item(s) serially", (long)totalToCompress]];
+    [MediaUploadTrace logSync:[NSString stringWithFormat:@"PREPARE begin compress=%ld/%ld serially settings={%@}",
+                               (long)totalToCompress, (long)items.count, [MediaUploadTrace settingsSnapshot]]];
 
     // Largest first while memory is freshest (after preview release).
     NSMutableArray<NSNumber *> *order = [NSMutableArray arrayWithCapacity:(NSUInteger)totalToCompress];
@@ -855,10 +1073,8 @@
     [itemsToCompress setArray:sortedItems];
     [levelsToCompress setArray:sortedLevels];
 
-    // Multi-video jetsam guard: if Settings chose Bitrate / AVAssetWriter but this Send has
-    // 2+ videos, force AVAssetExportSession + serial teardown. Parallel / multi Writer encodes
-    // hit mediaserverd memory and crashed (instant relaunch mid-prepare). Photos do not count —
-    // a single video with photos still uses Writer when Bitrate is selected.
+    // Telegram-style batch: keep Settings engine (Writer or Presets), encode serially via
+    // MediaUploadVideoEncodeQueue, and cap Writer max-edge so peak RAM stays lower.
     NSInteger videoToCompress = 0;
     unsigned long long videoBytes = 0;
     for (ShareItem *item in itemsToCompress) {
@@ -871,19 +1087,36 @@
     BOOL multiVideo = (videoToCompress >= 2);
     BOOL heavyBatch = (multiVideo && videoBytes >= 40ULL * 1024ULL * 1024ULL);
     BOOL writerChosen = [MediaUploadDebugSettings sharedSettings].usesAssetWriter;
-    if (heavyBatch) {
+    MediaUploadPreprocessor.preferExportSession = NO;
+    if (writerChosen && heavyBatch) {
         self.batchVideoMaxEdgeCap = 640;
-        MediaUploadPreprocessor.preferExportSession = YES;
-        [NCLog log:[NSString stringWithFormat:@"ShareItemController: multi-video → ExportSession (jetsam avoid; SettingsWriter=%d videos=%ld video=%.1f MB edgeCap=640)",
-                    writerChosen ? 1 : 0, (long)videoToCompress, videoBytes / 1048576.0]];
-    } else if (multiVideo) {
+        [MediaUploadTrace logSync:[NSString stringWithFormat:
+            @"JETSAM multi-video Writer serial videos=%ld videoBytes=%@ edgeCap=640 (heavy≥40MB)",
+            (long)videoToCompress, [MediaUploadTrace mbUInt:videoBytes]]];
+    } else if (writerChosen && multiVideo) {
         self.batchVideoMaxEdgeCap = 720;
-        MediaUploadPreprocessor.preferExportSession = YES;
-        [NCLog log:[NSString stringWithFormat:@"ShareItemController: multi-video → ExportSession (jetsam avoid; SettingsWriter=%d videos=%ld edgeCap=720)",
-                    writerChosen ? 1 : 0, (long)videoToCompress]];
+        [MediaUploadTrace logSync:[NSString stringWithFormat:
+            @"JETSAM multi-video Writer serial videos=%ld videoBytes=%@ edgeCap=720",
+            (long)videoToCompress, [MediaUploadTrace mbUInt:videoBytes]]];
     } else {
         self.batchVideoMaxEdgeCap = 0;
-        MediaUploadPreprocessor.preferExportSession = NO;
+        if (multiVideo) {
+            [MediaUploadTrace logSync:[NSString stringWithFormat:
+                @"JETSAM multi-video ExportSession serial videos=%ld (Settings=Presets)",
+                (long)videoToCompress]];
+        } else if (videoToCompress == 1) {
+            [MediaUploadTrace log:[NSString stringWithFormat:
+                @"JETSAM single-video engine=%@ edgeCap=profile",
+                writerChosen ? @"Writer" : @"ExportSession"]];
+        }
+    }
+
+    for (NSInteger i = 0; i < totalToCompress; i++) {
+        ShareItem *it = itemsToCompress[i];
+        MediaUploadCompressionLevel lv = (MediaUploadCompressionLevel)levelsToCompress[i].integerValue;
+        unsigned long long sz = [[NSFileManager.defaultManager attributesOfItemAtPath:it.filePath error:nil] fileSize];
+        [MediaUploadTrace log:[NSString stringWithFormat:@"PREPARE queue[%ld] %@ level=%@ original=%@",
+                               (long)i, it.fileName, [MediaUploadTrace levelName:lv], [MediaUploadTrace mbUInt:sz]]];
     }
 
     if (progress) {
@@ -911,7 +1144,7 @@
         }
     };
 
-    BOOL usedExportBatch = multiVideo;
+    BOOL usedExportBatch = multiVideo && !writerChosen;
     void (^finishAll)(void) = ^{
         void (^done)(void) = ^{
             typeof(self) strongSelf = weakSelf;
@@ -990,12 +1223,9 @@
             }
             dispatch_async(prepQueue, ^{
                 @autoreleasepool {
-                    // Extra mediaserverd drain between serial encodes (in addition to ExportSession teardown).
-                    if (MediaUploadPreprocessor.preferExportSession) {
-                        [NSThread sleepForTimeInterval:0.35];
-                    } else {
-                        [MediaUploadMemoryGateObjC waitForHeadroom];
-                    }
+                    // Telegram-style: always cool mediaserverd between serial encodes.
+                    [MediaUploadMemoryGateObjC waitForHeadroom];
+                    [NSThread sleepForTimeInterval:multiVideo ? 0.35 : 0.12];
                 }
                 [NCLog logSync:[NSString stringWithFormat:@"ShareItemController: after compress %ld/%ld → next",
                                 (long)(index + 1), (long)totalToCompress]];

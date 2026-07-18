@@ -1,5 +1,6 @@
 //
 // SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
@@ -7,15 +8,26 @@
 
     private static let backgroundLogQueue = DispatchQueue(label: "\(bundleIdentifier).backgroundLogQueue", qos: .background)
 
+    /// `CFBundleVersion` (build) — cached so every line can tag the binary that wrote it.
+    private static let buildNumber: String = {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String)
+            .flatMap { $0.isEmpty ? nil : $0 } ?? "?"
+    }()
+
     private static let logLineDateFormatter: DateFormatter = {
         let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "y-MM-dd H:mm:ss.SSSS"
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        // Trailing Z marks UTC for server-log reconciliation.
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS'Z'"
 
         return dateFormatter
     }()
 
     private static let fileNameDateFormatter: DateFormatter = {
         let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
         dateFormatter.dateFormat = "yyyy-MM-dd"
 
         return dateFormatter
@@ -72,7 +84,7 @@
             let now = Date()
 
             var logMessage = "\(logLineDateFormatter.string(from: now)) "
-            logMessage += "(\(queueName)): \(message)\n"
+            logMessage += "[b\(buildNumber)] (\(queueName)): \(message)\n"
 
             let dateString = fileNameDateFormatter.string(from: now)
             let logFileName = "debug-\(dateString).log"

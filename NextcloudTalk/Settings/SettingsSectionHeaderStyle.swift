@@ -1,5 +1,5 @@
 //
-// SPDX-FileCopyrightText: 2026 Sumba Chat contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 

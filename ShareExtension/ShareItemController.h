@@ -1,5 +1,6 @@
 /**
  * SPDX-FileCopyrightText: 2020 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -28,6 +29,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, weak) id<ShareItemControllerDelegate> delegate;
 @property (strong, nonatomic) NSArray<ShareItem *> *shareItems;
+/// Active Talk account id — scopes convert-cache reuse (required before Send prepare).
+@property (nonatomic, copy, nullable) NSString *accountId;
 @property (nonatomic, readonly) NSInteger preparingItemCount;
 /// Count of in-flight NSItemProvider / PHPicker loads (iCloud download, etc.).
 @property (nonatomic, readonly) NSInteger pendingProviderLoadCount;

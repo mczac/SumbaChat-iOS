@@ -1,5 +1,6 @@
 //
 // SPDX-FileCopyrightText: 2020 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
@@ -25,7 +26,6 @@ public class NCChatFileController: NSObject {
     public private(set) var tempDirectoryPath = ""
 
     private let account: TalkAccount
-    private let deleteFilesOlderThanDays = 7
     private var fileStatus: NCChatFileStatus?
 
     init(account: TalkAccount) {
@@ -42,37 +42,16 @@ public class NCChatFileController: NSObject {
     }
 
     private func initDownloadDirectory() {
-        let encodedAccountId = self.account.accountId.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? ""
-        let fileManager = FileManager.default
-
-        tempDirectoryPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("download")
-        tempDirectoryPath = (tempDirectoryPath as NSString).appendingPathComponent(encodedAccountId)
-
+        MediaUploadDiskStore.shared.ensureDirectories()
+        tempDirectoryPath = MediaUploadDiskStore.shared.downloadDirectoryPath(forAccountId: account.accountId)
         print("Directory for downloads: \(tempDirectoryPath)")
-
-        if !fileManager.fileExists(atPath: tempDirectoryPath) {
-            // Make sure our download directory exists
-            try? fileManager.createDirectory(atPath: tempDirectoryPath, withIntermediateDirectories: true)
-        }
     }
 
-    public func removeOldFilesFromCache() {
-        let fileManager = FileManager.default
-
-        guard let enumerator = fileManager.enumerator(atPath: tempDirectoryPath),
-              let thresholdDate = Calendar.current.date(byAdding: .day, value: -deleteFilesOlderThanDays, to: Date())
-        else { return }
-
-        for case let file as String in enumerator {
-            let filePath = (tempDirectoryPath as NSString).appendingPathComponent(file)
-            let creationDate = (try? fileManager.attributesOfItem(atPath: filePath))?[.creationDate] as? Date
-
-            if let creationDate, creationDate.compare(thresholdDate) == .orderedAscending {
-                print("Deleting file from cache: \(filePath)")
-
-                try? fileManager.removeItem(atPath: filePath)
-            }
-        }
+    /// When total download-cache size exceeds 95% of the Settings limit, delete
+    /// least-recently-accessed regular files (across all accounts) until usage ≤ 80%.
+    /// - Parameter excludingPath: Optional path to keep (e.g. a file just downloaded).
+    public static func enforceCacheSizeLimit(excludingPath: String? = nil) {
+        MediaUploadDiskStore.enforceDownloadCacheBudget(excludingPath: excludingPath)
     }
 
     public func deleteDownloadDirectory() {
@@ -116,6 +95,8 @@ public class NCChatFileController: NSObject {
         }
 
         // At this point there's a file in our cache but there's a different one on the server
+        let name = (filePath as NSString).lastPathComponent
+        MediaUploadTrace.log("CACHE download-STALE \(name) local=\(MediaUploadTrace.mb(fileSize)) remote=\(MediaUploadTrace.mb(size)) → \(filePath)")
         print("Deleting file from cache: \(filePath)")
         try? fileManager.removeItem(atPath: filePath)
 
@@ -182,7 +163,10 @@ public class NCChatFileController: NSObject {
 
             // File exists on server -> check our cache
             if self.isFileInCache(fileLocalPath, withModificationDate: file.date as Date, withSize: file.size) {
+                MediaUploadTrace.log("CACHE download-HIT \(file.fileName) \(MediaUploadTrace.mb(file.size)) fileId=\(fileId) → \(fileLocalPath)")
                 print("Found file in cache: \(fileLocalPath)")
+                // LRU: bump access only — do not touch modificationDate (STALE key).
+                MediaUploadDiskStore.touchCacheAccess(atPath: fileLocalPath)
 
                 self.delegate?.fileControllerDidLoadFile(self, with: fileStatus)
                 self.didChangeIsDownloadingNotification(isDownloading: false)
@@ -190,18 +174,30 @@ public class NCChatFileController: NSObject {
                 return
             }
 
+            MediaUploadTrace.log("CACHE download-MISS \(file.fileName) \(MediaUploadTrace.mb(file.size)) fileId=\(fileId) → \(fileLocalPath)")
+
             NextcloudKit.shared.download(serverUrlFileName: serverUrlFileName, fileNameLocalPath: fileLocalPath, queue: .main) { _ in
                 print("Download task")
             } progressHandler: { progress in
                 self.didChangeDownloadProgressNotification(progress: progress)
             } completionHandler: { _, _, _, _, _, error in
                 if error.errorCode == 0 {
-                    // Set modification date to invalidate our cache
-                    // Set creation date to delete older files from cache
+                    // modificationDate = remote (STALE). creationDate + access = LRU seed.
                     self.setDate(onFile: fileLocalPath, withCreationDate: Date(), withModificationDate: file.date as Date)
+                    try? FileManager.default.setAttributes(
+                        [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                        ofItemAtPath: fileLocalPath
+                    )
+                    MediaUploadDiskStore.touchCacheAccess(atPath: fileLocalPath)
 
+                    MediaUploadTrace.log("CACHE download-OK \(fileStatus.fileName) \(MediaUploadTrace.mb(file.size)) → \(fileLocalPath)")
                     self.delegate?.fileControllerDidLoadFile(self, with: fileStatus)
+
+                    DispatchQueue.global(qos: .utility).async {
+                        NCChatFileController.enforceCacheSizeLimit(excludingPath: fileLocalPath)
+                    }
                 } else {
+                    MediaUploadTrace.log("CACHE download-FAIL \(fileStatus.fileName) code=\(error.errorCode) \(error.errorDescription)")
                     print("Error downloading file: \(error.errorCode) - \(error.errorDescription)")
                     self.delegate?.fileControllerDidFailLoadingFile(self, withFileId: fileStatus.fileId, withErrorDescription: error.errorDescription)
                 }

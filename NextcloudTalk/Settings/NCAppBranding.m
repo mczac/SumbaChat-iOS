@@ -1,5 +1,6 @@
 /**
  * SPDX-FileCopyrightText: 2020 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -12,6 +13,16 @@
 
 #import "NextcloudTalk-Swift.h"
 
+// Local hosts live in gitignored NCAppBrandingLocal.h (copy from *.example.h).
+#if __has_include("NCAppBrandingLocal.h")
+#import "NCAppBrandingLocal.h"
+#else
+#define NC_BRANDING_DOMAIN @"https://cloud.example.com"
+#define NC_BRANDING_PRIVACY_URL @"https://cloud.example.com/privacy"
+#define NC_BRANDING_PUSH_SERVER @"https://push.example.com"
+#define NC_BRANDING_PUSH_SERVER_DEBUG @"https://push-dev.example.com"
+#endif
+
 typedef enum NCTextColorStyle {
     NCTextColorStyleLight = 0,
     NCTextColorStyleDark
@@ -23,22 +34,22 @@ typedef enum NCTextColorStyle {
 
 NSString * const talkAppName = @"SumbaChat";
 NSString * const filesAppName = @"SumbaFiles";
-NSString * const copyright = @"© 2026 Sumba Chat";
+NSString * const copyright = @"© 2026 Ivan Cursorov and Peter Zakharov";
 NSString * const licenseNotice = @"Based on Nextcloud Talk, licensed under GPLv3";
 NSString * const bundleIdentifier = @"com.spl.SumbaChat";
 NSString * const groupIdentifier = @"group.com.spl.SumbaChat";
 NSString * const appsGroupIdentifier = @"group.com.spl.apps";
 #if DEBUG
-NSString * const pushNotificationServer = @"https://push-dev.example.com";
+NSString * const pushNotificationServer = NC_BRANDING_PUSH_SERVER_DEBUG;
 #else
-NSString * const pushNotificationServer = @"https://push.example.com";
+NSString * const pushNotificationServer = NC_BRANDING_PUSH_SERVER;
 #endif
-NSString * const privacyURL = @"https://cloud.example.com/privacy";
+NSString * const privacyURL = NC_BRANDING_PRIVACY_URL;
 BOOL const isBrandedApp = YES;
 BOOL const multiAccountEnabled = YES;
 BOOL const useAppsGroup = NO;
 BOOL const forceDomain = YES;
-NSString * const domain = @"https://cloud.example.com";
+NSString * const domain = NC_BRANDING_DOMAIN;
 NSString * const appAlternateVersion = @"";
 
 + (NSString *)getAppVersionString

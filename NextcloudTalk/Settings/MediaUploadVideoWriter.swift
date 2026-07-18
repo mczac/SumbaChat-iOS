@@ -1,5 +1,6 @@
 //
 // SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
@@ -21,8 +22,8 @@ enum MediaUploadMemoryGate {
                                 timeout: TimeInterval = 2.5) {
         let available = availableBytes()
         if available == 0 {
-            NCLog.logSync(String(format: "MediaUploadMemoryGate: skip wait (available unknown), min=%.0f MB",
-                                 Double(minAvailableBytes) / 1_048_576.0))
+            MediaUploadTrace.logSync(String(format: "JETSAM MemoryGate skip wait (available unknown), min=%.0fMB",
+                                            Double(minAvailableBytes) / 1_048_576.0))
             return
         }
         if available >= minAvailableBytes {
@@ -36,19 +37,21 @@ enum MediaUploadMemoryGate {
             autoreleasepool { }
         }
         if spins > 0 {
-            NCLog.logSync(String(format: "MediaUploadMemoryGate: waited %d spin(s), available=%.1f MB",
-                                 spins, Double(availableBytes()) / 1_048_576.0))
+            MediaUploadTrace.logSync(String(format: "JETSAM MemoryGate waited %d spin(s) avail=%.1fMB (min=%.0fMB)",
+                                            spins,
+                                            Double(availableBytes()) / 1_048_576.0,
+                                            Double(minAvailableBytes) / 1_048_576.0))
         }
     }
 
     /// Fixed mediaserverd cooldown after a heavy ExportSession batch (no memory API dependency).
     static func drainAfterExportBatch(seconds: TimeInterval = 1.0) {
-        NCLog.logSync(String(format: "MediaUploadMemoryGate: post-batch drain %.2fs avail=%.0f MB",
-                             seconds, Double(availableBytes()) / 1_048_576.0))
+        MediaUploadTrace.logSync(String(format: "JETSAM MemoryGate post-batch drain %.2fs avail=%.0fMB",
+                                        seconds, Double(availableBytes()) / 1_048_576.0))
         Thread.sleep(forTimeInterval: seconds)
         autoreleasepool { }
-        NCLog.logSync(String(format: "MediaUploadMemoryGate: post-batch drain done avail=%.0f MB",
-                             Double(availableBytes()) / 1_048_576.0))
+        MediaUploadTrace.logSync(String(format: "JETSAM MemoryGate post-batch drain done avail=%.0fMB",
+                                        Double(availableBytes()) / 1_048_576.0))
     }
 }
 
@@ -110,19 +113,30 @@ enum MediaUploadVideoWriter {
             return
         }
 
-        let rateMBps = MediaUploadDebugSettings.effectiveRateMBps(profile: profile, durationSeconds: durationSeconds)
-        let totalBitsPerSecond = rateMBps * 1_048_576.0 * 8.0
+        let rateMbps = MediaUploadDebugSettings.effectiveRateMbps(profile: profile, durationSeconds: durationSeconds)
+        let totalBitsPerSecond = rateMbps * 1_000_000.0
         let audioBitsPerSecond = 128_000.0
         let videoBitsPerSecond = max(100_000, Int(totalBitsPerSecond - audioBitsPerSecond))
         let fps = max(1, Int(profile.videoFPS.rounded()))
+        MediaUploadTrace.logSync(String(format:
+            "WRITER start %@ duration=%.1fs out=%dx%d edge=%d rate=%.2fMbps videoBitrate=%d fps=%d avail=%.0fMB",
+            sourceURL.lastPathComponent,
+            durationSeconds,
+            width, height,
+            profile.videoMaxEdge,
+            rateMbps,
+            videoBitsPerSecond,
+            fps,
+            MediaUploadMemoryGateObjC.availableMegabytes()))
 
         do {
             try? FileManager.default.removeItem(at: destinationURL)
             let reader = try AVAssetReader(asset: asset)
             let writer = try AVAssetWriter(outputURL: destinationURL, fileType: .mp4)
+            writer.shouldOptimizeForNetworkUse = true
 
             // Prefer decoder output at encode size — avoids full-res frame peaks even when scale ≈ 1.
-            var readerVideoSettings: [String: Any] = [
+            let readerVideoSettings: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height
@@ -135,9 +149,11 @@ enum MediaUploadVideoWriter {
             }
             reader.add(videoReaderOutput)
 
+            // Telegram TGMediaVideoConverter: H.264 High + CABAC + target bitrate/fps.
             let compression: [String: Any] = [
                 AVVideoAverageBitRateKey: videoBitsPerSecond,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264MainAutoLevel,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCABAC,
                 AVVideoExpectedSourceFrameRateKey: fps
             ]
             let writerVideoSettings: [String: Any] = [
@@ -282,6 +298,7 @@ enum MediaUploadVideoWriter {
                                 return
                             }
                             guard writerStatus == .completed else {
+                                MediaUploadTrace.log("ENCODE video FAIL \(sourceURL.lastPathComponent) engine=Writer \(writerError ?? "unknown")")
                                 NCLog.log("MediaUploadVideoWriter: finish failed \(writerError ?? "unknown")")
                                 try? FileManager.default.removeItem(at: destinationURL)
                                 completion(false)
@@ -289,6 +306,7 @@ enum MediaUploadVideoWriter {
                             }
                             guard compressedSize > 0, sourceSize == 0 || compressedSize < sourceSize else {
                                 try? FileManager.default.removeItem(at: destinationURL)
+                                MediaUploadTrace.log("ENCODE video keep-original \(sourceURL.lastPathComponent) engine=Writer (not smaller)")
                                 NCLog.log("MediaUploadVideoWriter: output not smaller; using original")
                                 completion(false)
                                 return
@@ -297,11 +315,11 @@ enum MediaUploadVideoWriter {
                                 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: sourceSize, durationSeconds: duration) : 0
                             let outMbps = duration > 0
                                 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: compressedSize, durationSeconds: duration) : 0
-                            NCLog.log(String(format:
-                                "MediaUploadVideoWriter: ACTUAL %@ %lld (%.2f MB, %.3fMbps) → %lld (%.2f MB, %.3fMbps) %dx%d targetVideoBitrate=%d bps",
+                            MediaUploadTrace.log(String(format:
+                                "ENCODE video ACTUAL %@ %@ (%.3fMbps) → %@ (%.3fMbps) engine=Writer %dx%d videoBitrate=%d",
                                 sourceURL.lastPathComponent,
-                                sourceSize, Double(sourceSize) / 1_048_576.0, srcMbps,
-                                compressedSize, Double(compressedSize) / 1_048_576.0, outMbps,
+                                MediaUploadTrace.mb(sourceSize), srcMbps,
+                                MediaUploadTrace.mb(compressedSize), outMbps,
                                 width, height, videoBitsPerSecond))
                             completion(true)
                         }
@@ -309,6 +327,7 @@ enum MediaUploadVideoWriter {
                 }
             }
         } catch {
+            MediaUploadTrace.log("ENCODE video FAIL \(sourceURL.lastPathComponent) engine=Writer \(error.localizedDescription)")
             NCLog.log("MediaUploadVideoWriter: \(error.localizedDescription)")
             completion(false)
         }

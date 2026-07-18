@@ -1,5 +1,6 @@
 //
 // SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
@@ -118,6 +119,19 @@ final class UnitShareItemStagingTest: XCTestCase {
         XCTAssertEqual(controller.shareItems.first?.fileName, name)
     }
 
+    /// Hostile / crafted provider names must not escape App Group upload/.
+    func testPathTraversalNameStaysUnderUpload() throws {
+        let source = try writeJPEG(named: "real.jpg")
+        XCTAssertTrue(controller.addItem(withURLAndName: source, withName: "../../Library/evil.jpg"))
+        waitUntilPreparingDone()
+        let staged = try XCTUnwrap(controller.shareItems.first)
+        XCTAssertEqual(staged.fileName, "evil.jpg")
+        XCTAssertFalse(staged.filePath.contains(".."))
+        let uploadRoot = (MediaUploadDiskStore.shared.uploadDirectoryPath as NSString).standardizingPath
+        let stagedPath = (staged.filePath as NSString).standardizingPath
+        XCTAssertTrue(stagedPath.hasPrefix(uploadRoot + "/") || stagedPath == uploadRoot)
+    }
+
     /// Provider revoked / empty placeholder → must NOT become a fake share item (None=–, ~12.3 KB chips).
     func testEmptyFileRefusedAndReportedWhenCallerReports() throws {
         let source = try writeEmptyFile(named: "IMG_7542.jpeg")
@@ -177,22 +191,92 @@ final class UnitShareItemStagingTest: XCTestCase {
         XCTAssertEqual(totals.high, imageCounts.high + 5)
     }
 
-    func testAutomaticPackageCapEscalates() throws {
+    func testAutomaticPicksHighQualityWhenUnderFileCap() throws {
         let debug = MediaUploadDebugSettings.default
-        debug.perFileMaxBytes = 100 * 1024 * 1024
-        debug.packageMaxBytes = 1
-        debug.low.imageJPEGQuality = 90
-        debug.medium.imageJPEGQuality = 50
-        debug.high.imageJPEGQuality = 10
+        debug.perFileMaxBytes = 16 * 1024 * 1024
+        debug.packageMaxBytes = 16 * 1024 * 1024
+        debug.automaticPhotoEstimateMarginPercent = 20
+        debug.automaticVideoEstimateMarginPercent = 10
         debug.save()
         defer { MediaUploadDebugSettings.resetToDefaults() }
 
-        let a = try writeJPEG(named: "auto-a.jpg", size: CGSize(width: 320, height: 320))
-        let b = try writeJPEG(named: "auto-b.jpg", size: CGSize(width: 320, height: 320))
-        let levels = MediaUploadAutomaticPolicy.compressionLevels(forFileURLs: [a, b])
-        XCTAssertEqual(levels.count, 2)
-        // Tiny package cap forces escalation to High for both media items.
-        XCTAssertEqual(levels, [.high, .high])
+        let small = try writeJPEG(named: "auto-small.jpg", size: CGSize(width: 64, height: 64))
+        let levels = MediaUploadAutomaticPolicy.compressionLevels(forFileURLs: [small])
+        XCTAssertEqual(levels, [.low], "Tiny JPEG should fit High quality (Low compression)")
+    }
+
+    func testAutomaticEscalatesWhenHighQualityOverFileCap() throws {
+        let debug = MediaUploadDebugSettings.default
+        // Cap below any useful Low estimate for a large image → force Medium or High.
+        debug.perFileMaxBytes = 2 * 1024
+        debug.packageMaxBytes = 2 * 1024
+        debug.automaticPhotoEstimateMarginPercent = 20
+        debug.automaticVideoEstimateMarginPercent = 10
+        debug.low.imageJPEGQuality = 95
+        debug.low.imageMaxDimension = 4000
+        debug.medium.imageJPEGQuality = 40
+        debug.medium.imageMaxDimension = 800
+        debug.high.imageJPEGQuality = 10
+        debug.high.imageMaxDimension = 640
+        debug.save()
+        defer { MediaUploadDebugSettings.resetToDefaults() }
+
+        let large = try writeJPEG(named: "auto-large.jpg", size: CGSize(width: 2000, height: 1500))
+        let levels = MediaUploadAutomaticPolicy.compressionLevels(forFileURLs: [large])
+        XCTAssertEqual(levels.count, 1)
+        XCTAssertNotEqual(levels[0], .low, "Over-cap High quality must escalate")
+        XCTAssertTrue(levels[0] == .medium || levels[0] == .high)
+    }
+
+    func testAutomaticEstimateMarginCeiling() {
+        let cap: Int64 = 16 * 1024 * 1024
+        // 20% photo margin → ceiling = cap / 1.2
+        let photoCeiling = MediaUploadAutomaticPolicy.estimateAcceptanceCeilingBytes(fileCap: cap, marginPercent: 20)
+        XCTAssertEqual(photoCeiling, Int64(Double(cap) / 1.2))
+        XCTAssertTrue(MediaUploadAutomaticPolicy.estimateFitsUnderCap(12 * 1024 * 1024, fileCap: cap, marginPercent: 20))
+        XCTAssertFalse(MediaUploadAutomaticPolicy.estimateFitsUnderCap(13 * 1024 * 1024, fileCap: cap, marginPercent: 20))
+
+        // 10% video margin → ceiling = cap / 1.1
+        let videoCeiling = MediaUploadAutomaticPolicy.estimateAcceptanceCeilingBytes(fileCap: cap, marginPercent: 10)
+        XCTAssertEqual(videoCeiling, Int64(Double(cap) / 1.1))
+        XCTAssertTrue(MediaUploadAutomaticPolicy.estimateFitsUnderCap(14 * 1024 * 1024, fileCap: cap, marginPercent: 10))
+        XCTAssertFalse(MediaUploadAutomaticPolicy.estimateFitsUnderCap(15 * 1024 * 1024, fileCap: cap, marginPercent: 10))
+
+        // 0% margin → compare directly to cap
+        XCTAssertTrue(MediaUploadAutomaticPolicy.estimateFitsUnderCap(cap - 1, fileCap: cap, marginPercent: 0))
+        XCTAssertFalse(MediaUploadAutomaticPolicy.estimateFitsUnderCap(cap, fileCap: cap, marginPercent: 0))
+    }
+
+    func testAutomaticDefaultMargins() {
+        let defaults = MediaUploadDebugSettings.default
+        XCTAssertEqual(defaults.automaticPhotoEstimateMarginPercent, 20, accuracy: 0.001)
+        XCTAssertEqual(defaults.automaticVideoEstimateMarginPercent, 10, accuracy: 0.001)
+    }
+
+    func testContentFingerprintStableForSameBytes() throws {
+        let a = try writeJPEG(named: "fp-a.jpg", size: CGSize(width: 32, height: 32))
+        let b = scratchDir.appendingPathComponent("fp-b.jpg")
+        try FileManager.default.copyItem(at: a, to: b)
+        let fa = MediaUploadDiskStore.contentFingerprint(at: a)
+        let fb = MediaUploadDiskStore.contentFingerprint(at: b)
+        XCTAssertNotNil(fa)
+        XCTAssertEqual(fa, fb)
+        XCTAssertTrue(fa?.hasPrefix("v2_") == true)
+    }
+
+    /// Same size/head/tail but different middle must not collide (v2 mid samples).
+    func testContentFingerprintDivergesOnMiddleBytes() throws {
+        let size = 2 * 1024 * 1024
+        var bytesA = Data(repeating: 0x11, count: size)
+        var bytesB = Data(repeating: 0x11, count: size)
+        bytesB[size / 2] = 0x22
+        let a = scratchDir.appendingPathComponent("mid-a.bin")
+        let b = scratchDir.appendingPathComponent("mid-b.bin")
+        try bytesA.write(to: a)
+        try bytesB.write(to: b)
+        let fa = try XCTUnwrap(MediaUploadDiskStore.contentFingerprint(at: a))
+        let fb = try XCTUnwrap(MediaUploadDiskStore.contentFingerprint(at: b))
+        XCTAssertNotEqual(fa, fb)
     }
 
     // MARK: - Cancel prepare (Send-path)
@@ -226,10 +310,10 @@ final class UnitShareItemStagingTest: XCTestCase {
 
     func testEffectiveRateRespectsMaxBytesCap() {
         let profile = MediaUploadProfileConfig.defaultHigh
-        // 200s at 0.12 MB/s would be 24 MB; cap is 12 MB → rate ≤ 0.06 MB/s
-        let rate = MediaUploadDebugSettings.effectiveRateMBps(profile: profile, durationSeconds: 200)
-        XCTAssertLessThanOrEqual(rate, 0.12)
-        XCTAssertEqual(rate, 12.0 / 200.0, accuracy: 0.001)
+        // 200s at 0.96 Mbps would be 24 MB; cap is 12 MB → rate ≤ 0.48 Mbps
+        let rate = MediaUploadDebugSettings.effectiveRateMbps(profile: profile, durationSeconds: 200)
+        XCTAssertLessThanOrEqual(rate, 0.96)
+        XCTAssertEqual(rate, 12.0 * 8.0 / 200.0, accuracy: 0.001)
     }
 
     func testPresetGuestimateLabels() {

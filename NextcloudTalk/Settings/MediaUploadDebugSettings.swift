@@ -1,5 +1,6 @@
 //
 // SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
@@ -19,33 +20,82 @@ import UniformTypeIdentifiers
 @objcMembers public final class MediaUploadProfileConfig: NSObject, Codable {
     public var imageMaxDimension: Int
     public var imageJPEGQuality: Int
-    public var videoRateMBps: Double
+    /// Target total media bitrate for Writer, in **megabits per second** (Mbps).
+    public var videoRateMbps: Double
     public var videoMaxBytes: Int64
     public var videoMaxEdge: Int
     public var videoFPS: Double
     /// ExportSession preset key: low, medium, high, 480p, 540p, 720p, 1080p, 2160p.
     public var exportPreset: String
 
+    private enum CodingKeys: String, CodingKey {
+        case imageMaxDimension
+        case imageJPEGQuality
+        case videoRateMbps
+        /// Legacy megabytes/second — migrated × 8 → Mbps on decode.
+        case videoRateMBps
+        case videoMaxBytes
+        case videoMaxEdge
+        case videoFPS
+        case exportPreset
+    }
+
     public init(imageMaxDimension: Int,
                 imageJPEGQuality: Int,
-                videoRateMBps: Double,
+                videoRateMbps: Double,
                 videoMaxBytes: Int64,
                 videoMaxEdge: Int,
                 videoFPS: Double,
                 exportPreset: String) {
         self.imageMaxDimension = imageMaxDimension
         self.imageJPEGQuality = imageJPEGQuality
-        self.videoRateMBps = videoRateMBps
+        self.videoRateMbps = videoRateMbps
         self.videoMaxBytes = videoMaxBytes
         self.videoMaxEdge = videoMaxEdge
         self.videoFPS = videoFPS
         self.exportPreset = exportPreset
     }
 
+    public required convenience init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let imageMaxDimension = try c.decode(Int.self, forKey: .imageMaxDimension)
+        let imageJPEGQuality = try c.decode(Int.self, forKey: .imageJPEGQuality)
+        let videoRateMbps: Double
+        if let modern = try c.decodeIfPresent(Double.self, forKey: .videoRateMbps) {
+            videoRateMbps = modern
+        } else if let legacyMBps = try c.decodeIfPresent(Double.self, forKey: .videoRateMBps) {
+            videoRateMbps = legacyMBps * 8.0
+        } else {
+            videoRateMbps = 3.2
+        }
+        let videoMaxBytes = try c.decode(Int64.self, forKey: .videoMaxBytes)
+        let videoMaxEdge = try c.decode(Int.self, forKey: .videoMaxEdge)
+        let videoFPS = try c.decode(Double.self, forKey: .videoFPS)
+        let exportPreset = try c.decode(String.self, forKey: .exportPreset)
+        self.init(imageMaxDimension: imageMaxDimension,
+                  imageJPEGQuality: imageJPEGQuality,
+                  videoRateMbps: videoRateMbps,
+                  videoMaxBytes: videoMaxBytes,
+                  videoMaxEdge: videoMaxEdge,
+                  videoFPS: videoFPS,
+                  exportPreset: exportPreset)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(imageMaxDimension, forKey: .imageMaxDimension)
+        try c.encode(imageJPEGQuality, forKey: .imageJPEGQuality)
+        try c.encode(videoRateMbps, forKey: .videoRateMbps)
+        try c.encode(videoMaxBytes, forKey: .videoMaxBytes)
+        try c.encode(videoMaxEdge, forKey: .videoMaxEdge)
+        try c.encode(videoFPS, forKey: .videoFPS)
+        try c.encode(exportPreset, forKey: .exportPreset)
+    }
+
     public static var defaultLow: MediaUploadProfileConfig {
         MediaUploadProfileConfig(imageMaxDimension: 1920,
                                  imageJPEGQuality: 80,
-                                 videoRateMBps: 1.0,
+                                 videoRateMbps: 8.0,
                                  videoMaxBytes: 100 * 1024 * 1024,
                                  videoMaxEdge: 1920,
                                  videoFPS: 30,
@@ -55,7 +105,7 @@ import UniformTypeIdentifiers
     public static var defaultMedium: MediaUploadProfileConfig {
         MediaUploadProfileConfig(imageMaxDimension: 1600,
                                  imageJPEGQuality: 50,
-                                 videoRateMBps: 0.4,
+                                 videoRateMbps: 3.2,
                                  videoMaxBytes: 40 * 1024 * 1024,
                                  videoMaxEdge: 1280,
                                  videoFPS: 30,
@@ -65,7 +115,7 @@ import UniformTypeIdentifiers
     public static var defaultHigh: MediaUploadProfileConfig {
         MediaUploadProfileConfig(imageMaxDimension: 1280,
                                  imageJPEGQuality: 15,
-                                 videoRateMBps: 0.12,
+                                 videoRateMbps: 0.96,
                                  videoMaxBytes: 12 * 1024 * 1024,
                                  videoMaxEdge: 640,
                                  videoFPS: 24,
@@ -77,7 +127,7 @@ import UniformTypeIdentifiers
         let edge = max(320, min(videoMaxEdge, cap))
         return MediaUploadProfileConfig(imageMaxDimension: imageMaxDimension,
                                         imageJPEGQuality: imageJPEGQuality,
-                                        videoRateMBps: videoRateMBps,
+                                        videoRateMbps: videoRateMbps,
                                         videoMaxBytes: videoMaxBytes,
                                         videoMaxEdge: edge,
                                         videoFPS: videoFPS,
@@ -93,12 +143,32 @@ import UniformTypeIdentifiers
     /// Bytes last loaded/saved — used so Share Extension picks up main-app UI changes.
     private static var cachedData: Data?
 
+    /// Default Automatic estimate safety margin for photos (percent). `estimate × (1 + margin/100) < cap`.
+    public static let defaultAutomaticPhotoEstimateMarginPercent: Double = 20
+    /// Default Automatic estimate safety margin for videos (percent).
+    public static let defaultAutomaticVideoEstimateMarginPercent: Double = 10
+
     public var videoEngineRaw: Int
     public var perFileMaxBytes: Int64
     public var packageMaxBytes: Int64
+    /// Automatic: allow this % underestimate on photo size estimates before accepting a level vs max file size.
+    public var automaticPhotoEstimateMarginPercent: Double
+    /// Automatic: allow this % underestimate on video size estimates before accepting a level vs max file size.
+    public var automaticVideoEstimateMarginPercent: Double
     public var low: MediaUploadProfileConfig
     public var medium: MediaUploadProfileConfig
     public var high: MediaUploadProfileConfig
+
+    private enum CodingKeys: String, CodingKey {
+        case videoEngineRaw
+        case perFileMaxBytes
+        case packageMaxBytes
+        case automaticPhotoEstimateMarginPercent
+        case automaticVideoEstimateMarginPercent
+        case low
+        case medium
+        case high
+    }
 
     public var videoEngine: MediaUploadVideoEngine {
         get { MediaUploadVideoEngine(rawValue: videoEngineRaw) ?? .assetWriter }
@@ -112,15 +182,59 @@ import UniformTypeIdentifiers
     public init(videoEngineRaw: Int = MediaUploadVideoEngine.assetWriter.rawValue,
                 perFileMaxBytes: Int64 = 16 * 1024 * 1024,
                 packageMaxBytes: Int64 = 16 * 1024 * 1024,
+                automaticPhotoEstimateMarginPercent: Double = MediaUploadDebugSettings.defaultAutomaticPhotoEstimateMarginPercent,
+                automaticVideoEstimateMarginPercent: Double = MediaUploadDebugSettings.defaultAutomaticVideoEstimateMarginPercent,
                 low: MediaUploadProfileConfig = .defaultLow,
                 medium: MediaUploadProfileConfig = .defaultMedium,
                 high: MediaUploadProfileConfig = .defaultHigh) {
         self.videoEngineRaw = videoEngineRaw
         self.perFileMaxBytes = perFileMaxBytes
         self.packageMaxBytes = packageMaxBytes
+        self.automaticPhotoEstimateMarginPercent = Self.clampedMarginPercent(automaticPhotoEstimateMarginPercent)
+        self.automaticVideoEstimateMarginPercent = Self.clampedMarginPercent(automaticVideoEstimateMarginPercent)
         self.low = low
         self.medium = medium
         self.high = high
+    }
+
+    public required convenience init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let videoEngineRaw = try c.decodeIfPresent(Int.self, forKey: .videoEngineRaw)
+            ?? MediaUploadVideoEngine.assetWriter.rawValue
+        let perFileMaxBytes = try c.decodeIfPresent(Int64.self, forKey: .perFileMaxBytes) ?? (16 * 1024 * 1024)
+        let packageMaxBytes = try c.decodeIfPresent(Int64.self, forKey: .packageMaxBytes) ?? perFileMaxBytes
+        let photoMargin = try c.decodeIfPresent(Double.self, forKey: .automaticPhotoEstimateMarginPercent)
+            ?? Self.defaultAutomaticPhotoEstimateMarginPercent
+        let videoMargin = try c.decodeIfPresent(Double.self, forKey: .automaticVideoEstimateMarginPercent)
+            ?? Self.defaultAutomaticVideoEstimateMarginPercent
+        let low = try c.decodeIfPresent(MediaUploadProfileConfig.self, forKey: .low) ?? .defaultLow
+        let medium = try c.decodeIfPresent(MediaUploadProfileConfig.self, forKey: .medium) ?? .defaultMedium
+        let high = try c.decodeIfPresent(MediaUploadProfileConfig.self, forKey: .high) ?? .defaultHigh
+        self.init(videoEngineRaw: videoEngineRaw,
+                  perFileMaxBytes: perFileMaxBytes,
+                  packageMaxBytes: packageMaxBytes,
+                  automaticPhotoEstimateMarginPercent: photoMargin,
+                  automaticVideoEstimateMarginPercent: videoMargin,
+                  low: low,
+                  medium: medium,
+                  high: high)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(videoEngineRaw, forKey: .videoEngineRaw)
+        try c.encode(perFileMaxBytes, forKey: .perFileMaxBytes)
+        try c.encode(packageMaxBytes, forKey: .packageMaxBytes)
+        try c.encode(automaticPhotoEstimateMarginPercent, forKey: .automaticPhotoEstimateMarginPercent)
+        try c.encode(automaticVideoEstimateMarginPercent, forKey: .automaticVideoEstimateMarginPercent)
+        try c.encode(low, forKey: .low)
+        try c.encode(medium, forKey: .medium)
+        try c.encode(high, forKey: .high)
+    }
+
+    /// Clamps margin to 0…50%.
+    public static func clampedMarginPercent(_ value: Double) -> Double {
+        min(50, max(0, value))
     }
 
     public static var `default`: MediaUploadDebugSettings {
@@ -144,20 +258,22 @@ import UniformTypeIdentifiers
     /// Compact one-line dump for NCLog when settings are saved or reloaded.
     public var summaryForLog: String {
         func profileLine(_ name: String, _ c: MediaUploadProfileConfig) -> String {
-            String(format: "%@[q=%d imgEdge=%d rate=%.3fMB/s vidMax=%.1fMB vidEdge=%d fps=%.0f preset=%@]",
+            String(format: "%@[q=%d imgEdge=%d rate=%.2fMbps vidMax=%.1fMB vidEdge=%d fps=%.0f preset=%@]",
                    name,
                    c.imageJPEGQuality,
                    c.imageMaxDimension,
-                   c.videoRateMBps,
+                   c.videoRateMbps,
                    Double(c.videoMaxBytes) / 1_048_576.0,
                    c.videoMaxEdge,
                    c.videoFPS,
                    c.exportPreset)
         }
-        return String(format: "engine=%@ perFile=%.1fMB package=%.1fMB %@ %@ %@",
+        return String(format: "engine=%@ perFile=%.1fMB package=%.1fMB photoMargin=%.0f%% videoMargin=%.0f%% %@ %@ %@",
                       Self.engineName(videoEngineRaw),
                       Double(perFileMaxBytes) / 1_048_576.0,
                       Double(packageMaxBytes) / 1_048_576.0,
+                      automaticPhotoEstimateMarginPercent,
+                      automaticVideoEstimateMarginPercent,
                       profileLine("low", low),
                       profileLine("med", medium),
                       profileLine("high", high))
@@ -182,6 +298,16 @@ import UniformTypeIdentifiers
                                 Double(previous.packageMaxBytes) / 1_048_576.0,
                                 Double(packageMaxBytes) / 1_048_576.0))
         }
+        if previous.automaticPhotoEstimateMarginPercent != automaticPhotoEstimateMarginPercent {
+            parts.append(String(format: "photoMargin: %.0f%% → %.0f%%",
+                                previous.automaticPhotoEstimateMarginPercent,
+                                automaticPhotoEstimateMarginPercent))
+        }
+        if previous.automaticVideoEstimateMarginPercent != automaticVideoEstimateMarginPercent {
+            parts.append(String(format: "videoMargin: %.0f%% → %.0f%%",
+                                previous.automaticVideoEstimateMarginPercent,
+                                automaticVideoEstimateMarginPercent))
+        }
         func appendProfileDiff(_ name: String, _ before: MediaUploadProfileConfig, _ after: MediaUploadProfileConfig) {
             if before.imageJPEGQuality != after.imageJPEGQuality {
                 parts.append("\(name).jpegQuality: \(before.imageJPEGQuality) → \(after.imageJPEGQuality)")
@@ -189,8 +315,8 @@ import UniformTypeIdentifiers
             if before.imageMaxDimension != after.imageMaxDimension {
                 parts.append("\(name).imgEdge: \(before.imageMaxDimension) → \(after.imageMaxDimension)")
             }
-            if before.videoRateMBps != after.videoRateMBps {
-                parts.append(String(format: "%@.rate: %.3f → %.3f MB/s", name, before.videoRateMBps, after.videoRateMBps))
+            if before.videoRateMbps != after.videoRateMbps {
+                parts.append(String(format: "%@.rate: %.2f → %.2f Mbps", name, before.videoRateMbps, after.videoRateMbps))
             }
             if before.videoMaxBytes != after.videoMaxBytes {
                 parts.append(String(format: "%@.vidMax: %.1f → %.1f MB",
@@ -247,6 +373,16 @@ import UniformTypeIdentifiers
         avExportPresetName(forKey: presetKey)
     }
 
+    /// Compact label for the settings value column (avoids wrapping): `1280x720`, `LowQuality`, …
+    public static func shortAVExportPreset(_ presetKey: String) -> String {
+        let full = avExportPresetName(forKey: presetKey)
+        let prefix = "AVAssetExportPreset"
+        if full.hasPrefix(prefix) {
+            return String(full.dropFirst(prefix.count))
+        }
+        return full
+    }
+
     /// File bytes → approx total Mbps for duration (includes audio + container).
     public static func approximateSourceTotalMbps(fileBytes: Int64, durationSeconds: Double) -> Double {
         guard fileBytes > 0, durationSeconds.isFinite, durationSeconds > 0.05 else { return 0 }
@@ -259,12 +395,13 @@ import UniformTypeIdentifiers
         return max(0.05, total - 0.128)
     }
 
-    /// Effective MB/s for Writer: min(profile rate, profileMaxBytes / duration).
-    public static func effectiveRateMBps(profile: MediaUploadProfileConfig, durationSeconds: Double) -> Double {
-        let base = max(0.01, profile.videoRateMBps)
+    /// Effective Mbps for Writer: min(profile rate, size-cap → Mbps for this duration).
+    public static func effectiveRateMbps(profile: MediaUploadProfileConfig, durationSeconds: Double) -> Double {
+        let base = max(0.08, profile.videoRateMbps)
         guard durationSeconds.isFinite, durationSeconds > 0 else { return base }
-        let capped = Double(profile.videoMaxBytes) / (durationSeconds * 1_048_576.0)
-        return min(base, max(0.01, capped))
+        // videoMaxBytes as an average bitrate ceiling for this clip length.
+        let capped = Double(profile.videoMaxBytes) * 8.0 / durationSeconds / 1_000_000.0
+        return min(base, max(0.08, capped))
     }
 
     private static let estimateCacheLock = NSLock()
@@ -349,15 +486,33 @@ import UniformTypeIdentifiers
     /// Target Mbps for a profile under the current video engine (Writer rate or preset guestimate).
     public static func targetVideoMbps(profile: MediaUploadProfileConfig, durationSeconds: Double) -> Double {
         if shared().usesAssetWriter {
-            return effectiveRateMBps(profile: profile, durationSeconds: durationSeconds) * 8.0
+            return effectiveRateMbps(profile: profile, durationSeconds: durationSeconds)
         }
         return guestimatedExportPresetMbps(profile.exportPreset)
     }
 
+    /// Telegram-style size estimate: `Mbps × duration / 8` (bytes).
+    /// Matches Writer target rate (total file budget) for Manual chip labels.
+    public static func telegramEstimatedVideoBytes(profile: MediaUploadProfileConfig,
+                                                   durationSeconds: Double,
+                                                   originalSize: Int64) -> Int64 {
+        guard durationSeconds.isFinite, durationSeconds > 0 else {
+            return originalSize > 0 ? originalSize : 12_288
+        }
+        let rateMbps = effectiveRateMbps(profile: profile, durationSeconds: durationSeconds)
+        let estimated = Int64(rateMbps * 1_000_000.0 / 8.0 * durationSeconds)
+        return max(12_288, min(estimated, originalSize > 0 ? originalSize : estimated))
+    }
+
     public static func estimatedVideoBytes(profile: MediaUploadProfileConfig, durationSeconds: Double, originalSize: Int64) -> Int64 {
-        let mbps = targetVideoMbps(profile: profile, durationSeconds: durationSeconds)
+        if shared().usesAssetWriter {
+            return telegramEstimatedVideoBytes(profile: profile,
+                                               durationSeconds: durationSeconds,
+                                               originalSize: originalSize)
+        }
+        let mbps = guestimatedExportPresetMbps(profile.exportPreset)
         let estimated = Int64(mbps * durationSeconds * 1_000_000.0 / 8.0)
-        if !shared().usesAssetWriter, profile.exportPreset == "high" {
+        if profile.exportPreset == "high" {
             return originalSize > 0 ? originalSize : max(12_288, estimated)
         }
         return max(12_288, min(estimated, originalSize > 0 ? originalSize : estimated))
@@ -372,9 +527,7 @@ import UniformTypeIdentifiers
         return estimatedVideoBytes(profile: profile, durationSeconds: durationSeconds, originalSize: originalSize)
     }
 
-    /// Force ExportSession-preset sizing for chip labels when multi-video Send will use
-    /// `preferExportSession`. Cheap Mbps guestimate only — Apple `estimateOutputFileLength`
-    /// on several large videos at chip-draw time is too heavy (Share Extension jetsam risk).
+    /// Cheap ExportSession-preset guestimate (no AVAsset). Used when Settings = Presets.
     public static func estimatedVideoBytesForExportPreset(at fileURL: URL,
                                                           profile: MediaUploadProfileConfig,
                                                           durationSeconds: Double,
@@ -385,9 +538,12 @@ import UniformTypeIdentifiers
         return max(12_288, min(estimated, originalSize > 0 ? originalSize : estimated))
     }
 
+    private static let shrinkDecisionCacheLock = NSLock()
+    private static var shrinkDecisionCache: [String: (result: Bool, at: Date)] = [:]
+    private static let shrinkDecisionCacheTTL: TimeInterval = 8
+
     /// Whether compressing this video at `level` is likely to shrink (≥10% smaller).
-    /// - Parameter forceExportSession: Multi-video chip/Send path forces ExportSession even when
-    ///   the debug engine is Writer — estimate and logs must match that path.
+    /// - Parameter forceExportSession: When true, estimate with ExportSession guests (Settings=Presets).
     public static func videoCompressionLikelyShrinks(at fileURL: URL,
                                                      level: MediaUploadCompressionLevel,
                                                      forceExportSession: Bool = false) -> Bool {
@@ -395,6 +551,16 @@ import UniformTypeIdentifiers
         guard let profile = shared().profile(for: level) else { return false }
         let original = MediaUploadPreprocessor.fileSizePublic(at: fileURL)
         guard original > 0 else { return false }
+
+        let usesWriter = shared().usesAssetWriter && !forceExportSession && !MediaUploadPreprocessor.preferExportSession
+        let cacheKey = "\(fileURL.path)|\(level.rawValue)|\(usesWriter ? "w" : "e")|\(original)"
+        shrinkDecisionCacheLock.lock()
+        if let hit = shrinkDecisionCache[cacheKey], Date().timeIntervalSince(hit.at) < shrinkDecisionCacheTTL {
+            let cached = hit.result
+            shrinkDecisionCacheLock.unlock()
+            return cached
+        }
+        shrinkDecisionCacheLock.unlock()
 
         let asset = AVURLAsset(url: fileURL)
         if asset.statusOfValue(forKey: "duration", error: nil) != .loaded {
@@ -411,52 +577,65 @@ import UniformTypeIdentifiers
             NCLog.log(String(format:
                 "MediaUploadHeuristic video %@ level=%ld SHORT duration=%.2fs original=%lld → compress=YES (short-clip rule)",
                 fileURL.lastPathComponent, level.rawValue, duration.isFinite ? duration : -1, original))
+            shrinkDecisionCacheLock.lock()
+            shrinkDecisionCache[cacheKey] = (true, Date())
+            shrinkDecisionCacheLock.unlock()
             return true
         }
 
         let sourceTotalMbps = approximateSourceTotalMbps(fileBytes: original, durationSeconds: duration)
         let sourceVideoMbps = approximateSourceVideoMbps(fileBytes: original, durationSeconds: duration)
         let thresholdBytes = Int64(Double(original) * shrinkEnableMargin)
-        let batchForcesExport = forceExportSession || MediaUploadPreprocessor.preferExportSession
 
-        // ExportSession engine (non-batch): prefer Apple's asset-aware estimate over Mbps guests.
-        if !shared().usesAssetWriter, !batchForcesExport {
-            if let appleBytes = appleEstimatedExportBytes(at: fileURL, presetKey: profile.exportPreset) {
-                let willShrink = appleBytes < thresholdBytes
-                let appleMbps = approximateSourceTotalMbps(fileBytes: appleBytes, durationSeconds: duration)
-                NCLog.log(String(format:
-                    "MediaUploadHeuristic video %@ level=%ld engine=preset:%@ duration=%.2fs original=%lld (%.2f MB, %.3fMbps) AppleEstimate=%lld (%.2f MB, %.3fMbps) threshold=%lld → %@ (apple)",
-                    fileURL.lastPathComponent,
-                    level.rawValue,
-                    profile.exportPreset,
-                    duration,
-                    original,
-                    Double(original) / 1_048_576.0,
-                    sourceTotalMbps,
-                    appleBytes,
-                    Double(appleBytes) / 1_048_576.0,
-                    appleMbps,
-                    thresholdBytes,
-                    willShrink ? "compress" : "skip"))
-                return willShrink
-            }
-            // Estimate failed: do NOT skip on guestimate alone — prefer compress (keep-if-smaller).
+        let willShrink: Bool
+        if usesWriter {
+            let expectedBytes = telegramEstimatedVideoBytes(profile: profile,
+                                                            durationSeconds: duration,
+                                                            originalSize: original)
+            let targetMbps = targetVideoMbps(profile: profile, durationSeconds: duration)
+            let thresholdMbps = sourceVideoMbps * shrinkEnableMargin
+            willShrink = targetMbps < thresholdMbps
             NCLog.log(String(format:
-                "MediaUploadHeuristic video %@ level=%ld engine=preset:%@ AppleEstimate unavailable → compress=YES (safe fallback)",
-                fileURL.lastPathComponent, level.rawValue, profile.exportPreset))
-            return true
-        }
-
-        // Multi-video / preferExportSession: cheap preset guests (matches chip totals + Send).
-        if batchForcesExport || !shared().usesAssetWriter {
+                "MediaUploadHeuristic video %@ level=%ld engine=writer duration=%.2fs original=%lld (%.2f MB) sourceTotal=%.3fMbps sourceVideo=%.3fMbps target=%.3fMbps threshold=%.3fMbps expected=%lld (%.2f MB) → %@",
+                fileURL.lastPathComponent,
+                level.rawValue,
+                duration,
+                original,
+                Double(original) / 1_048_576.0,
+                sourceTotalMbps,
+                sourceVideoMbps,
+                targetMbps,
+                thresholdMbps,
+                expectedBytes,
+                Double(expectedBytes) / 1_048_576.0,
+                willShrink ? "compress" : "skip"))
+        } else if !forceExportSession,
+                  let appleBytes = appleEstimatedExportBytes(at: fileURL, presetKey: profile.exportPreset) {
+            willShrink = appleBytes < thresholdBytes
+            let appleMbps = approximateSourceTotalMbps(fileBytes: appleBytes, durationSeconds: duration)
+            NCLog.log(String(format:
+                "MediaUploadHeuristic video %@ level=%ld engine=preset:%@ duration=%.2fs original=%lld (%.2f MB, %.3fMbps) AppleEstimate=%lld (%.2f MB, %.3fMbps) threshold=%lld → %@ (apple)",
+                fileURL.lastPathComponent,
+                level.rawValue,
+                profile.exportPreset,
+                duration,
+                original,
+                Double(original) / 1_048_576.0,
+                sourceTotalMbps,
+                appleBytes,
+                Double(appleBytes) / 1_048_576.0,
+                appleMbps,
+                thresholdBytes,
+                willShrink ? "compress" : "skip"))
+        } else {
             let expectedBytes = estimatedVideoBytesForExportPreset(at: fileURL,
                                                                    profile: profile,
                                                                    durationSeconds: duration,
                                                                    originalSize: original)
             let targetMbps = guestimatedExportPresetMbps(profile.exportPreset)
-            let willShrink = expectedBytes < thresholdBytes
+            willShrink = expectedBytes < thresholdBytes
             NCLog.log(String(format:
-                "MediaUploadHeuristic video %@ level=%ld engine=preset:%@ (batch) duration=%.2fs original=%lld (%.2f MB) sourceTotal=%.3fMbps sourceVideo=%.3fMbps target=%.3fMbps expected=%lld (%.2f MB) threshold=%lld → %@",
+                "MediaUploadHeuristic video %@ level=%ld engine=preset:%@ duration=%.2fs original=%lld (%.2f MB) sourceTotal=%.3fMbps sourceVideo=%.3fMbps target=%.3fMbps expected=%lld (%.2f MB) threshold=%lld → %@",
                 fileURL.lastPathComponent,
                 level.rawValue,
                 profile.exportPreset,
@@ -470,29 +649,11 @@ import UniformTypeIdentifiers
                 Double(expectedBytes) / 1_048_576.0,
                 thresholdBytes,
                 willShrink ? "compress" : "skip"))
-            return willShrink
         }
 
-        let targetMbps = targetVideoMbps(profile: profile, durationSeconds: duration)
-        let expectedBytes = estimatedVideoBytes(profile: profile, durationSeconds: duration, originalSize: original)
-        let thresholdMbps = sourceVideoMbps * shrinkEnableMargin
-        let willShrink = targetMbps < thresholdMbps
-
-        NCLog.log(String(format:
-            "MediaUploadHeuristic video %@ level=%ld engine=writer duration=%.2fs original=%lld (%.2f MB) sourceTotal=%.3fMbps sourceVideo=%.3fMbps target=%.3fMbps threshold=%.3fMbps expected=%lld (%.2f MB) → %@",
-            fileURL.lastPathComponent,
-            level.rawValue,
-            duration,
-            original,
-            Double(original) / 1_048_576.0,
-            sourceTotalMbps,
-            sourceVideoMbps,
-            targetMbps,
-            thresholdMbps,
-            expectedBytes,
-            Double(expectedBytes) / 1_048_576.0,
-            willShrink ? "compress" : "skip"))
-
+        shrinkDecisionCacheLock.lock()
+        shrinkDecisionCache[cacheKey] = (willShrink, Date())
+        shrinkDecisionCacheLock.unlock()
         return willShrink
     }
 
@@ -619,10 +780,8 @@ import UniformTypeIdentifiers
     public static func compressionLevelLikelyUseful(_ level: MediaUploadCompressionLevel, forFileURLs fileURLs: [URL]) -> Bool {
         if level == .none { return true }
 
-        let videoCount = fileURLs.reduce(0) { partial, url in
-            partial + (MediaUploadPreprocessor.isVideo(fileExtension: url.pathExtension.lowercased()) ? 1 : 0)
-        }
-        let forceExportSession = videoCount >= 2
+        // Match Send engine: Writer estimates when Bitrate is selected (including multi-video).
+        let forceExportSession = !shared().usesAssetWriter
 
         var sawCompressible = false
         for url in fileURLs {

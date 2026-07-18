@@ -1,5 +1,6 @@
 //
 // SPDX-FileCopyrightText: 2022 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursorov and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
@@ -37,7 +38,17 @@ enum ConfigurationSectionOption: Int {
 enum AdvancedSectionOption: Int {
     case kAdvancedSectionOptionDiagnostics = 0
     case kAdvancedSectionOptionCachedImages
-    case kAdvancedSectionOptionCachedFiles
+    case kAdvancedSectionOptionCachedVideos
+    case kAdvancedSectionOptionCachedDocuments
+    case kAdvancedSectionOptionCacheLimit
+    /// Separate from Cache limit — share Send staging (`upload/`, soft 512 MB).
+    case kAdvancedSectionOptionUploadStaging
+    /// Encode reuse (`convert/`, soft 512 MB).
+    case kAdvancedSectionOptionConvertCache
+    /// Share-sheet image thumbs (`thumbs/`).
+    case kAdvancedSectionOptionShareThumbs
+    /// SDImageCache + URLCache (avatars / server previews).
+    case kAdvancedSectionOptionSystemPreviews
     case kAdvancedSectionOptionCallFromOldAccount
 }
 
@@ -56,8 +67,13 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
     var setPhoneAction: UIAlertAction?
     var includeInRecentsSwitch = UISwitch()
 
-    var totalImageCacheSize = 0
-    var totalFileCacheSize = 0
+    var totalImageCacheSize: Int64 = 0
+    var totalVideoCacheSize: Int64 = 0
+    var totalDocumentCacheSize: Int64 = 0
+    var totalUploadStagingSize: Int64 = 0
+    var totalConvertCacheSize: Int64 = 0
+    var totalShareThumbsSize: Int64 = 0
+    var totalSystemPreviewsSize: Int64 = 0
 
     var activeAccount = NCDatabaseManager.sharedInstance().activeAccount()
     var inactiveAccounts = NCDatabaseManager.sharedInstance().inactiveAccounts()
@@ -108,10 +124,17 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         NotificationCenter.default.addObserver(self, selector: #selector(contactsAccessHasBeenUpdated(notification:)), name: NSNotification.Name.NCContactsManagerContactsAccessUpdated, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(userProfileImageUpdated), name: NSNotification.Name.NCUserProfileImageUpdated, object: nil)
 
-        self.updateTotalImageCacheSize()
-        self.updateTotalFileCacheSize()
+        self.updateCacheUsageSizes()
 
         self.adaptInterfaceForAppState(appState: NCConnectionController.shared.appState)
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        updateCacheUsageSizes()
+        if let advanced = getSettingsSections().firstIndex(of: SettingsSection.kSettingsSectionAdvanced.rawValue) {
+            tableView.reloadSections(IndexSet(integer: advanced), with: .none)
+        }
     }
 
     override func didReceiveMemoryWarning() {
@@ -199,7 +222,14 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
 
         // Caches
         options.append(AdvancedSectionOption.kAdvancedSectionOptionCachedImages.rawValue)
-        options.append(AdvancedSectionOption.kAdvancedSectionOptionCachedFiles.rawValue)
+        options.append(AdvancedSectionOption.kAdvancedSectionOptionCachedVideos.rawValue)
+        options.append(AdvancedSectionOption.kAdvancedSectionOptionCachedDocuments.rawValue)
+        options.append(AdvancedSectionOption.kAdvancedSectionOptionCacheLimit.rawValue)
+        // After Cache limit — caches outside the download/ pool (full coverage).
+        options.append(AdvancedSectionOption.kAdvancedSectionOptionUploadStaging.rawValue)
+        options.append(AdvancedSectionOption.kAdvancedSectionOptionConvertCache.rawValue)
+        options.append(AdvancedSectionOption.kAdvancedSectionOptionShareThumbs.rawValue)
+        options.append(AdvancedSectionOption.kAdvancedSectionOptionSystemPreviews.rawValue)
 
         // Received calls from old accounts
         if NCSettingsController.sharedInstance().didReceiveCallsFromOldAccount() {
@@ -412,7 +442,7 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
              NSLocalizedString("Upload originals without compressing", comment: "Subtitle for None media compression mode")),
             (.automatic,
              NSLocalizedString("Automatic", comment: "Automatic media compression"),
-             NSLocalizedString("Picks Low, Medium, or High to stay under size caps", comment: "Subtitle for Automatic media compression mode")),
+             NSLocalizedString("Per file: best quality that stays under the max file size (with estimate margin)", comment: "Subtitle for Automatic media compression mode")),
             (.chooseOnUpload,
              NSLocalizedString("Manual", comment: "Choose compression level when uploading"),
              NSLocalizedString("Choose None, Low, Medium, or High on each send", comment: "Subtitle for Manual media compression mode"))
@@ -432,7 +462,7 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
                                                                         andStyle: .insetGrouped) else { return }
         selector.title = NSLocalizedString("Media Compression", comment: "")
         selector.footerText = NSLocalizedString(
-            "Manual shows estimated sizes before send. Estimates are approximate. Two or more videos use Apple export presets for stability.",
+            "Manual shows estimated sizes before send (bitrate × duration for Bitrate engine). Videos encode one-at-a-time.",
             comment: "Footer on Media Compression mode picker"
         )
         selector.delegate = self
@@ -457,6 +487,20 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         selector.title = NSLocalizedString("Video Call Quality", comment: "")
         selector.delegate = self
         navigationController?.pushViewController(selector, animated: true)
+    }
+
+    func presentCacheLimitSettings() {
+        let controller = CacheLimitSettingsViewController(currentBytes: NCUserDefaults.fileCacheMaxBytes()) { [weak self] bytes in
+            NCUserDefaults.setFileCacheMaxBytes(bytes)
+            DispatchQueue.global(qos: .utility).async {
+                NCChatFileController.enforceCacheSizeLimit()
+                DispatchQueue.main.async {
+                    self?.updateCacheUsageSizes()
+                    self?.tableView.reloadData()
+                }
+            }
+        }
+        navigationController?.pushViewController(controller, animated: true)
     }
 
     func detailedOptionsSelector(_ viewController: DetailedOptionsSelectorTableViewController!,
@@ -582,16 +626,16 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
     func cachedImagesPressed() {
         let clearCacheDialog = UIAlertController(
             title: NSLocalizedString("Clear cache", comment: ""),
-            message: NSLocalizedString("Do you really want to clear the image cache?", comment: ""),
+            message: NSLocalizedString(
+                "Clear downloaded image attachments only (download/). Avatars and chat previews are under System previews.",
+                comment: ""
+            ),
             preferredStyle: .alert)
 
         let clearAction = UIAlertAction(title: NSLocalizedString("Clear cache", comment: ""), style: .destructive) { _ in
-            URLCache.shared.removeAllCachedResponses()
-            SDImageCache.shared.clearMemory()
-            SDImageCache.shared.clearDisk {
-                self.updateTotalImageCacheSize()
-                self.tableView.reloadData()
-            }
+            MediaUploadDiskStore.clearAttachmentCache(kind: .images)
+            self.updateCacheUsageSizes()
+            self.tableView.reloadData()
         }
         clearCacheDialog.addAction(clearAction)
 
@@ -601,20 +645,34 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         self.present(clearCacheDialog, animated: true, completion: nil)
     }
 
-    func cachedFilesPressed() {
+    func cachedVideosPressed() {
         let clearCacheDialog = UIAlertController(
             title: NSLocalizedString("Clear cache", comment: ""),
-            message: NSLocalizedString("Do you really want to clear the file cache?", comment: ""),
+            message: NSLocalizedString(
+                "Clear downloaded video attachments only (download/). Encoded reuse is under Convert cache.",
+                comment: ""
+            ),
             preferredStyle: .alert)
 
         let clearAction = UIAlertAction(title: NSLocalizedString("Clear cache", comment: ""), style: .destructive) { _ in
-            let talkAccounts = NCDatabaseManager.sharedInstance().allAccounts()
+            MediaUploadDiskStore.clearAttachmentCache(kind: .videos)
+            self.updateCacheUsageSizes()
+            self.tableView.reloadData()
+        }
+        clearCacheDialog.addAction(clearAction)
+        clearCacheDialog.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel))
+        present(clearCacheDialog, animated: true)
+    }
 
-            for account in talkAccounts {
-                NCChatFileController(account: account).clearDownloadDirectory()
-            }
+    func cachedDocumentsPressed() {
+        let clearCacheDialog = UIAlertController(
+            title: NSLocalizedString("Clear cache", comment: ""),
+            message: NSLocalizedString("Do you really want to clear the document cache?", comment: ""),
+            preferredStyle: .alert)
 
-            self.updateTotalFileCacheSize()
+        let clearAction = UIAlertAction(title: NSLocalizedString("Clear cache", comment: ""), style: .destructive) { _ in
+            MediaUploadDiskStore.clearAttachmentCache(kind: .documents)
+            self.updateCacheUsageSizes()
             self.tableView.reloadData()
         }
         clearCacheDialog.addAction(clearAction)
@@ -623,6 +681,133 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         clearCacheDialog.addAction(cancelAction)
 
         self.present(clearCacheDialog, animated: true, completion: nil)
+    }
+
+    func uploadStagingPressed() {
+        if MediaUploadDiskStore.isUploadSessionActive() {
+            let blocked = UIAlertController(
+                title: NSLocalizedString("Share in progress", comment: ""),
+                message: NSLocalizedString(
+                    "Upload staging is in use by an active share session. Finish or cancel the share, then try again.",
+                    comment: "Cannot clear upload/ while Share Extension holds session marker"
+                ),
+                preferredStyle: .alert
+            )
+            blocked.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: ""), style: .default))
+            present(blocked, animated: true)
+            return
+        }
+
+        let cap = MediaUploadDiskStore.formatCacheBytes(MediaUploadDiskStore.uploadStagingMaxBytes)
+        let used = MediaUploadDiskStore.formatCacheBytes(totalUploadStagingSize)
+        let message = String.localizedStringWithFormat(
+            NSLocalizedString(
+                "Share send staging (upload/). Soft cap %@ — not part of Cache limit. Also clears share thumbs. Auto-cleared after send, Cancel, or on the next share session. Currently %@.",
+                comment: "Confirm clear upload staging; first %@ is cap, second is current size"
+            ),
+            cap,
+            used
+        )
+        let clearCacheDialog = UIAlertController(
+            title: NSLocalizedString("Clear upload staging?", comment: ""),
+            message: message,
+            preferredStyle: .alert
+        )
+        let clearAction = UIAlertAction(title: NSLocalizedString("Clear", comment: ""), style: .destructive) { _ in
+            let cleared = MediaUploadDiskStore.clearUploadStagingCaches()
+            if !cleared {
+                let blocked = UIAlertController(
+                    title: NSLocalizedString("Share in progress", comment: ""),
+                    message: NSLocalizedString(
+                        "Upload staging is in use by an active share session. Finish or cancel the share, then try again.",
+                        comment: "Cannot clear upload/ while Share Extension holds session marker"
+                    ),
+                    preferredStyle: .alert
+                )
+                blocked.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: ""), style: .default))
+                self.present(blocked, animated: true)
+            }
+            self.updateCacheUsageSizes()
+            self.tableView.reloadData()
+        }
+        clearCacheDialog.addAction(clearAction)
+        clearCacheDialog.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel))
+        present(clearCacheDialog, animated: true)
+    }
+
+    func convertCachePressed() {
+        let cap = MediaUploadDiskStore.formatCacheBytes(MediaUploadDiskStore.convertCacheMaxBytes)
+        let used = MediaUploadDiskStore.formatCacheBytes(totalConvertCacheSize)
+        let message = String.localizedStringWithFormat(
+            NSLocalizedString(
+                "Encoded reuse cache (convert/). Soft cap %@ — not part of Cache limit. Cleared entries must re-encode on next send. Currently %@.",
+                comment: "Confirm clear convert cache; first %@ is cap, second is current size"
+            ),
+            cap,
+            used
+        )
+        let alert = UIAlertController(
+            title: NSLocalizedString("Clear convert cache?", comment: ""),
+            message: message,
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Clear", comment: ""), style: .destructive) { _ in
+            MediaUploadDiskStore.clearConvertCache()
+            self.updateCacheUsageSizes()
+            self.tableView.reloadData()
+        })
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel))
+        present(alert, animated: true)
+    }
+
+    func shareThumbsPressed() {
+        let used = MediaUploadDiskStore.formatCacheBytes(totalShareThumbsSize)
+        let message = String.localizedStringWithFormat(
+            NSLocalizedString(
+                "Share-sheet image thumbs (thumbs/). Not part of Cache limit. Also cleared with Upload staging. Currently %@.",
+                comment: "Confirm clear share thumbs; %@ is current size"
+            ),
+            used
+        )
+        let alert = UIAlertController(
+            title: NSLocalizedString("Clear share thumbs?", comment: ""),
+            message: message,
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Clear", comment: ""), style: .destructive) { _ in
+            MediaUploadDiskStore.clearThumbsCache()
+            self.updateCacheUsageSizes()
+            self.tableView.reloadData()
+        })
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel))
+        present(alert, animated: true)
+    }
+
+    func systemPreviewsPressed() {
+        let used = MediaUploadDiskStore.formatCacheBytes(totalSystemPreviewsSize)
+        let message = String.localizedStringWithFormat(
+            NSLocalizedString(
+                "Avatars, chat file previews, and HTTP cache (SDImageCache + URLCache). Not part of Cache limit. Currently %@.",
+                comment: "Confirm clear system previews; %@ is current size"
+            ),
+            used
+        )
+        let alert = UIAlertController(
+            title: NSLocalizedString("Clear system previews?", comment: ""),
+            message: message,
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Clear", comment: ""), style: .destructive) { _ in
+            URLCache.shared.removeAllCachedResponses()
+            SDImageCache.shared.clearMemory()
+            SDImageCache.shared.clearDisk {
+                MediaUploadTrace.log("CACHE clear system-previews (SDImageCache + URLCache)")
+                self.updateCacheUsageSizes()
+                self.tableView.reloadData()
+            }
+        })
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel))
+        present(alert, animated: true)
     }
 
     func callsFromOldAccountPressed() {
@@ -656,7 +841,7 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         case SettingsSection.kSettingsSectionConfiguration.rawValue:
             return getConfigurationSectionOptions().count
         case SettingsSection.kSettingsSectionDebug.rawValue:
-            return 1
+            return 3
         case SettingsSection.kSettingsSectionAdvanced.rawValue:
             return getAdvancedSectionOptions().count
         case SettingsSection.kSettingsSectionAbout.rawValue:
@@ -768,11 +953,27 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
             return sectionConfigurationCell(for: indexPath)
 
         case SettingsSection.kSettingsSectionDebug.rawValue:
-            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "DebugCompressionCell", style: .default)
-            cell.textLabel?.text = NSLocalizedString("Media Compression Settings", comment: "")
+            if indexPath.row == 0 {
+                let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "DebugCompressionCell", style: .default)
+                cell.textLabel?.text = NSLocalizedString("Media Compression Settings", comment: "")
+                cell.detailTextLabel?.text = nil
+                cell.accessoryType = .disclosureIndicator
+                cell.setColoredSettingsIcon(systemName: "slider.horizontal.3", backgroundColor: SettingsIconColor.orange)
+                return cell
+            }
+            if indexPath.row == 1 {
+                let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "DebugCompressionAlgoCell", style: .default)
+                cell.textLabel?.text = NSLocalizedString("Compression Algo", comment: "Debug: explanation of compression algorithm")
+                cell.detailTextLabel?.text = nil
+                cell.accessoryType = .disclosureIndicator
+                cell.setColoredSettingsIcon(systemName: "chevron.left.forwardslash.chevron.right", backgroundColor: SettingsIconColor.gray)
+                return cell
+            }
+            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "DebugCachePolicyCell", style: .default)
+            cell.textLabel?.text = NSLocalizedString("Cache Policy", comment: "Debug: explanation of media caches")
             cell.detailTextLabel?.text = nil
             cell.accessoryType = .disclosureIndicator
-            cell.setColoredSettingsIcon(systemName: "slider.horizontal.3", backgroundColor: SettingsIconColor.orange)
+            cell.setColoredSettingsIcon(systemName: "internaldrive", backgroundColor: SettingsIconColor.gray)
             return cell
 
         case SettingsSection.kSettingsSectionAdvanced.rawValue:
@@ -824,8 +1025,20 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
             self.diagnosticsPressed()
         case AdvancedSectionOption.kAdvancedSectionOptionCachedImages.rawValue:
             self.cachedImagesPressed()
-        case AdvancedSectionOption.kAdvancedSectionOptionCachedFiles.rawValue:
-            self.cachedFilesPressed()
+        case AdvancedSectionOption.kAdvancedSectionOptionCachedVideos.rawValue:
+            self.cachedVideosPressed()
+        case AdvancedSectionOption.kAdvancedSectionOptionCachedDocuments.rawValue:
+            self.cachedDocumentsPressed()
+        case AdvancedSectionOption.kAdvancedSectionOptionCacheLimit.rawValue:
+            self.presentCacheLimitSettings()
+        case AdvancedSectionOption.kAdvancedSectionOptionUploadStaging.rawValue:
+            self.uploadStagingPressed()
+        case AdvancedSectionOption.kAdvancedSectionOptionConvertCache.rawValue:
+            self.convertCachePressed()
+        case AdvancedSectionOption.kAdvancedSectionOptionShareThumbs.rawValue:
+            self.shareThumbsPressed()
+        case AdvancedSectionOption.kAdvancedSectionOptionSystemPreviews.rawValue:
+            self.systemPreviewsPressed()
         case AdvancedSectionOption.kAdvancedSectionOptionCallFromOldAccount.rawValue:
             self.callsFromOldAccountPressed()
         default:
@@ -870,8 +1083,16 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
             self.didSelectSettingsSectionCell(for: indexPath)
 
         case SettingsSection.kSettingsSectionDebug.rawValue:
-            let debugVC = MediaUploadCompressionDebugViewController()
-            self.navigationController?.pushViewController(debugVC, animated: true)
+            if indexPath.row == 0 {
+                let debugVC = MediaUploadCompressionDebugViewController()
+                self.navigationController?.pushViewController(debugVC, animated: true)
+            } else if indexPath.row == 1 {
+                let algoVC = MediaUploadCompressionAlgoViewController()
+                self.navigationController?.pushViewController(algoVC, animated: true)
+            } else {
+                let policyVC = MediaUploadCachePolicyViewController()
+                self.navigationController?.pushViewController(policyVC, animated: true)
+            }
 
         case SettingsSection.kSettingsSectionAdvanced.rawValue:
             self.didSelectAdvancedSectionCell(for: indexPath)
@@ -1035,42 +1256,105 @@ extension SettingsTableViewController {
             return cell
 
         case AdvancedSectionOption.kAdvancedSectionOptionCachedImages.rawValue:
-            let byteFormatter = ByteCountFormatter()
-            byteFormatter.allowedUnits = [.useMB]
-            byteFormatter.countStyle = .file
+            return self.cacheUsageCell(
+                tableView: tableView,
+                title: NSLocalizedString("Cached Images", comment: ""),
+                systemName: "photo",
+                bytes: self.totalImageCacheSize
+            )
 
-            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: advancedCellIdentifier, style: .default)
-            cell.textLabel?.text = NSLocalizedString("Cached images", comment: "")
-            cell.setColoredSettingsIcon(systemName: "photo", backgroundColor: SettingsIconColor.blue)
+        case AdvancedSectionOption.kAdvancedSectionOptionCachedVideos.rawValue:
+            return self.cacheUsageCell(
+                tableView: tableView,
+                title: NSLocalizedString("Cached Videos", comment: ""),
+                systemName: "video",
+                bytes: self.totalVideoCacheSize
+            )
 
-            let byteCounterLabel = UILabel()
-            byteCounterLabel.text = byteFormatter.string(fromByteCount: Int64(self.totalImageCacheSize))
-            byteCounterLabel.textColor = .secondaryLabel
-            byteCounterLabel.sizeToFit()
-            cell.accessoryView = byteCounterLabel
+        case AdvancedSectionOption.kAdvancedSectionOptionCachedDocuments.rawValue:
+            return self.cacheUsageCell(
+                tableView: tableView,
+                title: NSLocalizedString("Cached Documents", comment: ""),
+                systemName: "doc",
+                bytes: self.totalDocumentCacheSize
+            )
 
+        case AdvancedSectionOption.kAdvancedSectionOptionCacheLimit.rawValue:
+            let advancedValueCellIdentifier = "AdvancedValueCellIdentifier"
+            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: advancedValueCellIdentifier, style: .value1)
+            cell.textLabel?.text = NSLocalizedString("Cache limit", comment: "")
+            cell.detailTextLabel?.text = MediaUploadDiskStore.formatCacheBytes(NCUserDefaults.fileCacheMaxBytes())
+            cell.detailTextLabel?.textColor = .secondaryLabel
+            cell.setColoredSettingsIcon(systemName: "internaldrive", backgroundColor: SettingsIconColor.gray)
+            cell.accessoryType = .disclosureIndicator
+            cell.accessoryView = nil
             return cell
 
-        case AdvancedSectionOption.kAdvancedSectionOptionCachedFiles.rawValue:
-            let byteFormatter = ByteCountFormatter()
-            byteFormatter.allowedUnits = [.useMB]
-            byteFormatter.countStyle = .file
+        case AdvancedSectionOption.kAdvancedSectionOptionUploadStaging.rawValue:
+            return self.specialCacheCell(
+                title: NSLocalizedString("Upload staging", comment: "Share send temporary upload/ cache"),
+                subtitle: String.localizedStringWithFormat(
+                    NSLocalizedString("Separate from Cache limit · soft cap %@", comment: "Subtitle under Upload staging; %@ is e.g. 512 MB"),
+                    MediaUploadDiskStore.formatCacheBytes(MediaUploadDiskStore.uploadStagingMaxBytes)
+                ),
+                systemName: "arrow.up.circle",
+                iconColor: SettingsIconColor.orange,
+                bytes: self.totalUploadStagingSize
+            )
 
-            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: advancedCellIdentifier, style: .default)
-            cell.textLabel?.text = NSLocalizedString("Cached files", comment: "")
-            cell.setColoredSettingsIcon(systemName: "doc", backgroundColor: SettingsIconColor.blue)
+        case AdvancedSectionOption.kAdvancedSectionOptionConvertCache.rawValue:
+            return self.specialCacheCell(
+                title: NSLocalizedString("Convert cache", comment: "Encoded media reuse cache"),
+                subtitle: String.localizedStringWithFormat(
+                    NSLocalizedString("Encode reuse · soft cap %@", comment: "Subtitle under Convert cache; %@ is e.g. 512 MB"),
+                    MediaUploadDiskStore.formatCacheBytes(MediaUploadDiskStore.convertCacheMaxBytes)
+                ),
+                systemName: "arrow.triangle.2.circlepath",
+                iconColor: SettingsIconColor.orange,
+                bytes: self.totalConvertCacheSize
+            )
 
-            let byteCounterLabel = UILabel()
-            byteCounterLabel.text = byteFormatter.string(fromByteCount: Int64(self.totalFileCacheSize))
-            byteCounterLabel.textColor = .secondaryLabel
-            byteCounterLabel.sizeToFit()
-            cell.accessoryView = byteCounterLabel
+        case AdvancedSectionOption.kAdvancedSectionOptionShareThumbs.rawValue:
+            return self.specialCacheCell(
+                title: NSLocalizedString("Share thumbs", comment: "Share sheet image thumbnail cache"),
+                subtitle: NSLocalizedString("Share-sheet previews · cleared with staging", comment: "Subtitle under Share thumbs"),
+                systemName: "rectangle.grid.2x2",
+                iconColor: SettingsIconColor.gray,
+                bytes: self.totalShareThumbsSize
+            )
 
-            return cell
+        case AdvancedSectionOption.kAdvancedSectionOptionSystemPreviews.rawValue:
+            return self.specialCacheCell(
+                title: NSLocalizedString("System previews", comment: "SDImageCache and URLCache"),
+                subtitle: NSLocalizedString("Avatars & chat previews · not Cache limit", comment: "Subtitle under System previews"),
+                systemName: "photo.on.rectangle",
+                iconColor: SettingsIconColor.gray,
+                bytes: self.totalSystemPreviewsSize
+            )
 
         default:
             return UITableViewCell()
         }
+    }
+
+    private func specialCacheCell(title: String,
+                                  subtitle: String,
+                                  systemName: String,
+                                  iconColor: UIColor,
+                                  bytes: Int64) -> UITableViewCell {
+        let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "AdvancedSpecialCacheCell", style: .subtitle)
+        cell.textLabel?.text = title
+        cell.detailTextLabel?.text = subtitle
+        cell.detailTextLabel?.textColor = .secondaryLabel
+        cell.detailTextLabel?.numberOfLines = 2
+        cell.setColoredSettingsIcon(systemName: systemName, backgroundColor: iconColor)
+        let byteCounterLabel = UILabel()
+        byteCounterLabel.text = MediaUploadDiskStore.formatCacheBytes(bytes)
+        byteCounterLabel.textColor = .secondaryLabel
+        byteCounterLabel.sizeToFit()
+        cell.accessoryView = byteCounterLabel
+        cell.accessoryType = .none
+        return cell
     }
 
     func sectionAboutCell(for indexPath: IndexPath) -> UITableViewCell {
@@ -1108,19 +1392,31 @@ extension SettingsTableViewController {
         return NCAPIController.sharedInstance().userProfileImage(forAccount: account, withStyle: self.traitCollection.userInterfaceStyle)
     }
 
-    func updateTotalImageCacheSize() {
-        let sharedUrlCache = URLCache.shared.currentDiskUsage
-        let sdImageCacheSize = SDImageCache.shared.totalDiskSize()
-        self.totalImageCacheSize = sharedUrlCache + Int(sdImageCacheSize)
+    private func cacheUsageCell(tableView: UITableView, title: String, systemName: String, bytes: Int64) -> UITableViewCell {
+        let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "AdvancedCellIdentifier", style: .default)
+        cell.textLabel?.text = title
+        cell.setColoredSettingsIcon(systemName: systemName, backgroundColor: SettingsIconColor.blue)
+        let byteCounterLabel = UILabel()
+        byteCounterLabel.text = MediaUploadDiskStore.formatCacheBytes(bytes)
+        byteCounterLabel.textColor = .secondaryLabel
+        byteCounterLabel.sizeToFit()
+        cell.accessoryView = byteCounterLabel
+        cell.accessoryType = .none
+        return cell
     }
 
-    func updateTotalFileCacheSize() {
-        self.totalFileCacheSize = 0
-
-        let talkAccounts = NCDatabaseManager.sharedInstance().allAccounts()
-
-        for account in talkAccounts {
-            self.totalFileCacheSize += Int(NCChatFileController(account: account).getDiskUsage())
-        }
+    func updateCacheUsageSizes() {
+        // download/ — same pool as Cache limit (I + V + D).
+        let attachments = MediaUploadDiskStore.attachmentCacheUsage()
+        self.totalImageCacheSize = attachments.images
+        self.totalVideoCacheSize = attachments.videos
+        self.totalDocumentCacheSize = attachments.documents
+        // Outside Cache limit (listed after Cache limit in Advanced).
+        self.totalUploadStagingSize = MediaUploadDiskStore.uploadStagingUsageBytes()
+        self.totalConvertCacheSize = MediaUploadDiskStore.convertCacheUsageBytes()
+        self.totalShareThumbsSize = MediaUploadDiskStore.thumbsCacheUsageBytes()
+        let sd = Int64(SDImageCache.shared.totalDiskSize())
+        let url = Int64(URLCache.shared.currentDiskUsage)
+        self.totalSystemPreviewsSize = max(0, sd) + max(0, url)
     }
 }
