@@ -563,24 +563,32 @@ import UniformTypeIdentifiers
         return guestimatedExportPresetMbps(profile.exportPreset)
     }
 
-    /// Writer size estimate: `Mbps × duration / 8` (bytes).
-    /// Matches Writer target rate (total mux budget: video + profile AAC) for Manual chip labels.
+    /// Writer size estimate matching encode: H.264 + profile AAC (when `hasAudio`), including bitrate floors.
     public static func estimatedWriterVideoBytes(profile: MediaUploadProfileConfig,
                                                  durationSeconds: Double,
-                                                 originalSize: Int64) -> Int64 {
+                                                 originalSize: Int64,
+                                                 hasAudio: Bool = true) -> Int64 {
         guard durationSeconds.isFinite, durationSeconds > 0 else {
             return originalSize > 0 ? originalSize : 12_288
         }
         let rateMbps = effectiveRateMbps(profile: profile, durationSeconds: durationSeconds)
-        let estimated = Int64(rateMbps * 1_000_000.0 / 8.0 * durationSeconds)
+        let totalBitsPerSecond = rateMbps * 1_000_000.0
+        let audioBitsPerSecond = hasAudio ? Double(profile.audioBitsPerSecond) : 0
+        let videoBitsPerSecond = max(100_000.0, totalBitsPerSecond - audioBitsPerSecond)
+        let muxBitsPerSecond = videoBitsPerSecond + audioBitsPerSecond
+        let estimated = Int64(muxBitsPerSecond / 8.0 * durationSeconds)
         return max(12_288, min(estimated, originalSize > 0 ? originalSize : estimated))
     }
 
-    public static func estimatedVideoBytes(profile: MediaUploadProfileConfig, durationSeconds: Double, originalSize: Int64) -> Int64 {
+    public static func estimatedVideoBytes(profile: MediaUploadProfileConfig,
+                                           durationSeconds: Double,
+                                           originalSize: Int64,
+                                           hasAudio: Bool = true) -> Int64 {
         if shared().usesAssetWriter {
             return estimatedWriterVideoBytes(profile: profile,
                                              durationSeconds: durationSeconds,
-                                             originalSize: originalSize)
+                                             originalSize: originalSize,
+                                             hasAudio: hasAudio)
         }
         let mbps = guestimatedExportPresetMbps(profile.exportPreset)
         let estimated = Int64(mbps * durationSeconds * 1_000_000.0 / 8.0)
@@ -590,13 +598,23 @@ import UniformTypeIdentifiers
         return max(12_288, min(estimated, originalSize > 0 ? originalSize : estimated))
     }
 
+    /// True when the file has at least one audio track (file URLs; sync track list).
+    public static func assetHasAudioTrack(at fileURL: URL) -> Bool {
+        let asset = AVURLAsset(url: fileURL)
+        return !asset.tracks(withMediaType: .audio).isEmpty
+    }
+
     /// URL-aware estimate: Apple ExportSession estimate when engine is presets.
     public static func estimatedVideoBytes(at fileURL: URL, profile: MediaUploadProfileConfig, durationSeconds: Double, originalSize: Int64) -> Int64 {
         if !shared().usesAssetWriter,
            let apple = appleEstimatedExportBytes(at: fileURL, presetKey: profile.exportPreset) {
             return max(12_288, min(apple, originalSize > 0 ? originalSize : apple))
         }
-        return estimatedVideoBytes(profile: profile, durationSeconds: durationSeconds, originalSize: originalSize)
+        let hasAudio = shared().usesAssetWriter ? assetHasAudioTrack(at: fileURL) : true
+        return estimatedVideoBytes(profile: profile,
+                                   durationSeconds: durationSeconds,
+                                   originalSize: originalSize,
+                                   hasAudio: hasAudio)
     }
 
     /// Cheap ExportSession-preset guestimate (no AVAsset). Used when Settings = Presets.
@@ -656,32 +674,31 @@ import UniformTypeIdentifiers
         }
 
         let sourceTotalMbps = approximateSourceTotalMbps(fileBytes: original, durationSeconds: duration)
-        let sourceVideoMbps = approximateSourceVideoMbps(fileBytes: original,
-                                                         durationSeconds: duration,
-                                                         audioBitrateKbps: profile.audioBitrateKbps)
         let thresholdBytes = Int64(Double(original) * shrinkEnableMargin)
 
+        // Same rule as Manual chips: compress when estimated output is ≥10% smaller (bytes).
         let willShrink: Bool
         if usesWriter {
+            let hasAudio = !asset.tracks(withMediaType: .audio).isEmpty
             let expectedBytes = estimatedWriterVideoBytes(profile: profile,
-                                                            durationSeconds: duration,
-                                                            originalSize: original)
+                                                          durationSeconds: duration,
+                                                          originalSize: original,
+                                                          hasAudio: hasAudio)
+            willShrink = expectedBytes < thresholdBytes
             let targetMbps = targetVideoMbps(profile: profile, durationSeconds: duration)
-            let thresholdMbps = sourceVideoMbps * shrinkEnableMargin
-            willShrink = targetMbps < thresholdMbps
             NCLog.log(String(format:
-                "MediaUploadHeuristic video %@ level=%ld engine=writer duration=%.2fs original=%lld (%.2f MB) sourceTotal=%.3fMbps sourceVideo=%.3fMbps target=%.3fMbps threshold=%.3fMbps expected=%lld (%.2f MB) → %@",
+                "MediaUploadHeuristic video %@ level=%ld engine=writer duration=%.2fs original=%lld (%.2f MB) sourceTotal=%.3fMbps target=%.3fMbps expected=%lld (%.2f MB) threshold=%lld audio=%@ → %@",
                 fileURL.lastPathComponent,
                 level.rawValue,
                 duration,
                 original,
                 Double(original) / 1_048_576.0,
                 sourceTotalMbps,
-                sourceVideoMbps,
                 targetMbps,
-                thresholdMbps,
                 expectedBytes,
                 Double(expectedBytes) / 1_048_576.0,
+                thresholdBytes,
+                hasAudio ? "yes" : "none",
                 willShrink ? "compress" : "skip"))
         } else if !forceExportSession,
                   let appleBytes = appleEstimatedExportBytes(at: fileURL, presetKey: profile.exportPreset) {
@@ -709,7 +726,7 @@ import UniformTypeIdentifiers
             let targetMbps = guestimatedExportPresetMbps(profile.exportPreset)
             willShrink = expectedBytes < thresholdBytes
             NCLog.log(String(format:
-                "MediaUploadHeuristic video %@ level=%ld engine=preset:%@ duration=%.2fs original=%lld (%.2f MB) sourceTotal=%.3fMbps sourceVideo=%.3fMbps target=%.3fMbps expected=%lld (%.2f MB) threshold=%lld → %@",
+                "MediaUploadHeuristic video %@ level=%ld engine=preset:%@ duration=%.2fs original=%lld (%.2f MB) sourceTotal=%.3fMbps target=%.3fMbps expected=%lld (%.2f MB) threshold=%lld → %@",
                 fileURL.lastPathComponent,
                 level.rawValue,
                 profile.exportPreset,
@@ -717,7 +734,6 @@ import UniformTypeIdentifiers
                 original,
                 Double(original) / 1_048_576.0,
                 sourceTotalMbps,
-                sourceVideoMbps,
                 targetMbps,
                 expectedBytes,
                 Double(expectedBytes) / 1_048_576.0,

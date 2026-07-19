@@ -176,21 +176,24 @@ enum MediaUploadVideoWriter {
             return
         }
 
+        let sourceHasAudio = !asset.tracks(withMediaType: .audio).isEmpty
         let rateMbps = MediaUploadDebugSettings.effectiveRateMbps(profile: profile, durationSeconds: durationSeconds)
         let totalBitsPerSecond = rateMbps * 1_000_000.0
-        let audioBitsPerSecond = Double(profile.audioBitsPerSecond)
+        // Reserve profile AAC only when the source has audio (matches chip/Send size estimate).
+        let audioBitsPerSecond = sourceHasAudio ? Double(profile.audioBitsPerSecond) : 0
         let videoBitsPerSecond = max(100_000, Int(totalBitsPerSecond - audioBitsPerSecond))
         let fps = max(1, Int(profile.videoFPS.rounded()))
         MediaUploadTrace.logSync(String(format:
-            "WRITER start %@ duration=%.1fs out=%dx%d edge=%d rate=%.2fMbps videoBitrate=%d aac=%dk/%dch fps=%d avail=%.0fMB",
+            "WRITER start %@ duration=%.1fs out=%dx%d edge=%d rate=%.2fMbps videoBitrate=%d aac=%@ fps=%d avail=%.0fMB",
             sourceURL.lastPathComponent,
             durationSeconds,
             width, height,
             profile.videoMaxEdge,
             rateMbps,
             videoBitsPerSecond,
-            profile.audioBitrateKbps,
-            profile.audioChannels,
+            sourceHasAudio
+                ? String(format: "%dk/%dch", profile.audioBitrateKbps, profile.audioChannels)
+                : "none",
             fps,
             MediaUploadMemoryGateObjC.availableMegabytes()))
 
@@ -236,8 +239,7 @@ enum MediaUploadVideoWriter {
             }
             writer.add(videoWriterInput)
 
-            // Audio — always Linear PCM → AAC at the profile bitrate so the size budget is honest.
-            let sourceHasAudio = !asset.tracks(withMediaType: .audio).isEmpty
+            // Audio — Linear PCM → AAC at the profile bitrate so the size budget is honest.
             var audioReaderOutput: AVAssetReaderTrackOutput?
             var audioWriterInput: AVAssetWriterInput?
             if let audioTrack = asset.tracks(withMediaType: .audio).first {

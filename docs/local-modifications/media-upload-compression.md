@@ -111,11 +111,14 @@ See [next-features.md](next-features.md) — e.g. in-app Save to Photos that kee
 - **Settings → Debug → Compression Debug:** video engine (Writer vs ExportSession),
   per-file cap X, package cap Y, Low/Medium/High (JPEG quality, edges, MB/s,
   max MB, FPS, ExportSession preset, Writer AAC bitrate/channels). Mirrored via App Group.
-- **Writer audio:** rate / max size are a **total mux budget**. Profile AAC is reserved
-  first (`audioBitrateKbps` × 1000), remainder goes to H.264. Audio is always
-  re-encoded (Linear PCM → AAC @ 44.1 kHz). Defaults: Low **96 kbps stereo**,
-  Medium **64 kbps stereo**, High **32 kbps mono**. ExportSession ignores these
-  knobs (Apple preset owns A/V).
+- **Writer audio:** rate / max size are a **total mux budget**. When the source has
+  audio, profile AAC is reserved first (`audioBitrateKbps` × 1000), remainder goes
+  to H.264; silent sources get the full rate as video. Audio is re-encoded
+  (Linear PCM → AAC @ 44.1 kHz). Defaults: Low **96 kbps stereo**, Medium
+  **64 kbps stereo**, High **32 kbps mono**. ExportSession ignores these knobs.
+- **Chip + Send shrink gate (Writer):** one byte formula —
+  `expected ≈ (videoBits + audioBits) × duration / 8`, compress if
+  `expected < original × 0.9` (same for Manual chip sizes and Send skip).
 - **Manual chips:** None / Low / Medium / High.
 - **Automatic:** package-aware — escalate largest items until estimates ≤ X and
   sum ≤ Y (Y wins); High is best effort for huge clips.
