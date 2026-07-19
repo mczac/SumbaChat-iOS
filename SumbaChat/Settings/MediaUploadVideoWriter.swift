@@ -8,6 +8,24 @@ import CoreMedia
 import UIKit
 import os
 
+/// Lightweight post-encode checks shared by Writer and ExportSession.
+enum MediaUploadVideoIntegrity {
+    static func assetHasAudioTrack(at url: URL) -> Bool {
+        let asset = AVURLAsset(url: url)
+        return !asset.tracks(withMediaType: .audio).isEmpty
+    }
+
+    static func outputHasAudioTrack(at url: URL) -> Bool {
+        assetHasAudioTrack(at: url)
+    }
+
+    /// True when source had no audio, or output kept at least one audio track.
+    static func preservesAudioIfPresent(source: URL, output: URL) -> Bool {
+        guard assetHasAudioTrack(at: source) else { return true }
+        return assetHasAudioTrack(at: output)
+    }
+}
+
 /// Waits for jetsam headroom between serial AVAssetWriter sessions.
 enum MediaUploadMemoryGate {
     static func availableBytes() -> UInt64 {
@@ -179,13 +197,6 @@ enum MediaUploadVideoWriter {
             let reader = try AVAssetReader(asset: asset)
             let writer = try AVAssetWriter(outputURL: destinationURL, fileType: .mp4)
             writer.shouldOptimizeForNetworkUse = true
-            // Must be set before startWriting — Writer does not inherit source metadata.
-            let preserved = Self.captureMetadataItems(from: asset)
-            if !preserved.isEmpty {
-                writer.metadata = preserved
-                MediaUploadTrace.logSync(String(format: "WRITER metadata preserved %d item(s) for %@",
-                                                preserved.count, sourceURL.lastPathComponent))
-            }
 
             // Prefer decoder output at encode size — avoids full-res frame peaks even when scale ≈ 1.
             let readerVideoSettings: [String: Any] = [
@@ -223,24 +234,35 @@ enum MediaUploadVideoWriter {
             }
             writer.add(videoWriterInput)
 
-            // Passthrough compressed audio — Linear PCM decode was a large memory spike.
+            // Audio — Telegram-style PCM→AAC (always re-encode). Passthrough without a
+            // sourceFormatHint is rejected for MP4 and we used to ship silent files.
+            let sourceHasAudio = !asset.tracks(withMediaType: .audio).isEmpty
             var audioReaderOutput: AVAssetReaderTrackOutput?
             var audioWriterInput: AVAssetWriterInput?
             if let audioTrack = asset.tracks(withMediaType: .audio).first {
-                let aOut = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-                aOut.alwaysCopiesSampleData = false
-                if reader.canAdd(aOut) {
-                    reader.add(aOut)
-                    audioReaderOutput = aOut
-                    let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
-                    aIn.expectsMediaDataInRealTime = false
-                    if writer.canAdd(aIn) {
-                        writer.add(aIn)
-                        audioWriterInput = aIn
-                    } else {
-                        audioReaderOutput = nil
-                    }
+                if let wired = Self.wireAudio(track: audioTrack, reader: reader, writer: writer) {
+                    audioReaderOutput = wired.readerOutput
+                    audioWriterInput = wired.writerInput
+                    MediaUploadTrace.logSync(String(format: "WRITER audio path=%@ %@",
+                                                    wired.pathName, sourceURL.lastPathComponent))
+                } else {
+                    // Fail the Writer encode so ExportSession can take over — never upload mute.
+                    MediaUploadTrace.logSync("WRITER audio FAIL (could not wire) \(sourceURL.lastPathComponent)")
+                    NCLog.log("MediaUploadVideoWriter: unable to wire audio track")
+                    completion(false)
+                    return
                 }
+            }
+
+            // Must be set before startWriting — Writer does not inherit source metadata.
+            // Applied after inputs so metadata never interferes with canAdd for audio.
+            let preserved = Self.captureMetadataItems(from: asset)
+            if !preserved.isEmpty {
+                writer.metadata = preserved
+                MediaUploadTrace.logSync(String(format: "WRITER metadata preserved %d item(s) for %@",
+                                                preserved.count, sourceURL.lastPathComponent))
+            } else {
+                MediaUploadTrace.logSync("WRITER metadata none \(sourceURL.lastPathComponent)")
             }
 
             let state = WriterState()
@@ -363,16 +385,25 @@ enum MediaUploadVideoWriter {
                                 completion(false)
                                 return
                             }
+                            if sourceHasAudio,
+                               !MediaUploadVideoIntegrity.outputHasAudioTrack(at: destinationURL) {
+                                try? FileManager.default.removeItem(at: destinationURL)
+                                MediaUploadTrace.log("ENCODE video FAIL \(sourceURL.lastPathComponent) engine=Writer missing-audio")
+                                NCLog.log("MediaUploadVideoWriter: output missing audio track")
+                                completion(false)
+                                return
+                            }
                             let srcMbps = duration > 0
                                 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: sourceSize, durationSeconds: duration) : 0
                             let outMbps = duration > 0
                                 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: compressedSize, durationSeconds: duration) : 0
                             MediaUploadTrace.log(String(format:
-                                "ENCODE video ACTUAL %@ %@ (%.3fMbps) → %@ (%.3fMbps) engine=Writer %dx%d videoBitrate=%d",
+                                "ENCODE video ACTUAL %@ %@ (%.3fMbps) → %@ (%.3fMbps) engine=Writer %dx%d videoBitrate=%d audio=%@",
                                 sourceURL.lastPathComponent,
                                 MediaUploadTrace.mb(sourceSize), srcMbps,
                                 MediaUploadTrace.mb(compressedSize), outMbps,
-                                width, height, videoBitsPerSecond))
+                                width, height, videoBitsPerSecond,
+                                sourceHasAudio ? "yes" : "none"))
                             completion(true)
                         }
                     }
@@ -383,6 +414,76 @@ enum MediaUploadVideoWriter {
             NCLog.log("MediaUploadVideoWriter: \(error.localizedDescription)")
             completion(false)
         }
+    }
+
+    private struct WiredAudio {
+        let readerOutput: AVAssetReaderTrackOutput
+        let writerInput: AVAssetWriterInput
+        let pathName: String
+    }
+
+    /// Wire source audio. Matches Telegram's converter: decode PCM → encode AAC for MP4
+    /// (passthrough without a format hint is rejected and used to produce silent uploads).
+    private static func wireAudio(track audioTrack: AVAssetTrack,
+                                  reader: AVAssetReader,
+                                  writer: AVAssetWriter) -> WiredAudio? {
+        let formatHint = audioTrack.formatDescriptions.first.map { $0 as! CMFormatDescription }
+
+        // Optional fast path: copy compressed audio when MP4 accepts it with a format hint.
+        if let formatHint {
+            let passthrough = AVAssetWriterInput(mediaType: .audio,
+                                                 outputSettings: nil,
+                                                 sourceFormatHint: formatHint)
+            passthrough.expectsMediaDataInRealTime = false
+            if writer.canAdd(passthrough) {
+                let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+                output.alwaysCopiesSampleData = false
+                if reader.canAdd(output) {
+                    writer.add(passthrough)
+                    reader.add(output)
+                    return WiredAudio(readerOutput: output, writerInput: passthrough, pathName: "passthrough")
+                }
+            }
+        }
+
+        // Telegram-style fallback / primary path: Linear PCM → AAC.
+        var channels = 1
+        if let formatHint,
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatHint)?.pointee,
+           asbd.mChannelsPerFrame > 0 {
+            channels = Int(asbd.mChannelsPerFrame)
+        }
+        channels = max(1, min(2, channels))
+
+        var channelLayout = AudioChannelLayout()
+        channelLayout.mChannelLayoutTag = channels > 1
+            ? kAudioChannelLayoutTag_Stereo
+            : kAudioChannelLayoutTag_Mono
+        let channelLayoutData = withUnsafeBytes(of: &channelLayout) { Data($0) }
+
+        let aacSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 44_100.0,
+            AVNumberOfChannelsKey: channels,
+            AVEncoderBitRateKey: 128_000,
+            AVChannelLayoutKey: channelLayoutData
+        ]
+        let pcmSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        let aacInput = AVAssetWriterInput(mediaType: .audio, outputSettings: aacSettings)
+        aacInput.expectsMediaDataInRealTime = false
+        guard writer.canAdd(aacInput) else { return nil }
+        let pcmOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: pcmSettings)
+        pcmOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(pcmOutput) else { return nil }
+        writer.add(aacInput)
+        reader.add(pcmOutput)
+        return WiredAudio(readerOutput: pcmOutput, writerInput: aacInput, pathName: "aac")
     }
 
     /// Location + creation date (and light camera identity) from the source movie.
@@ -410,7 +511,12 @@ enum MediaUploadVideoWriter {
                     || item.stringValue != nil
                     || item.dateValue != nil else { return }
             seen.insert(id)
-            result.append(item)
+            // Mutable copies are safer for AVAssetWriter than handing it live asset items.
+            if let copy = item.mutableCopy() as? AVMetadataItem {
+                result.append(copy)
+            } else {
+                result.append(item)
+            }
         }
 
         for item in asset.commonMetadata {

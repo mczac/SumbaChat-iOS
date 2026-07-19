@@ -693,6 +693,7 @@ import UniformTypeIdentifiers
                 let asset = AVURLAsset(url: sourceURL, options: [
                     AVURLAssetPreferPreciseDurationAndTimingKey: false
                 ])
+                let sourceHasAudio = MediaUploadVideoIntegrity.assetHasAudioTrack(at: sourceURL)
 
                 guard let exportSession = AVAssetExportSession(asset: asset, presetName: settings.avVideoPreset) else {
                     NCLog.log("MediaUploadPreprocessor: unable to create export session")
@@ -709,7 +710,8 @@ import UniformTypeIdentifiers
                 exportSession.outputURL = destinationURL
                 exportSession.outputFileType = .mp4
                 exportSession.shouldOptimizeForNetworkUse = true
-                // Default already keeps source metadata; do not apply forSharing (that strips location).
+                // Default copies source metadata (incl. GPS / creation date).
+                // Never use forSharing — that filter strips location.
                 exportSession.metadataItemFilter = nil
 
                 final class ProgressPollState: @unchecked Sendable {
@@ -766,15 +768,24 @@ import UniformTypeIdentifiers
                                 completion(false)
                                 return
                             }
+                            if sourceHasAudio,
+                               !MediaUploadVideoIntegrity.outputHasAudioTrack(at: destinationURL) {
+                                try? FileManager.default.removeItem(at: destinationURL)
+                                MediaUploadTrace.log("ENCODE video FAIL \(sourceName) engine=ExportSession missing-audio")
+                                NCLog.log("MediaUploadPreprocessor: ExportSession output missing audio track")
+                                completion(false)
+                                return
+                            }
 
                             let srcMbps = duration > 0 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: sourceSize, durationSeconds: duration) : 0
                             let outMbps = duration > 0 ? MediaUploadDebugSettings.approximateSourceTotalMbps(fileBytes: compressedSize, durationSeconds: duration) : 0
                             MediaUploadTrace.logSync(String(format:
-                                "ENCODE video ACTUAL %@ %@ (%.3fMbps) → %@ (%.3fMbps) engine=ExportSession preset=%@",
+                                "ENCODE video ACTUAL %@ %@ (%.3fMbps) → %@ (%.3fMbps) engine=ExportSession preset=%@ audio=%@",
                                 sourceName,
                                 MediaUploadTrace.mb(sourceSize), srcMbps,
                                 MediaUploadTrace.mb(compressedSize), outMbps,
-                                presetName))
+                                presetName,
+                                sourceHasAudio ? "yes" : "none"))
                             completion(true)
                         case .failed, .cancelled:
                             MediaUploadTrace.log("ENCODE video FAIL \(sourceName) engine=ExportSession \(errorDescription ?? "unknown")")
