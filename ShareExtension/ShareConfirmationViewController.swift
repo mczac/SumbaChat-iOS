@@ -1527,13 +1527,19 @@ import AVFoundation
         self.updateCompressionOptionsUI()
     }
 
-    private var progressAlertStyle: MediaUploadProgressAlert.Style {
-        // Share Extension: branded bottom card (logo + name) over Photos.
-        // In-app: simple centered progress — already inside SumbaChat.
-        if isAppExtensionProcess, !composeDismissedForUpload, progressHostView == nil {
-            return .bottomCompactBranded
+    private func progressAlertStyle(for phase: UploadHUDPhase) -> MediaUploadProgressAlert.Style {
+        switch phase {
+        case .loadingMedia:
+            // Always centered. The branded bottom card is Send-path only — using it during
+            // staging looked like a leftover "Uploading…" sheet from a prior share session.
+            return .centeredAlert
+        case .preparing, .uploading:
+            // Share Extension: branded bottom card over Photos. In-app: centered on chat/compose.
+            if isAppExtensionProcess, !composeDismissedForUpload, progressHostView == nil {
+                return .bottomCompactBranded
+            }
+            return .centeredAlert
         }
-        return .centeredAlert
     }
 
     private func showProgressAlert(phase: UploadHUDPhase, progress: Float?, indeterminate: Bool) {
@@ -1542,7 +1548,7 @@ import AVFoundation
         lastProgressIndeterminate = indeterminate
 
         let host = progressAlertHostView
-        let style = progressAlertStyle
+        let style = progressAlertStyle(for: phase)
         let alert: MediaUploadProgressAlert
         if let existing = self.progressAlert, existing.style == style {
             alert = existing
@@ -1550,11 +1556,18 @@ import AVFoundation
         } else {
             self.progressAlert?.dismiss(animated: false)
             alert = MediaUploadProgressAlert(style: style)
-            alert.onCancel = { [weak self] in
-                self?.cancelUploadAndReturnToCompose()
-            }
             self.progressAlert = alert
             alert.present(on: host, animated: true)
+        }
+
+        alert.onCancel = { [weak self] in
+            guard let self else { return }
+            if case .loadingMedia = self.lastProgressPhase {
+                // Abandon pick/staging — same as nav Cancel (no prepare/upload in flight yet).
+                self.leaveShareFlow(reason: "loading-cancel")
+            } else {
+                self.cancelUploadAndReturnToCompose()
+            }
         }
 
         alert.update(title: phase.title,
@@ -2705,11 +2718,13 @@ import AVFoundation
             return
         }
 
-        // Staging must not use the branded upload card — it sits on top of compose and
-        // looks like a leftover "Uploading…" sheet from the previous share session.
-        // Compression chips already show "–" until sizes are ready.
-        if self.progressAlert != nil, !self.isInSendProgressMode {
-            self.hideProgressAlert(animated: false)
+        if self.shareItemController.isBusyLoadingMedia {
+            // Centered "Loading media…" (not the branded Send card).
+            self.showProgressAlert(phase: .loadingMedia, progress: nil, indeterminate: true)
+        } else if self.progressAlert != nil, !self.isInSendProgressMode {
+            // Load/staging finished — dismiss whether or not items appeared.
+            // Also clears a warm-extension leftover if somehow still attached.
+            self.hideProgressAlert(animated: true)
         }
 
         self.updateSendButtonEnabledState()
