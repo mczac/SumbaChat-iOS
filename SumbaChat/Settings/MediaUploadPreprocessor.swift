@@ -323,7 +323,7 @@ import UniformTypeIdentifiers
             .appendingPathComponent(".\(UUID().uuidString).\(destinationURL.lastPathComponent)")
 
         do {
-            // Prefer ImageIO downsample → JPEG (orientation baked in, no GPS/EXIF baggage).
+            // Prefer ImageIO downsample → JPEG (orientation baked in; GPS + capture dates preserved).
             let wroteImageIO = writeDownsampledJPEG(from: sourceURL,
                                                     to: tempURL,
                                                     maxDimension: settings.imageMaxDimension,
@@ -339,12 +339,20 @@ import UniformTypeIdentifiers
                     NCLog.log("MediaUploadPreprocessor: failed to decode image for compression at \(sourceURL.lastPathComponent)")
                     return false
                 }
-                guard let jpegData = compressedJPEGData(from: image, settings: settings), !jpegData.isEmpty else {
-                    NCLog.log("MediaUploadPreprocessor: JPEG encode produced empty data for \(sourceURL.lastPathComponent)")
-                    return false
+                // Prefer ImageIO so we can re-attach GPS / capture dates from the source file.
+                if writeJPEG(from: image,
+                             preservingMetadataFrom: sourceURL,
+                             to: tempURL,
+                             quality: settings.imageJPEGQuality) {
+                    encodePath = "UIImage+ImageIO"
+                } else {
+                    guard let jpegData = compressedJPEGData(from: image, settings: settings), !jpegData.isEmpty else {
+                        NCLog.log("MediaUploadPreprocessor: JPEG encode produced empty data for \(sourceURL.lastPathComponent)")
+                        return false
+                    }
+                    try jpegData.write(to: tempURL, options: .atomic)
+                    encodePath = "jpegData"
                 }
-                try jpegData.write(to: tempURL, options: .atomic)
-                encodePath = "jpegData"
             }
 
             let written = fileSize(at: tempURL)
@@ -415,7 +423,7 @@ import UniformTypeIdentifiers
         return aNum == bNum && aDev == bDev
     }
 
-    /// ImageIO thumbnail + JPEG destination (strips GPS / bulky metadata; applies orientation).
+    /// ImageIO thumbnail + JPEG destination (orientation baked in; GPS + capture dates preserved).
     /// Caller must pass a temp URL — Finalize is not crash-atomic.
     private static func writeDownsampledJPEG(from sourceURL: URL,
                                              to destinationURL: URL,
@@ -437,21 +445,143 @@ import UniformTypeIdentifiers
             return false
         }
 
+        return finalizeJPEG(cgImage: cgImage,
+                            source: source,
+                            to: destinationURL,
+                            quality: quality)
+    }
+
+    /// UIImage fallback that still copies GPS / capture dates from the original file when possible.
+    private static func writeJPEG(from image: UIImage,
+                                  preservingMetadataFrom sourceURL: URL,
+                                  to destinationURL: URL,
+                                  quality: CGFloat) -> Bool {
+        let drawn: UIImage
+        if image.imageOrientation == .up {
+            drawn = image
+        } else {
+            let format = UIGraphicsImageRendererFormat.default()
+            format.scale = image.scale
+            format.opaque = false
+            drawn = UIGraphicsImageRenderer(size: image.size, format: format).image { _ in
+                image.draw(in: CGRect(origin: .zero, size: image.size))
+            }
+        }
+        guard let cgImage = drawn.cgImage else { return false }
+
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, sourceOptions) else {
+            return false
+        }
+        return finalizeJPEG(cgImage: cgImage,
+                            source: source,
+                            to: destinationURL,
+                            quality: quality)
+    }
+
+    private static func finalizeJPEG(cgImage: CGImage,
+                                     source: CGImageSource,
+                                     to destinationURL: URL,
+                                     quality: CGFloat) -> Bool {
         guard let dest = CGImageDestinationCreateWithURL(destinationURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
             return false
         }
 
         let q = min(1, max(0.01, quality))
-        let properties: [CFString: Any] = [
-            kCGImageDestinationLossyCompressionQuality: q
-        ]
-        // Do not copy source properties — drops GPS / large EXIF; orientation already applied via transform.
+        let properties = jpegPropertiesPreservingCaptureMetadata(
+            from: source,
+            quality: q,
+            pixelWidth: cgImage.width,
+            pixelHeight: cgImage.height
+        )
         CGImageDestinationAddImage(dest, cgImage, properties as CFDictionary)
         let ok = CGImageDestinationFinalize(dest)
         if !ok {
             try? FileManager.default.removeItem(at: destinationURL)
         }
         return ok
+    }
+
+    /// Keeps GPS and capture timestamps (plus light camera identity). Orientation is reset to `.up`
+    /// because pixels are already transformed. Bulky MakerNote / XMP packets are not copied.
+    private static func jpegPropertiesPreservingCaptureMetadata(from source: CGImageSource,
+                                                                quality: CGFloat,
+                                                                pixelWidth: Int,
+                                                                pixelHeight: Int) -> [CFString: Any] {
+        var properties: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: quality,
+            kCGImagePropertyOrientation: 1
+        ]
+
+        guard let sourceProps = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else {
+            return properties
+        }
+
+        if let gps = sourceProps[kCGImagePropertyGPSDictionary] {
+            properties[kCGImagePropertyGPSDictionary] = gps
+        }
+
+        if let exif = sourceProps[kCGImagePropertyExifDictionary] as? [CFString: Any] {
+            var outExif: [CFString: Any] = [:]
+            let exifKeys: [CFString] = [
+                kCGImagePropertyExifDateTimeOriginal,
+                kCGImagePropertyExifDateTimeDigitized,
+                kCGImagePropertyExifSubsecTime,
+                kCGImagePropertyExifSubsecTimeOriginal,
+                kCGImagePropertyExifSubsecTimeDigitized,
+                kCGImagePropertyExifOffsetTime,
+                kCGImagePropertyExifOffsetTimeOriginal,
+                kCGImagePropertyExifOffsetTimeDigitized
+            ]
+            for key in exifKeys {
+                if let value = exif[key] {
+                    outExif[key] = value
+                }
+            }
+            outExif[kCGImagePropertyExifPixelXDimension] = pixelWidth
+            outExif[kCGImagePropertyExifPixelYDimension] = pixelHeight
+            if !outExif.isEmpty {
+                properties[kCGImagePropertyExifDictionary] = outExif
+            }
+        }
+
+        if let tiff = sourceProps[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
+            var outTiff: [CFString: Any] = [:]
+            let tiffKeys: [CFString] = [
+                kCGImagePropertyTIFFDateTime,
+                kCGImagePropertyTIFFMake,
+                kCGImagePropertyTIFFModel
+            ]
+            for key in tiffKeys {
+                if let value = tiff[key] {
+                    outTiff[key] = value
+                }
+            }
+            outTiff[kCGImagePropertyTIFFOrientation] = 1
+            if !outTiff.isEmpty {
+                properties[kCGImagePropertyTIFFDictionary] = outTiff
+            }
+        }
+
+        if let iptc = sourceProps[kCGImagePropertyIPTCDictionary] as? [CFString: Any] {
+            var outIptc: [CFString: Any] = [:]
+            let iptcKeys: [CFString] = [
+                kCGImagePropertyIPTCDateCreated,
+                kCGImagePropertyIPTCTimeCreated,
+                kCGImagePropertyIPTCDigitalCreationDate,
+                kCGImagePropertyIPTCDigitalCreationTime
+            ]
+            for key in iptcKeys {
+                if let value = iptc[key] {
+                    outIptc[key] = value
+                }
+            }
+            if !outIptc.isEmpty {
+                properties[kCGImagePropertyIPTCDictionary] = outIptc
+            }
+        }
+
+        return properties
     }
 
     @objc(compressedJPEGDataFromImage:settings:)

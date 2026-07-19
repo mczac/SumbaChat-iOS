@@ -86,7 +86,7 @@ final class MediaUploadCompressionAlgoViewController: UIViewController {
     // Prefer ImageIO thumbnail + JPEG destination
     //   maxEdge = imageMaxDimension
     //   quality = imageJPEGQuality (0…100 → 0…1)
-    //   orientation via transform; GPS / bulky EXIF stripped
+    //   orientation via transform; GPS + capture dates preserved (MakerNote not copied)
     // Fallback: UIImage → jpegData(compressionQuality:)
     // Skip GIF; skip if unlikely to shrink
     // Convert-cache key = content fingerprint + profile

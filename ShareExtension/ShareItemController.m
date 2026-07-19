@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#import <ImageIO/ImageIO.h>
 #import <MobileCoreServices/MobileCoreServices.h>
 
 #import "ShareItemController.h"
@@ -570,10 +571,25 @@
                     [loadSelf addItemWithImage:(UIImage *)item];
                     finish(YES);
                 } else if ([(NSObject *)item isKindOfClass:[NSData class]]) {
-                    UIImage *fromData = [UIImage imageWithData:(NSData *)item];
-                    if (fromData) {
-                        [NCLog log:@"ShareItemController: image fallback staged via loadItem NSData"];
-                        [loadSelf addItemWithImage:fromData];
+                    // Write container bytes as-is so GPS / EXIF survive (UIImage round-trip strips them).
+                    NSData *imageData = (NSData *)item;
+                    if (imageData.length > 0 && [UIImage imageWithData:imageData] != nil) {
+                        NSString *ext = @"jpg";
+                        CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)imageData, NULL);
+                        if (src) {
+                            CFStringRef uti = CGImageSourceGetType(src);
+                            if (uti) {
+                                CFStringRef tag = UTTypeCopyPreferredTagWithClass(uti, kUTTagClassFilenameExtension);
+                                if (tag) {
+                                    ext = (__bridge_transfer NSString *)tag;
+                                }
+                            }
+                            CFRelease(src);
+                        }
+                        NSString *name = [NSString stringWithFormat:@"IMG_%.f.%@",
+                                          [[NSDate date] timeIntervalSince1970] * 1000, ext];
+                        [NCLog log:@"ShareItemController: image fallback staged via loadItem NSData (preserving metadata)"];
+                        [loadSelf addItemWithImageDataAndName:imageData withName:name];
                         finish(YES);
                     } else {
                         [NCLog log:@"ShareItemController: image fallback NSData could not decode"];
