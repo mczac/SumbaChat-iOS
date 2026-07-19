@@ -3003,6 +3003,7 @@ class NCAPIController: NSObject, NKCommonDelegate {
                 <d:getcontenttype />\
                 <d:resourcetype />\
                 <fileid xmlns=\"http://owncloud.org/ns\"/>\
+                <size xmlns=\"http://owncloud.org/ns\"/>\
                 <is-encrypted xmlns=\"http://nextcloud.org/ns\"/>\
                 <has-preview xmlns=\"http://nextcloud.org/ns\"/>\
             </d:prop>\

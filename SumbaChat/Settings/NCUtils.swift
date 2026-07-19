@@ -80,6 +80,16 @@ import AVFoundation
         return self.previewImage(forMimeType: fileType) == "file-audio"
     }
 
+    /// Office docs, PDF, text, spreadsheets, presentations (not images/video/audio).
+    public static func isDocument(fileType: String) -> Bool {
+        switch self.previewImage(forMimeType: fileType) {
+        case "file-document", "file-pdf", "file-text", "file-spreadsheet", "file-presentation":
+            return true
+        default:
+            return false
+        }
+    }
+
     public static func isVCard(fileType: String) -> Bool {
         return self.previewImage(forMimeType: fileType) == "file-vcard"
     }
@@ -220,6 +230,27 @@ import AVFoundation
         dateFormatter.timeStyle = .short
 
         return dateFormatter.string(from: date)
+    }
+
+    /// Compact file size for list subtitles (e.g. "4.1 MB").
+    public static func readableFileSize(_ byteCount: Int64) -> String {
+        guard byteCount > 0 else { return "" }
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
+        formatter.countStyle = .file
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: byteCount)
+    }
+
+    /// Subtitle like "4.1 MB · 2 hours ago" (size omitted when unknown / zero).
+    public static func fileListSubtitle(size: Int64, date: Date) -> String {
+        let time = relativeTimeFromDate(date: date)
+        let sizeText = readableFileSize(size)
+        if sizeText.isEmpty {
+            return time
+        }
+        return "\(sizeText) · \(time)"
     }
 
     public static func relativeTimeFromDate(date: Date) -> String {

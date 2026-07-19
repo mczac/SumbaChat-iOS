@@ -13,13 +13,26 @@ import Foundation
 
     public static var identifier = "DirectoryCellIdentifier"
     public static var nibName = "DirectoryTableViewCell"
-    public static var cellHeight = 60.0
+    /// Comfortable two-line row; scales a bit with Dynamic Type via preferred fonts.
+    public static var cellHeight = 68.0
 
     public var fileParameter: NCMessageFileParameter?
     internal var activityIndicator: MDCActivityIndicator?
 
     public override func awakeFromNib() {
         super.awakeFromNib()
+
+        // Keep the extension visible on long names.
+        fileNameLabel?.lineBreakMode = .byTruncatingMiddle
+        fileNameLabel?.numberOfLines = 1
+        fileNameLabel?.font = .preferredFont(forTextStyle: .body)
+        fileNameLabel?.adjustsFontForContentSizeCategory = true
+
+        fileInfoLabel?.lineBreakMode = .byTruncatingTail
+        fileInfoLabel?.numberOfLines = 1
+        fileInfoLabel?.font = .preferredFont(forTextStyle: .caption1)
+        fileInfoLabel?.adjustsFontForContentSizeCategory = true
+        fileInfoLabel?.textColor = .secondaryLabel
 
         NotificationCenter.default.addObserver(self, selector: #selector(didChangeIsDownloading(notification:)), name: NSNotification.Name.NCChatFileControllerDidChangeIsDownloading, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(didChangeDownloadProgress(notification:)), name: NSNotification.Name.NCChatFileControllerDidChangeDownloadProgress, object: nil)

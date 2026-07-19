@@ -50,6 +50,7 @@ Pull requests should stay SwiftLint-clean.
 - Calls: request mic/camera before join; refresh local media if permission is granted mid-call
 - Dedicated push proxies (via `NCAppBrandingLocal.h`) and system-announcement notification chrome
 - Media viewer: start muted with an on-screen mute control
+- SumbaFiles chooser: type filter (All / Video / Audio / Documents), search by name, middle-truncated filenames, and size · relative date in each row
 
 See also [docs/notifications.md](docs/notifications.md) and [docs/local-modifications/media-upload-compression.md](docs/local-modifications/media-upload-compression.md).
 

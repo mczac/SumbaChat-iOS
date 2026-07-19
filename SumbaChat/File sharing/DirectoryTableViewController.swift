@@ -6,22 +6,63 @@
 import UIKit
 import NextcloudKit
 
-class DirectoryTableViewController: UITableViewController {
+class DirectoryTableViewController: UITableViewController, UISearchResultsUpdating {
+
+    private enum FileTypeFilter: Int {
+        case all
+        case video
+        case audio
+        case documents
+
+        var title: String {
+            switch self {
+            case .all:
+                return NSLocalizedString("All", comment: "File type filter: show all files")
+            case .video:
+                return NSLocalizedString("Video", comment: "File type filter: videos only")
+            case .audio:
+                return NSLocalizedString("Audio", comment: "File type filter: audio only")
+            case .documents:
+                return NSLocalizedString("Documents", comment: "File type filter: documents only")
+            }
+        }
+
+        var systemImageName: String {
+            switch self {
+            case .all:
+                return "square.grid.2x2"
+            case .video:
+                return "video"
+            case .audio:
+                return "waveform"
+            case .documents:
+                return "doc"
+            }
+        }
+    }
 
     private let path: String
     private let token: String
     private let threadId: Int
 
     private var userHomePath = ""
+    /// Full folder listing from the server (unfiltered).
+    private var allItemsInDirectory: [NKFile] = []
+    /// Sorted + type/name-filtered rows shown in the table.
     private var itemsInDirectory: [NKFile] = []
+    private var fileTypeFilter: FileTypeFilter
+    private var nameSearchText: String = ""
     private var sortingButton: UIBarButtonItem?
+    private var filterButton: UIBarButtonItem?
+    private var searchController: UISearchController!
     private let directoryBackgroundView = PlaceholderView()
     private let sharingFileView = UIActivityIndicatorView()
 
-    init(path: String, inRoom token: String, andThread threadId: Int) {
+    init(path: String, inRoom token: String, andThread threadId: Int, fileTypeFilter: FileTypeFilter = .all) {
         self.path = path
         self.token = token
         self.threadId = threadId
+        self.fileTypeFilter = fileTypeFilter
 
         super.init(style: .plain)
     }
@@ -36,6 +77,7 @@ class DirectoryTableViewController: UITableViewController {
         let activeAccount = NCDatabaseManager.sharedInstance().activeAccount()
         userHomePath = NCAPIController.sharedInstance().filesPath(forAccount: activeAccount)
 
+        configureSearchController()
         configureNavigationBar()
 
         if #available(iOS 26.0, *) {
@@ -79,19 +121,44 @@ class DirectoryTableViewController: UITableViewController {
 
         let alphabeticalAction = UIAction(title: NSLocalizedString("Alphabetical order", comment: ""), image: UIImage(systemName: "character.square")) { [weak self] _ in
             NCSettingsController.sharedInstance().setPreferredFileSorting(.alphabeticalSorting)
-            self?.sortItemsInDirectory()
+            self?.applyFilterAndSort()
         }
 
         alphabeticalAction.state = preferredSorting == .alphabeticalSorting ? .on : .off
 
         let modificationDateAction = UIAction(title: NSLocalizedString("Modification date", comment: ""), image: UIImage(systemName: "clock")) { [weak self] _ in
             NCSettingsController.sharedInstance().setPreferredFileSorting(.modificationDateSorting)
-            self?.sortItemsInDirectory()
+            self?.applyFilterAndSort()
         }
 
         modificationDateAction.state = preferredSorting == .modificationDateSorting ? .on : .off
 
         sortingButton?.menu = UIMenu(children: [alphabeticalAction, modificationDateAction])
+    }
+
+    private func addMenuToFilterButton() {
+        let filters: [FileTypeFilter] = [.all, .video, .audio, .documents]
+        let actions = filters.map { filter -> UIAction in
+            let action = UIAction(title: filter.title, image: UIImage(systemName: filter.systemImageName)) { [weak self] _ in
+                guard let self, self.fileTypeFilter != filter else { return }
+                self.fileTypeFilter = filter
+                self.applyFilterAndSort()
+                self.updateFilterButtonAppearance()
+            }
+            action.state = fileTypeFilter == filter ? .on : .off
+            return action
+        }
+        filterButton?.menu = UIMenu(title: NSLocalizedString("Filter", comment: "File browser type filter menu"),
+                                    children: actions)
+    }
+
+    private func updateFilterButtonAppearance() {
+        let imageName = fileTypeFilter == .all
+            ? "line.3.horizontal.decrease.circle"
+            : "line.3.horizontal.decrease.circle.fill"
+        filterButton?.image = UIImage(systemName: imageName)
+        filterButton?.accessibilityLabel = NSLocalizedString("Filter files", comment: "")
+        addMenuToFilterButton()
     }
 
     // MARK: - Files
@@ -118,24 +185,63 @@ class DirectoryTableViewController: UITableViewController {
                 }
             }
 
-            self.itemsInDirectory = itemsInDirectory
-            self.sortItemsInDirectory()
+            self.allItemsInDirectory = itemsInDirectory
+            self.applyFilterAndSort()
 
             self.directoryBackgroundView.loadingView.stopAnimating()
             self.directoryBackgroundView.loadingView.isHidden = true
-            self.directoryBackgroundView.placeholderView.isHidden = !itemsInDirectory.isEmpty
+            self.updatePlaceholderVisibility()
         }
     }
 
-    private func sortItemsInDirectory() {
-        if NCSettingsController.sharedInstance().getPreferredFileSorting() == .alphabeticalSorting {
-            itemsInDirectory.sort { $0.fileName.localizedCaseInsensitiveCompare($1.fileName) == .orderedAscending }
-        } else {
-            itemsInDirectory.sort { ($0.date as Date) > ($1.date as Date) }
+    private func applyFilterAndSort() {
+        let query = nameSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var filtered = allItemsInDirectory.filter { item in
+            if !query.isEmpty,
+               item.fileName.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) == nil {
+                return false
+            }
+
+            // Folders stay visible for navigation (unless excluded by name search above).
+            if item.directory {
+                return true
+            }
+
+            switch fileTypeFilter {
+            case .all:
+                return true
+            case .video:
+                return NCUtils.isVideo(fileType: item.contentType)
+            case .audio:
+                return NCUtils.isAudio(fileType: item.contentType)
+            case .documents:
+                return NCUtils.isDocument(fileType: item.contentType)
+            }
         }
 
+        if NCSettingsController.sharedInstance().getPreferredFileSorting() == .alphabeticalSorting {
+            filtered.sort { $0.fileName.localizedCaseInsensitiveCompare($1.fileName) == .orderedAscending }
+        } else {
+            filtered.sort { ($0.date as Date) > ($1.date as Date) }
+        }
+
+        itemsInDirectory = filtered
         addMenuToSortingButton()
-        self.tableView.reloadData()
+        addMenuToFilterButton()
+        updatePlaceholderVisibility()
+        tableView.reloadData()
+    }
+
+    private func updatePlaceholderVisibility() {
+        let hasRows = !itemsInDirectory.isEmpty
+        directoryBackgroundView.placeholderView.isHidden = hasRows
+        let hasNameQuery = !nameSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if fileTypeFilter == .all && !hasNameQuery {
+            directoryBackgroundView.placeholderTextView.text = NSLocalizedString("No files in here", comment: "")
+        } else {
+            directoryBackgroundView.placeholderTextView.text = NSLocalizedString("No matching files", comment: "")
+        }
     }
 
     private func shareFile(withPath path: String) {
@@ -161,16 +267,35 @@ class DirectoryTableViewController: UITableViewController {
 
     // MARK: - Utils
 
+    private func configureSearchController() {
+        let searchController = UISearchController(searchResultsController: nil)
+        searchController.searchResultsUpdater = self
+        searchController.obscuresBackgroundDuringPresentation = false
+        searchController.hidesNavigationBarDuringPresentation = false
+        searchController.searchBar.placeholder = NSLocalizedString("Search by name", comment: "SumbaFiles browser search placeholder")
+        searchController.searchBar.autocapitalizationType = .none
+        self.searchController = searchController
+        self.navigationItem.searchController = searchController
+        self.navigationItem.preferredSearchBarPlacement = .stacked
+        self.definesPresentationContext = true
+    }
+
     private func configureNavigationBar() {
-        // Sorting button
         let sortingButton = UIBarButtonItem(image: UIImage(systemName: "arrow.up.arrow.down"), style: .plain, target: self, action: nil)
         self.sortingButton = sortingButton
         addMenuToSortingButton()
 
+        let filterButton = UIBarButtonItem(image: UIImage(systemName: "line.3.horizontal.decrease.circle"), style: .plain, target: self, action: nil)
+        self.filterButton = filterButton
+        updateFilterButtonAppearance()
+
+        // Keep search attached across sharing-spinner resets of the right bar items.
+        self.navigationItem.searchController = searchController
+
         // Home folder
         if path.isEmpty {
             self.navigationItem.leftBarButtonItem = UIBarButtonItem(barButtonSystemItem: .cancel, target: self, action: #selector(cancelButtonPressed))
-            self.navigationItem.rightBarButtonItem = sortingButton
+            self.navigationItem.rightBarButtonItems = [sortingButton, filterButton]
 
             let navigationLogo = UIImage(systemName: "house")
             let navigationImageView = UIImageView(image: navigationLogo)
@@ -186,10 +311,17 @@ class DirectoryTableViewController: UITableViewController {
             // Other directories
         } else {
             let shareButton = UIBarButtonItem(image: UIImage(named: "sharing"), style: .plain, target: self, action: #selector(shareButtonPressed))
-            self.navigationItem.rightBarButtonItems = [sortingButton, shareButton]
+            self.navigationItem.rightBarButtonItems = [sortingButton, filterButton, shareButton]
 
             self.navigationItem.title = (path as NSString).lastPathComponent
         }
+    }
+
+    // MARK: - UISearchResultsUpdating
+
+    func updateSearchResults(for searchController: UISearchController) {
+        nameSearchText = searchController.searchBar.text ?? ""
+        applyFilterAndSort()
     }
 
     private func setSharingFileUI() {
@@ -244,9 +376,13 @@ class DirectoryTableViewController: UITableViewController {
         let cell = tableView.dequeueReusableCell(withIdentifier: DirectoryTableViewCell.identifier) as? DirectoryTableViewCell ??
                    DirectoryTableViewCell(style: .default, reuseIdentifier: DirectoryTableViewCell.identifier)
 
-        // Name and modification date
+        // Name (middle-truncated in the cell) + size · relative date
         cell.fileNameLabel.text = item.fileName
-        cell.fileInfoLabel.text = NCUtils.relativeTimeFromDate(date: item.date as Date)
+        if item.directory {
+            cell.fileInfoLabel.text = NCUtils.relativeTimeFromDate(date: item.date as Date)
+        } else {
+            cell.fileInfoLabel.text = NCUtils.fileListSubtitle(size: item.size, date: item.date as Date)
+        }
 
         // Icon or preview
         if item.directory {
@@ -268,7 +404,10 @@ class DirectoryTableViewController: UITableViewController {
         let selectedItemPath = "\(path)/\(item.fileName)"
 
         if item.directory {
-            let directoryVC = DirectoryTableViewController(path: selectedItemPath, inRoom: token, andThread: threadId)
+            let directoryVC = DirectoryTableViewController(path: selectedItemPath,
+                                                           inRoom: token,
+                                                           andThread: threadId,
+                                                           fileTypeFilter: fileTypeFilter)
             self.navigationController?.pushViewController(directoryVC, animated: true)
         } else {
             showConfirmationDialogForSharingItem(withPath: selectedItemPath, andName: item.fileName)
