@@ -210,32 +210,10 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
     }
 
     private func setNavigationLogoButton() {
-        // sumbaLoginLogo is ~180pt intrinsically. iOS 26 Liquid Glass titleView uses that
-        // size when only `bounds` is set — the mark fills the top of the rooms list.
-        let side: CGFloat = 28
-        let logoImageView = UIImageView(image: NCAppBranding.navigationLogoImage())
-        logoImageView.contentMode = .scaleAspectFit
-        logoImageView.translatesAutoresizingMaskIntoConstraints = false
-
-        if #available(iOS 26.0, *) {
-            // Clear glass chrome — brand the centered mark instead of the + button.
-            logoImageView.tintColor = NCAppBranding.elementColor()
-        } else {
-            logoImageView.tintColor = NCAppBranding.themeTextColor()
-        }
-
-        let container = UIView(frame: CGRect(x: 0, y: 0, width: side, height: side))
-        container.addSubview(logoImageView)
-        NSLayoutConstraint.activate([
-            logoImageView.widthAnchor.constraint(equalToConstant: side),
-            logoImageView.heightAnchor.constraint(equalToConstant: side),
-            logoImageView.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-            logoImageView.centerYAnchor.constraint(equalTo: container.centerYAnchor)
-        ])
-        container.isAccessibilityElement = true
-        container.accessibilityLabel = talkAppName
-
-        self.navigationItem.titleView = container
+        let titleView = RoomsNavigationLogoTitleView(side: 30, logoInset: 6)
+        titleView.isAccessibilityElement = true
+        titleView.accessibilityLabel = talkAppName
+        self.navigationItem.titleView = titleView
     }
 
     private func configureRightBarButtonItems() {
@@ -2141,6 +2119,83 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
                     self.tableView.reloadRows(at: [selectedRow], with: .none)
                 }
             }
+        }
+    }
+}
+
+/// Rooms list nav logo: circular badge + template mark. Updates with light/dark on iOS 26+.
+private final class RoomsNavigationLogoTitleView: UIView {
+
+    private let circleView = UIView()
+    private let logoImageView = UIImageView()
+    private let side: CGFloat
+    private let logoInset: CGFloat
+
+    init(side: CGFloat, logoInset: CGFloat) {
+        self.side = side
+        self.logoInset = logoInset
+        super.init(frame: CGRect(x: 0, y: 0, width: side, height: side))
+
+        circleView.translatesAutoresizingMaskIntoConstraints = false
+        circleView.layer.cornerRadius = side / 2
+        circleView.clipsToBounds = true
+
+        logoImageView.image = NCAppBranding.navigationLogoImage()
+        logoImageView.contentMode = .scaleAspectFit
+        logoImageView.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(circleView)
+        circleView.addSubview(logoImageView)
+
+        let logoSide = side - (logoInset * 2)
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: side),
+            heightAnchor.constraint(equalToConstant: side),
+
+            circleView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            circleView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            circleView.topAnchor.constraint(equalTo: topAnchor),
+            circleView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            logoImageView.widthAnchor.constraint(equalToConstant: logoSide),
+            logoImageView.heightAnchor.constraint(equalToConstant: logoSide),
+            logoImageView.centerXAnchor.constraint(equalTo: circleView.centerXAnchor),
+            logoImageView.centerYAnchor.constraint(equalTo: circleView.centerYAnchor)
+        ])
+
+        applyChrome()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: side, height: side)
+    }
+
+    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        if traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) {
+            applyChrome()
+        }
+    }
+
+    private func applyChrome() {
+        let brandBlue = NCAppBranding.brandColor()
+        if #available(iOS 26.0, *) {
+            // Glass chrome: invert badge vs mark by appearance.
+            if traitCollection.userInterfaceStyle == .dark {
+                circleView.backgroundColor = .white
+                logoImageView.tintColor = brandBlue
+            } else {
+                circleView.backgroundColor = brandBlue
+                logoImageView.tintColor = .white
+            }
+        } else {
+            // Themed blue nav bar — white badge, blue mark.
+            circleView.backgroundColor = .white
+            logoImageView.tintColor = brandBlue
         }
     }
 }

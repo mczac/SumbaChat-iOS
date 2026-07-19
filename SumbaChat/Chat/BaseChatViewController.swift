@@ -411,7 +411,7 @@ import Toast
         super.didChangeKeyboardStatus(status)
 
         switch status {
-        case .willShow, .didShow, .willHide, .didHide:
+        case .willShow, .didShow:
             // Insets finish updating in the keyboard animation/layout pass — pin afterward.
             if wasNearBottom {
                 DispatchQueue.main.async { [weak self] in
@@ -421,6 +421,17 @@ import Toast
                 }
             } else {
                 self.updateToolbar(animated: false)
+            }
+        case .willHide, .didHide:
+            // Animate the pin so interactive dismiss doesn't hard-jump after the keyboard eases down.
+            if wasNearBottom {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.tableView?.slk_scrollToBottom(animated: true)
+                    self.updateToolbar(animated: true)
+                }
+            } else {
+                self.updateToolbar(animated: true)
             }
         @unknown default:
             break

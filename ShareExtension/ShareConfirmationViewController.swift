@@ -291,7 +291,8 @@ import AVFoundation
         let button = UIButton(type: .custom)
         let image = UIImage(systemName: systemName)?.withRenderingMode(.alwaysTemplate)
         button.setImage(image, for: .normal)
-        button.tintColor = NCAppBranding.themeColor()
+        // System label — black in light / white in dark (not brand template blue).
+        button.tintColor = .label
         button.backgroundColor = .clear
         button.adjustsImageWhenHighlighted = false
         button.translatesAutoresizingMaskIntoConstraints = false
@@ -2134,9 +2135,8 @@ import AVFoundation
         // Sequential staging briefly has count==1 then count==N; dimming trash for that window
         // reads as a blink when the first preview appears. Keep trash at full opacity always —
         // `removeItemButtonPressed` already no-ops when only one item remains.
-        let brand = NCAppBranding.themeColor()
         UIView.performWithoutAnimation {
-            self.removeItemButton.tintColor = brand
+            self.removeItemButton.tintColor = .label
             self.removeItemButton.alpha = 1.0
             self.removeItemButton.isUserInteractionEnabled = true
         }
@@ -2159,11 +2159,11 @@ import AVFoundation
 
         // Dim via alpha only — never UIControl.isEnabled (iOS 26 glass makes icons vanish).
         UIView.performWithoutAnimation {
-            self.cropItemButton.tintColor = brand
+            self.cropItemButton.tintColor = .label
             self.cropItemButton.alpha = canCrop ? 1.0 : 0.35
             self.cropItemButton.isUserInteractionEnabled = canCrop
 
-            self.addItemButton.tintColor = brand
+            self.addItemButton.tintColor = .label
             self.addItemButton.alpha = canAdd ? 1.0 : 0.35
             self.addItemButton.isUserInteractionEnabled = canAdd
         }
