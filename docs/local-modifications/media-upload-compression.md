@@ -77,6 +77,10 @@ visible on white previews.
 
 Unchanged (GIF skipped; pasted PNG data path unchanged).
 
+## Next (see also)
+
+See [next-features.md](next-features.md) — e.g. in-app Save to Photos that keeps GPS/EXIF.
+
 ## iOS 18 hardening (build 6+)
 
 - **Staging:** security-scoped access, copy (not move), sync copy before
