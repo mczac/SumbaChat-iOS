@@ -992,11 +992,9 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
             let displayName = activeAccount.userDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
             let user = activeAccount.user.trimmingCharacters(in: .whitespacesAndNewlines)
             cell.textLabel?.text = displayName.isEmpty ? user : displayName
-            cell.textLabel?.font = .preferredFont(forTextStyle: .body)
+            cell.textLabel?.font = .preferredFont(for: .title2, weight: .medium)
             cell.textLabel?.numberOfLines = 1
-            let host = activeAccount.server.replacingOccurrences(of: "https://", with: "")
-            cell.detailTextLabel?.text = host
-            cell.detailTextLabel?.font = .preferredFont(forTextStyle: .subheadline)
+            cell.detailTextLabel?.text = activeAccount.server.replacingOccurrences(of: "https://", with: "")
             cell.detailTextLabel?.numberOfLines = 1
             cell.detailTextLabel?.lineBreakMode = .byTruncatingMiddle
             // Always reserve a 60pt avatar slot so text doesn’t jump when the photo loads.

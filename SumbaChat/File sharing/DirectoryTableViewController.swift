@@ -153,12 +153,54 @@ class DirectoryTableViewController: UITableViewController, UISearchResultsUpdati
                                              isDirectory: true)
     }
 
+    private static let sortMenuSubtitleReserved = "\u{2007}"
+
+    /// Rounded tile so menu glyphs (e.g. `textformat.abc` on iOS 26) read as icons, not part of the title.
+    private static func sortMenuIcon(systemName: String) -> UIImage? {
+        let symbolConfig = UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+        guard let symbol = UIImage(systemName: systemName, withConfiguration: symbolConfig) else {
+            return UIImage(systemName: systemName)
+        }
+
+        let tileSize = CGSize(width: 28, height: 28)
+        let renderer = UIGraphicsImageRenderer(size: tileSize)
+        return renderer.image { _ in
+            let rect = CGRect(origin: .zero, size: tileSize)
+            UIColor.secondarySystemFill.setFill()
+            UIBezierPath(roundedRect: rect, cornerRadius: 7).fill()
+
+            let tinted = symbol.withTintColor(.label, renderingMode: .alwaysOriginal)
+            let drawRect = CGRect(
+                x: (tileSize.width - tinted.size.width) / 2,
+                y: (tileSize.height - tinted.size.height) / 2,
+                width: tinted.size.width,
+                height: tinted.size.height
+            )
+            tinted.draw(in: drawRect)
+        }
+    }
+
+    private func sortDirectionSubtitle(for sorting: NCPreferredFileSorting, ascending: Bool) -> String {
+        switch sorting {
+        case .alphabeticalSorting:
+            return ascending
+                ? NSLocalizedString("A to Z", comment: "File browser name sort: ascending")
+                : NSLocalizedString("Z to A", comment: "File browser name sort: descending")
+        case .modificationDateSorting:
+            return ascending
+                ? NSLocalizedString("Earliest first", comment: "File browser date sort: oldest first")
+                : NSLocalizedString("Latest first", comment: "File browser date sort: newest first")
+        @unknown default:
+            return Self.sortMenuSubtitleReserved
+        }
+    }
+
     private func addMenuToSortingButton() {
         let settings = NCSettingsController.sharedInstance()
         let preferredSorting = settings.getPreferredFileSorting()
         let ascending = settings.isPreferredFileSortingAscending()
 
-        // One row per criterion (icon always visible); tap again toggles direction via subtitle only.
+        // One row per criterion; tap again toggles direction via subtitle only.
         let criteria: [(sorting: NCPreferredFileSorting, title: String, image: String)] = [
             (.alphabeticalSorting,
              NSLocalizedString("Name", comment: "File browser sort criterion"),
@@ -170,26 +212,14 @@ class DirectoryTableViewController: UITableViewController, UISearchResultsUpdati
 
         let actions: [UIAction] = criteria.map { item in
             let isSelected = preferredSorting == item.sorting
-            let subtitle: String? = {
-                guard isSelected else { return nil }
-                switch item.sorting {
-                case .alphabeticalSorting:
-                    return ascending
-                        ? NSLocalizedString("A to Z", comment: "File browser name sort: ascending")
-                        : NSLocalizedString("Z to A", comment: "File browser name sort: descending")
-                case .modificationDateSorting:
-                    return ascending
-                        ? NSLocalizedString("Earliest first", comment: "File browser date sort: oldest first")
-                        : NSLocalizedString("Latest first", comment: "File browser date sort: newest first")
-                @unknown default:
-                    return nil
-                }
-            }()
+            let subtitle = isSelected
+                ? sortDirectionSubtitle(for: item.sorting, ascending: ascending)
+                : Self.sortMenuSubtitleReserved
 
             let action = UIAction(
                 title: item.title,
                 subtitle: subtitle,
-                image: UIImage(systemName: item.image),
+                image: Self.sortMenuIcon(systemName: item.image),
                 attributes: .keepsMenuPresented
             ) { [weak self] _ in
                 guard let self else { return }
