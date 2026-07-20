@@ -18,6 +18,13 @@ import SDWebImage
     // MARK: - Conversation avatars
 
     public func getAvatar(for room: NCRoom, with style: UIUserInterfaceStyle, completionBlock: @escaping (_ image: UIImage?) -> Void) -> SDWebImageCombinedOperation? {
+#if DEMO_SCREENSHOTS
+        if DemoScreenshotController.isDemoRoom(room),
+           let image = DemoScreenshotImageStore.roomAvatar(forToken: room.token, style: style) {
+            completionBlock(image)
+            return nil
+        }
+#endif
         if isRetiredRoom(room) {
             completionBlock(getDeletedUserAvatar(with: style))
             return nil

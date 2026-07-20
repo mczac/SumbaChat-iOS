@@ -635,6 +635,18 @@ import SwiftUI
 
         self.startObservingExpiredMessages()
 
+#if DEMO_SCREENSHOTS
+        if DemoScreenshotController.isDemoRoom(self.room), !self.hasReceiveInitialHistory {
+            self.hasRequestedInitialHistory = true
+            self.offlineMode = true
+            self.hasJoinedRoom = true
+            self.setOfflineFooterView()
+            self.checkRoomControlsAvailability()
+            self.chatController.getInitialChatHistoryForOfflineMode()
+            return
+        }
+#endif
+
         // Workaround for open conversations:
         // We can't get initial chat history until we join the conversation (since we are not a participant until then)
         // So for rooms that we don't know the last read message we wait until we join the room to get the initial chat history.
@@ -1359,6 +1371,12 @@ import SwiftUI
         if self.isVisible,
             notification.userInfo?["error"] != nil,
             let errorReason = notification.userInfo?["errorReason"] as? String {
+
+#if DEMO_SCREENSHOTS
+            if DemoScreenshotController.isDemoRoom(self.room) {
+                return
+            }
+#endif
 
             self.setOfflineMode()
             self.presentJoinError(errorReason)

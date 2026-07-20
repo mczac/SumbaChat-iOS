@@ -3691,6 +3691,12 @@ class NCAPIController: NSObject, NKCommonDelegate {
     @nonobjc
     @discardableResult
     public func getPreviewForFile(_ fileId: String, width: Int, height: Int, forAccount account: TalkAccount, completionBlock: @escaping (_ image: UIImage?, _ error: Error?) -> Void) -> SDWebImageCombinedOperation? {
+#if DEMO_SCREENSHOTS
+        if fileId.hasPrefix("demo-file-"), let image = DemoScreenshotImageStore.previewImage(forFileId: fileId) {
+            completionBlock(image, nil)
+            return nil
+        }
+#endif
         var urlString: String
 
         if width > 0 {

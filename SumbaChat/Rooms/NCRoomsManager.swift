@@ -146,6 +146,17 @@ class NCRoomsManager: NSObject, CallViewControllerDelegate {
     @objc(updateRoomsUpdatingUserStatus: onlyLastModified: withCompletionBlock:)
     public func updateRooms(updatingUserStatus updateStatus: Bool, onlyLastModified: Bool, withCompletion completion: ((_ roomsWithNewMessage: [NCRoom]?, _ account: TalkAccount, _ error: Error?) -> Void)? = nil) {
         let activeAccount = NCDatabaseManager.sharedInstance().activeAccount()
+
+#if DEMO_SCREENSHOTS
+        if DemoScreenshotController.isEnabled {
+            DemoScreenshotSeeder.seedIfNeeded(for: activeAccount) {
+                NotificationCenter.default.post(name: .NCRoomsManagerDidUpdateRooms, object: self)
+                completion?([], activeAccount, nil)
+            }
+            return
+        }
+#endif
+
         let lastReceivedModified = Int(activeAccount.lastReceivedModifiedSince) ?? 0
         let modifiedSince = onlyLastModified ? lastReceivedModified : 0
 
@@ -953,6 +964,11 @@ class NCRoomsManager: NSObject, CallViewControllerDelegate {
     // MARK: - Join/Leave room
 
     public func joinRoom(_ token: String, forAccountId accountId: String, forCall call: Bool) {
+#if DEMO_SCREENSHOTS
+        if DemoScreenshotController.isDemoRoomToken(token) {
+            return
+        }
+#endif
         NCLog.log("Joining room \(token) for call \(call)")
 
         // Clean up joining room flag and attempts

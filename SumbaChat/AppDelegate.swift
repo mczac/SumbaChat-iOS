@@ -88,6 +88,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
         NCUserInterfaceController.sharedInstance().mainViewController = self.window?.rootViewController as? NCSplitViewController
         NCUserInterfaceController.sharedInstance().roomsTableViewController = NCUserInterfaceController.sharedInstance().mainViewController.viewControllers.first?.children.first as? RoomsTableViewController
         NCUserInterfaceController.sharedInstance().mainViewController.displayModeButtonVisibility = .never
+
+#if DEMO_SCREENSHOTS
+        DemoScreenshotController.installSplashHold(on: self.window)
+#endif
+
         // checkConnectionState() above can run before the window exists; present login once UI is wired.
         NCConnectionController.shared.checkAppState()
 
