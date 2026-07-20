@@ -24,10 +24,51 @@ import UIKit
     private var edgeTapEnabled = true
     private var galleryTapRecognizer: UITapGestureRecognizer?
 
-    private lazy var shareButton = {
-        let shareButton = UIBarButtonItem(title: nil, style: .plain, target: nil, action: nil)
-        shareButton.isEnabled = false
-        shareButton.primaryAction = UIAction(title: "", image: .init(systemName: "square.and.arrow.up"), handler: { [unowned self, unowned shareButton] _ in
+    /// Plain footer — not `UIToolbar`. iOS 26 Liquid Glass regroups toolbar items and breaks centering.
+    private lazy var galleryFooterBar: UIView = {
+        let bar = UIView()
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+
+        let leadingStack = UIStackView(arrangedSubviews: [shareFooterButton, showMessageFooterButton])
+        leadingStack.axis = .horizontal
+        leadingStack.alignment = .center
+        leadingStack.spacing = 20
+        leadingStack.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(leadingStack)
+        bar.addSubview(muteFooterButton)
+
+        let centerX = leadingStack.centerXAnchor.constraint(equalTo: bar.centerXAnchor)
+        let leading = leadingStack.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 20)
+        leading.isActive = false
+        footerCenterXConstraint = centerX
+        footerLeadingConstraint = leading
+
+        NSLayoutConstraint.activate([
+            centerX,
+            leadingStack.topAnchor.constraint(equalTo: bar.topAnchor, constant: 8),
+            leadingStack.bottomAnchor.constraint(equalTo: bar.safeAreaLayoutGuide.bottomAnchor, constant: -8),
+            muteFooterButton.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -20),
+            muteFooterButton.centerYAnchor.constraint(equalTo: leadingStack.centerYAnchor),
+            shareFooterButton.widthAnchor.constraint(equalToConstant: 44),
+            shareFooterButton.heightAnchor.constraint(equalToConstant: 44),
+            showMessageFooterButton.widthAnchor.constraint(equalToConstant: 44),
+            showMessageFooterButton.heightAnchor.constraint(equalToConstant: 44),
+            muteFooterButton.widthAnchor.constraint(equalToConstant: 44),
+            muteFooterButton.heightAnchor.constraint(equalToConstant: 44)
+        ])
+
+        return bar
+    }()
+
+    private var footerCenterXConstraint: NSLayoutConstraint?
+    private var footerLeadingConstraint: NSLayoutConstraint?
+
+    private lazy var shareFooterButton: UIButton = {
+        makeGalleryFooterButton(
+            systemName: "square.and.arrow.up",
+            accessibilityLabel: NSLocalizedString("Share", comment: "Share media from gallery")
+        ) { [unowned self] sender in
             guard let mediaPageViewController = self.getCurrentPageViewController() else { return }
 
             var itemsToShare: [Any] = []
@@ -39,19 +80,19 @@ import UIKit
             } else {
                 return
             }
+
             let activityViewController = UIActivityViewController(activityItems: itemsToShare, applicationActivities: nil)
-            activityViewController.popoverPresentationController?.barButtonItem = shareButton
-
+            activityViewController.popoverPresentationController?.sourceView = sender
+            activityViewController.popoverPresentationController?.sourceRect = sender.bounds
             self.present(activityViewController, animated: true)
-        })
-
-        return shareButton
+        }
     }()
 
-    private lazy var showMessageButton = {
-        let showMessageButton = UIBarButtonItem(title: nil, style: .plain, target: nil, action: nil)
-        showMessageButton.isEnabled = false
-        showMessageButton.primaryAction = UIAction(title: "", image: .init(systemName: "text.magnifyingglass"), handler: { [unowned self] _ in
+    private lazy var showMessageFooterButton: UIButton = {
+        makeGalleryFooterButton(
+            systemName: "text.magnifyingglass",
+            accessibilityLabel: NSLocalizedString("Show in chat", comment: "Open message context in chat")
+        ) { [unowned self] _ in
             guard let mediaPageViewController = self.getCurrentPageViewController() else { return }
 
             let message = mediaPageViewController.message
@@ -62,10 +103,20 @@ import UIKit
                 let navController = NCNavigationController(rootViewController: chatViewController)
                 self.present(navController, animated: true)
             }
+        }
+    }()
 
-        })
-
-        return showMessageButton
+    private lazy var muteFooterButton: UIButton = {
+        let button = makeGalleryFooterButton(
+            systemName: "speaker.wave.2.fill",
+            accessibilityLabel: NSLocalizedString("Mute", comment: "Mute video playback")
+        ) { [unowned self] _ in
+            guard let page = self.getCurrentPageViewController() else { return }
+            let muted = page.toggleVideoMute()
+            self.updateMuteFooterButton(muted: muted)
+        }
+        button.isHidden = true
+        return button
     }()
 
     override var preferredStatusBarStyle: UIStatusBarStyle {
@@ -101,6 +152,7 @@ import UIKit
 
         self.addChild(self.pageController)
         self.view.addSubview(self.pageController.view)
+        self.view.addSubview(self.galleryFooterBar)
         self.pageController.didMove(toParent: self)
 
         // Full-bleed media under translucent chrome.
@@ -108,7 +160,11 @@ import UIKit
             self.pageController.view.leftAnchor.constraint(equalTo: self.view.leftAnchor),
             self.pageController.view.rightAnchor.constraint(equalTo: self.view.rightAnchor),
             self.pageController.view.topAnchor.constraint(equalTo: self.view.topAnchor),
-            self.pageController.view.bottomAnchor.constraint(equalTo: self.view.bottomAnchor)
+            self.pageController.view.bottomAnchor.constraint(equalTo: self.view.bottomAnchor),
+
+            self.galleryFooterBar.leadingAnchor.constraint(equalTo: self.view.leadingAnchor),
+            self.galleryFooterBar.trailingAnchor.constraint(equalTo: self.view.trailingAnchor),
+            self.galleryFooterBar.bottomAnchor.constraint(equalTo: self.view.bottomAnchor)
         ])
 
         // Tap does not cancel touches — swipe / pinch still reach the pager and zoom view.
@@ -144,11 +200,64 @@ import UIKit
         self.navigationItem.leftBarButtonItem = closeButton
         self.navigationItem.rightBarButtonItem = nil
 
-        self.navigationController?.setToolbarHidden(false, animated: false)
+        self.navigationController?.setToolbarHidden(true, animated: false)
+    }
 
-        let fixedSpace = UIBarButtonItem(barButtonSystemItem: .fixedSpace, target: nil, action: nil)
-        fixedSpace.width = 20
-        self.toolbarItems = [shareButton, fixedSpace, showMessageButton]
+    private func makeGalleryFooterButton(
+        systemName: String,
+        accessibilityLabel: String,
+        handler: @escaping (UIButton) -> Void
+    ) -> UIButton {
+        let button = UIButton(type: .custom)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.tintColor = .white
+        button.isEnabled = false
+        button.accessibilityLabel = accessibilityLabel
+        button.adjustsImageWhenHighlighted = false
+
+        if #available(iOS 26.0, *) {
+            button.configuration = .glass()
+            button.configuration?.image = UIImage(systemName: systemName)
+        } else {
+            button.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+            button.layer.cornerRadius = 22
+            button.clipsToBounds = true
+            button.setImage(UIImage(systemName: systemName), for: .normal)
+        }
+
+        button.addAction(UIAction { [weak button] _ in
+            guard let button else { return }
+            handler(button)
+        }, for: .touchUpInside)
+
+        return button
+    }
+
+    private func updateMuteFooterButton(muted: Bool) {
+        let imageName = muted ? "speaker.slash.fill" : "speaker.wave.2.fill"
+
+        if #available(iOS 26.0, *), var configuration = muteFooterButton.configuration {
+            configuration.image = UIImage(systemName: imageName)
+            muteFooterButton.configuration = configuration
+        } else {
+            muteFooterButton.setImage(UIImage(systemName: imageName), for: .normal)
+        }
+
+        muteFooterButton.accessibilityLabel = muted
+            ? NSLocalizedString("Unmute", comment: "Unmute video playback")
+            : NSLocalizedString("Mute", comment: "Mute video playback")
+    }
+
+    private func updateFooterLayout(for page: NCMediaViewerPageViewController) {
+        let isVideo = page.currentVideoURL != nil
+        muteFooterButton.isHidden = !isVideo
+        footerCenterXConstraint?.isActive = !isVideo
+        footerLeadingConstraint?.isActive = isVideo
+
+        if isVideo {
+            updateMuteFooterButton(muted: page.isVideoMuted)
+            muteFooterButton.isEnabled = true
+        }
     }
 
     private func applyDarkGalleryAppearance() {
@@ -163,16 +272,6 @@ import UIKit
         navigationController?.navigationBar.compactAppearance = navAppearance
         navigationController?.navigationBar.tintColor = .white
         navigationController?.navigationBar.isTranslucent = true
-
-        let toolbarAppearance = UIToolbarAppearance()
-        toolbarAppearance.configureWithTransparentBackground()
-        toolbarAppearance.backgroundColor = UIColor.black.withAlphaComponent(0.45)
-
-        navigationController?.toolbar.standardAppearance = toolbarAppearance
-        navigationController?.toolbar.compactAppearance = toolbarAppearance
-        navigationController?.toolbar.scrollEdgeAppearance = toolbarAppearance
-        navigationController?.toolbar.tintColor = .white
-        navigationController?.toolbar.isTranslucent = true
     }
 
     func getCurrentPageViewController() -> NCMediaViewerPageViewController? {
@@ -242,8 +341,9 @@ import UIKit
         }
 
         let mediaReady = (page.currentImage != nil) || (page.currentVideoURL != nil)
-        shareButton.isEnabled = mediaReady
-        showMessageButton.isEnabled = mediaReady
+        shareFooterButton.isEnabled = mediaReady
+        showMessageFooterButton.isEnabled = mediaReady
+        updateFooterLayout(for: page)
     }
 
     @objc private func handleGalleryTap(_ recognizer: UITapGestureRecognizer) {
@@ -304,7 +404,7 @@ import UIKit
     @objc private func toggleChrome() {
         chromeHidden.toggle()
         navigationController?.setNavigationBarHidden(chromeHidden, animated: true)
-        navigationController?.setToolbarHidden(chromeHidden, animated: true)
+        galleryFooterBar.isHidden = chromeHidden
         setNeedsStatusBarAppearanceUpdate()
     }
 
@@ -382,8 +482,9 @@ import UIKit
 
     func mediaViewerPageMediaDidLoad(_ controller: NCMediaViewerPageViewController) {
         if let mediaPageViewController = self.getCurrentPageViewController(), mediaPageViewController.isEqual(controller) {
-            self.shareButton.isEnabled = true
-            self.showMessageButton.isEnabled = true
+            self.shareFooterButton.isEnabled = true
+            self.showMessageFooterButton.isEnabled = true
+            self.updateFooterLayout(for: mediaPageViewController)
         }
     }
 }

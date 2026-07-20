@@ -69,18 +69,6 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         NCDatabaseManager.sharedInstance().serverCapabilities(forAccountId: activeAccount.accountId)
     }
 
-    lazy var profilePictures: [String: UIImage] = {
-        var result: [String: UIImage] = [:]
-
-        for account in NCDatabaseManager.sharedInstance().allAccounts() {
-            if let image = NCAPIController.sharedInstance().userProfileImage(forAccount: account, withStyle: self.traitCollection.userInterfaceStyle) {
-                result[account.accountId] = image
-            }
-        }
-
-        return result
-    }()
-
     @IBOutlet weak var cancelButton: UIBarButtonItem!
 
     /// Avoids network-driven `reloadData` during the sheet open animation.
@@ -459,11 +447,17 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
     }
 
     @objc func userProfileImageUpdated(notification: NSNotification) {
-        let sections = getSettingsSections()
-        guard let section = sections.firstIndex(of: SettingsSection.kSettingsSectionUser.rawValue) else {
+        reloadAccountAvatarRows()
+    }
+
+    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+
+        guard previousTraitCollection?.userInterfaceStyle != traitCollection.userInterfaceStyle else {
             return
         }
-        tableView.reloadRows(at: [IndexPath(row: 0, section: section)], with: .none)
+
+        reloadAccountAvatarRows()
     }
 
     // MARK: - User Interface
@@ -1440,11 +1434,29 @@ extension SettingsTableViewController {
 
     // UIImage should be optional because userProfileImage (objC) can return a nil value
     func getProfilePicture(for account: TalkAccount) -> UIImage? {
-        if let avatar = self.profilePictures[account.accountId] {
-            return avatar
+        NCAPIController.sharedInstance().userProfileImage(
+            forAccount: account,
+            withStyle: traitCollection.userInterfaceStyle
+        )
+    }
+
+    /// Reload active-account and other-accounts rows so avatars track light/dark variants.
+    private func reloadAccountAvatarRows() {
+        let sections = getSettingsSections()
+        var indexPaths: [IndexPath] = []
+
+        if let section = sections.firstIndex(of: SettingsSection.kSettingsSectionUser.rawValue) {
+            indexPaths.append(IndexPath(row: 0, section: section))
         }
 
-        return NCAPIController.sharedInstance().userProfileImage(forAccount: account, withStyle: self.traitCollection.userInterfaceStyle)
+        if let section = sections.firstIndex(of: SettingsSection.kSettingsSectionOtherAccounts.rawValue) {
+            for row in 0..<inactiveAccounts.count {
+                indexPaths.append(IndexPath(row: row, section: section))
+            }
+        }
+
+        guard !indexPaths.isEmpty else { return }
+        tableView.reloadRows(at: indexPaths, with: .none)
     }
 
     /// Draws status glyphs into a fixed square so UITableViewCell imageView width stays stable.

@@ -86,7 +86,6 @@ import SwiftyGif
     }
 
     private var playerViewController: AVPlayerViewController?
-    private var muteButton: UIButton?
 
     private lazy var activityIndicator: UIActivityIndicatorView = {
         let indicator = UIActivityIndicatorView(style: .large)
@@ -359,10 +358,9 @@ import SwiftyGif
         playerViewController.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         playerViewController.didMove(toParent: self)
 
-        // Start with sound; user can mute via the on-screen control.
+        // Start with sound; mute via gallery footer (Sumba). AVKit's top-right speaker is display-only.
         player.isMuted = false
         player.play()
-        self.installMuteControl(for: player)
 
         self.zoomableView.contentViewSize = playerViewController.view.bounds.size
         self.zoomableView.resizeContentView()
@@ -372,62 +370,18 @@ import SwiftyGif
         self.delegate?.mediaViewerPageMediaDidLoad(self)
     }
 
-    private func installMuteControl(for player: AVPlayer) {
-        self.muteButton?.removeFromSuperview()
-
-        let button = UIButton(type: .system)
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.tintColor = .white
-        button.accessibilityIdentifier = "mediaViewerMuteButton"
-
-        if #available(iOS 26.0, *) {
-            button.configuration = .glass()
-            button.configuration?.image = UIImage(systemName: "speaker.slash.fill")
-        } else {
-            button.backgroundColor = UIColor.black.withAlphaComponent(0.55)
-            button.layer.cornerRadius = 22
-            button.clipsToBounds = true
-        }
-
-        self.updateMuteButtonAppearance(button, muted: player.isMuted)
-
-        button.addAction(UIAction { [weak self, weak player, weak button] _ in
-            guard let self, let player, let button else { return }
-            player.isMuted.toggle()
-            self.updateMuteButtonAppearance(button, muted: player.isMuted)
-        }, for: .touchUpInside)
-
-        self.view.addSubview(button)
-        NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 44),
-            button.heightAnchor.constraint(equalToConstant: 44),
-            button.trailingAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
-            button.bottomAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
-        ])
-        self.view.bringSubviewToFront(button)
-        self.muteButton = button
+    @discardableResult
+    public func toggleVideoMute() -> Bool {
+        guard let player = playerViewController?.player else { return false }
+        player.isMuted.toggle()
+        return player.isMuted
     }
 
-    private func updateMuteButtonAppearance(_ button: UIButton, muted: Bool) {
-        let imageName = muted ? "speaker.slash.fill" : "speaker.wave.2.fill"
-        let image = UIImage(systemName: imageName)
-
-        if #available(iOS 26.0, *), var configuration = button.configuration {
-            configuration.image = image
-            button.configuration = configuration
-        } else {
-            button.setImage(image, for: .normal)
-        }
-
-        button.accessibilityLabel = muted
-            ? NSLocalizedString("Unmute", comment: "Unmute video playback")
-            : NSLocalizedString("Mute", comment: "Mute video playback")
+    public var isVideoMuted: Bool {
+        playerViewController?.player?.isMuted ?? false
     }
 
     private func removePlayerViewControllerIfNeeded() {
-        self.muteButton?.removeFromSuperview()
-        self.muteButton = nil
-
         if let playerVC = self.playerViewController {
             playerVC.player?.replaceCurrentItem(with: nil)
             playerVC.willMove(toParent: nil)
