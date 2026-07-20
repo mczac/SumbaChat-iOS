@@ -11,6 +11,7 @@ import SwiftUI
 import ReplayKit
 import SDWebImage
 import libPhoneNumber
+import UserNotifications
 
 enum SettingsSection: Int {
     case kSettingsSectionUser = 0
@@ -43,6 +44,9 @@ enum AdvancedSectionOption: Int {
 
 enum AboutSection: Int {
     case kAboutSectionPrivacy = 0
+    case kAboutSectionNotifications
+    case kAboutSectionContactUs
+    case kAboutSectionDeleteAccount
     case kAboutSectionSourceCode
 }
 
@@ -80,6 +84,12 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
 
     @IBOutlet weak var cancelButton: UIBarButtonItem!
 
+    /// Avoids network-driven `reloadData` during the sheet open animation.
+    private var didRunInitialRefresh = false
+
+    /// System notification permission for the Notifications row status.
+    private var notificationAuthorizationStatus: UNAuthorizationStatus?
+
     override func viewDidLoad() {
         super.viewDidLoad()
 
@@ -109,10 +119,39 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         NotificationCenter.default.addObserver(self, selector: #selector(contactsHaveBeenUpdated(notification:)), name: NSNotification.Name.NCContactsManagerContactsUpdated, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(contactsAccessHasBeenUpdated(notification:)), name: NSNotification.Name.NCContactsManagerContactsAccessUpdated, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(userProfileImageUpdated), name: NSNotification.Name.NCUserProfileImageUpdated, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(applicationDidBecomeActive), name: UIApplication.didBecomeActiveNotification, object: nil)
 
         self.updateCacheUsageSizes()
+        self.refreshNotificationAuthorizationStatus()
 
-        self.adaptInterfaceForAppState(appState: NCConnectionController.shared.appState)
+        // Storyboard pins sectionHeaderHeight to 18pt, which clips longer titles.
+        tableView.sectionHeaderHeight = UITableView.automaticDimension
+        tableView.estimatedSectionHeaderHeight = 36
+
+        // Seed status from the conversations list so the row doesn’t flash “Fetching…” → real status.
+        if activeUserStatus == nil {
+            activeUserStatus = NCUserInterfaceController.sharedInstance().roomsTableViewController?.activeUserStatus
+        }
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        guard !didRunInitialRefresh else { return }
+        didRunInitialRefresh = true
+
+        let refresh = { [weak self] in
+            guard let self else { return }
+            self.adaptInterfaceForAppState(appState: NCConnectionController.shared.appState)
+        }
+
+        // Wait until the sheet presentation finishes so inset/nav metrics stay put.
+        if let coordinator = transitionCoordinator, animated {
+            coordinator.animate(alongsideTransition: nil) { _ in
+                DispatchQueue.main.async(execute: refresh)
+            }
+        } else {
+            refresh()
+        }
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -137,6 +176,7 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         // interactive transition double-draws the Caching row (looks like a Simulator glitch).
         let refresh = { [weak self] in
             self?.refreshCachingRowSubtitle()
+            self?.refreshNotificationAuthorizationStatus()
         }
         if let coordinator = transitionCoordinator, animated {
             coordinator.animate(alongsideTransition: nil) { context in
@@ -146,6 +186,102 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
             }
         } else {
             refresh()
+        }
+    }
+
+    @objc private func applicationDidBecomeActive() {
+        refreshNotificationAuthorizationStatus()
+    }
+
+    private func refreshNotificationAuthorizationStatus() {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let previous = self.notificationAuthorizationStatus
+                self.notificationAuthorizationStatus = settings.authorizationStatus
+                guard previous != settings.authorizationStatus else { return }
+                self.reloadNotificationsRow()
+            }
+        }
+    }
+
+    private func reloadNotificationsRow() {
+        let sections = getSettingsSections()
+        guard let section = sections.firstIndex(of: SettingsSection.kSettingsSectionAbout.rawValue) else { return }
+        let options = getAboutSectionOptions()
+        guard let row = options.firstIndex(of: AboutSection.kAboutSectionNotifications.rawValue) else { return }
+        tableView.reloadRows(at: [IndexPath(row: row, section: section)], with: .none)
+    }
+
+    private func notificationsStatusText() -> String {
+        guard let status = notificationAuthorizationStatus else { return "" }
+        switch status {
+        case .authorized, .provisional, .ephemeral:
+            return NSLocalizedString("On", comment: "Notifications are enabled in system Settings")
+        case .denied, .notDetermined:
+            return NSLocalizedString("Off", comment: "Notifications are disabled in system Settings")
+        @unknown default:
+            return NSLocalizedString("Off", comment: "Notifications are disabled in system Settings")
+        }
+    }
+
+    /// Sanam-style: ask in-app when never prompted; otherwise open Settings → SumbaChat.
+    private func handleNotificationsRowTapped() {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.notificationAuthorizationStatus = settings.authorizationStatus
+                self.reloadNotificationsRow()
+
+                switch settings.authorizationStatus {
+                case .notDetermined:
+                    self.requestNotificationAuthorizationInApp()
+                case .denied, .authorized, .provisional, .ephemeral:
+                    self.openAppNotificationSettings()
+                @unknown default:
+                    self.openAppNotificationSettings()
+                }
+            }
+        }
+    }
+
+    private func requestNotificationAuthorizationInApp() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                // Status updates to On/Off; if denied, a later tap opens our app’s Notifications page.
+                self?.refreshNotificationAuthorizationStatus()
+            }
+        }
+    }
+
+    /// Opens Settings → SumbaChat so the user can manage Notifications.
+    /// On iOS 18+, `openSettingsURLString` often only opens the Apps list; deep-link with
+    /// our bundle id (`App-prefs:<bundleId>`) selects SumbaChat, matching the Sanam approach.
+    private func openAppNotificationSettings() {
+        let bundleId = Bundle.main.bundleIdentifier ?? bundleIdentifier
+        var candidates: [URL] = []
+
+        if let prefsURL = URL(string: "App-prefs:\(bundleId)") {
+            candidates.append(prefsURL)
+        }
+        // Official fallbacks (Notifications pane, then generic app settings).
+        if let notificationURL = URL(string: UIApplication.openNotificationSettingsURLString) {
+            candidates.append(notificationURL)
+        }
+        if let settingsURL = URL(string: UIApplication.openSettingsURLString) {
+            candidates.append(settingsURL)
+        }
+
+        openFirstWorkingURL(candidates)
+    }
+
+    private func openFirstWorkingURL(_ urls: [URL]) {
+        guard let url = urls.first else { return }
+        // Pass options + completion explicitly — required for reliable open() on iOS 18+.
+        UIApplication.shared.open(url, options: [:]) { [weak self] success in
+            if !success {
+                self?.openFirstWorkingURL(Array(urls.dropFirst()))
+            }
         }
     }
 
@@ -178,9 +314,6 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
 
         // Compression section
         sections.append(SettingsSection.kSettingsSectionConfiguration.rawValue)
-
-        // Debug compression controls (also shown in TestFlight)
-        sections.append(SettingsSection.kSettingsSectionDebug.rawValue)
 
         // Advanced section
         sections.append(SettingsSection.kSettingsSectionAdvanced.rawValue)
@@ -242,10 +375,12 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
     func getAboutSectionOptions() -> [Int] {
         var options = [Int]()
 
-        // Privacy
         options.append(AboutSection.kAboutSectionPrivacy.rawValue)
+        options.append(AboutSection.kAboutSectionNotifications.rawValue)
+        options.append(AboutSection.kAboutSectionContactUs.rawValue)
+        options.append(AboutSection.kAboutSectionDeleteAccount.rawValue)
 
-        // Source code
+        // Source code (non-branded builds only)
         if !isBrandedApp.boolValue {
             options.append(AboutSection.kAboutSectionSourceCode.rawValue)
         }
@@ -274,12 +409,36 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
     }
 
     func getActiveUserStatus() {
-        NCAPIController.sharedInstance().getUserStatus(forAccount: activeAccount) { userStatus in
-            if let userStatus {
-                self.activeUserStatus = userStatus
-                self.tableView.reloadData()
+        NCAPIController.sharedInstance().getUserStatus(forAccount: activeAccount) { [weak self] userStatus, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let previous = self.activeUserStatus
+                if let userStatus {
+                    self.activeUserStatus = userStatus
+                } else if previous == nil {
+                    // Don’t leave “Fetching status …” forever when the API fails
+                    // (e.g. user_status app missing/disabled on the server).
+                    let unavailable = NCUserStatus()
+                    unavailable.message = NSLocalizedString("Unavailable", comment: "User status could not be loaded")
+                    self.activeUserStatus = unavailable
+                }
+                let current = self.activeUserStatus
+                let sameStatus = previous?.status == current?.status
+                    && previous?.message == current?.message
+                    && previous?.icon == current?.icon
+                if !sameStatus {
+                    self.reloadUserStatusRow()
+                }
             }
         }
+    }
+
+    func reloadUserStatusRow() {
+        let sections = getSettingsSections()
+        guard let section = sections.firstIndex(of: SettingsSection.kSettingsSectionUserStatus.rawValue) else {
+            return
+        }
+        tableView.reloadRows(at: [IndexPath(row: 0, section: section)], with: .none)
     }
 
     // MARK: - Notifications
@@ -306,7 +465,11 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
     }
 
     @objc func userProfileImageUpdated(notification: NSNotification) {
-        self.tableView.reloadSections(IndexSet(integer: SettingsSection.kSettingsSectionUser.rawValue), with: .none)
+        let sections = getSettingsSections()
+        guard let section = sections.firstIndex(of: SettingsSection.kSettingsSectionUser.rawValue) else {
+            return
+        }
+        tableView.reloadRows(at: [IndexPath(row: 0, section: section)], with: .none)
     }
 
     // MARK: - User Interface
@@ -442,10 +605,16 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
              NSLocalizedString("Upload originals without compressing", comment: "Subtitle for None media compression mode")),
             (.automatic,
              NSLocalizedString("Automatic", comment: "Automatic media compression"),
-             NSLocalizedString("Per file: best quality that stays under the max file size (with estimate margin)", comment: "Subtitle for Automatic media compression mode")),
+             NSLocalizedString(
+                "Keeps good quality while staying under the size limit for each file",
+                comment: "Subtitle for Automatic media compression mode"
+             )),
             (.chooseOnUpload,
              NSLocalizedString("Manual", comment: "Choose compression level when uploading"),
-             NSLocalizedString("Choose None, Low, Medium, or High on each send", comment: "Subtitle for Manual media compression mode"))
+             NSLocalizedString(
+                "Choose the compression level when you send. Higher compression means smaller files and faster transfers",
+                comment: "Subtitle for Manual media compression mode"
+             ))
         ]
 
         let options: [DetailedOption] = modes.map { mode, title, subtitle in
@@ -461,10 +630,7 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
                                                                         forSenderIdentifier: mediaUploadModeSenderId,
                                                                         andStyle: .insetGrouped) else { return }
         selector.title = NSLocalizedString("Media Compression", comment: "")
-        selector.footerText = NSLocalizedString(
-            "Manual shows estimated sizes before send (bitrate × duration for Bitrate engine). Videos encode one-at-a-time.",
-            comment: "Footer on Media Compression mode picker"
-        )
+        selector.footerText = nil
         selector.delegate = self
         navigationController?.pushViewController(selector, animated: true)
     }
@@ -671,7 +837,7 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         case SettingsSection.kSettingsSectionAdvanced.rawValue:
             return NSLocalizedString("Advanced", comment: "")
         case SettingsSection.kSettingsSectionAbout.rawValue:
-            return NSLocalizedString("About", comment: "")
+            return NSLocalizedString("Privacy & Personal Data", comment: "Settings section for privacy, notifications, contact us, and account deletion")
         default:
             return nil
         }
@@ -768,27 +934,44 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "UserProfileCellIdentifier", style: .subtitle)
             cell.textLabel?.text = activeAccount.userDisplayName
             cell.textLabel?.font = .preferredFont(for: .title2, weight: .medium)
+            cell.textLabel?.numberOfLines = 1
             cell.detailTextLabel?.text = activeAccount.server.replacingOccurrences(of: "https://", with: "")
-            cell.detailTextLabel?.lineBreakMode = .byCharWrapping
-            cell.imageView?.image = self.getProfilePicture(for: activeAccount)?.cropToCircle(withSize: CGSize(width: 60, height: 60))
+            cell.detailTextLabel?.numberOfLines = 1
+            cell.detailTextLabel?.lineBreakMode = .byTruncatingMiddle
+            // Always reserve a 60pt avatar slot so text doesn’t jump when the photo loads.
+            let avatarSize = CGSize(width: 60, height: 60)
+            if let photo = self.getProfilePicture(for: activeAccount)?.cropToCircle(withSize: avatarSize) {
+                cell.imageView?.image = photo
+            } else {
+                cell.imageView?.image = Self.circlePlaceholderImage(size: avatarSize, color: .tertiarySystemFill)
+            }
+            cell.imageView?.tintColor = nil
             cell.accessoryType = .disclosureIndicator
             return cell
 
         case SettingsSection.kSettingsSectionUserStatus.rawValue:
-            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "UserStatusCellIdentifier", style: .subtitle)
-            if activeUserStatus != nil {
-                cell.textLabel?.text = activeUserStatus!.readableUserStatus()
-                let statusMessage = activeUserStatus!.readableUserStatusMessage()
-                if !statusMessage.isEmpty {
-                    cell.textLabel?.text = statusMessage
-                }
-                if activeUserStatus!.status == kUserStatusDND {
-                    cell.detailTextLabel?.text = NSLocalizedString("All notifications are muted", comment: "")
-                }
-                let statusImage = activeUserStatus!.getSFUserStatusIcon()
-                cell.imageView?.image = statusImage
+            // Single-line only (no DND subtitle) so fetching → status never changes row height.
+            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(
+                withIdentifier: "UserStatusSingleLineCellIdentifier",
+                style: .default
+            )
+            cell.detailTextLabel?.text = nil
+            cell.textLabel?.numberOfLines = 1
+            cell.accessoryType = .disclosureIndicator
+            // Fixed icon canvas so SF Symbol swaps don’t nudge the label.
+            let iconSize = CGSize(width: 22, height: 22)
+            if let activeUserStatus {
+                let statusMessage = activeUserStatus.readableUserStatusMessage()
+                cell.textLabel?.text = statusMessage.isEmpty
+                    ? activeUserStatus.readableUserStatus()
+                    : statusMessage
+                cell.imageView?.image = Self.fixedSizeStatusIcon(activeUserStatus.getSFUserStatusIcon(), size: iconSize)
+                cell.imageView?.tintColor = nil
             } else {
                 cell.textLabel?.text = NSLocalizedString("Fetching status …", comment: "")
+                let placeholder = UIImage(systemName: "circle.fill")?.withTintColor(.tertiaryLabel, renderingMode: .alwaysOriginal)
+                cell.imageView?.image = Self.fixedSizeStatusIcon(placeholder, size: iconSize)
+                cell.imageView?.tintColor = nil
             }
             return cell
 
@@ -890,12 +1073,59 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
                 let safariVC = SFSafariViewController(url: url)
                 self.present(safariVC, animated: true, completion: nil)
             }
+        case AboutSection.kAboutSectionNotifications.rawValue:
+            handleNotificationsRowTapped()
+        case AboutSection.kAboutSectionContactUs.rawValue:
+            let contactVC = SumbaContactUsViewController(account: activeAccount)
+            navigationController?.pushViewController(contactVC, animated: true)
+        case AboutSection.kAboutSectionDeleteAccount.rawValue:
+            presentDeleteAccountFlow()
         case AboutSection.kAboutSectionSourceCode.rawValue:
             let safariVC = SFSafariViewController(url: URL(string: "https://github.com/nextcloud/talk-ios")!)
             self.present(safariVC, animated: true, completion: nil)
         default:
             break
         }
+    }
+
+    /// Password confirmation → countdown cancel window → Drop Account API delete.
+    func presentDeleteAccountFlow() {
+        let account = activeAccount
+        let displayName = account.userDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let user = account.user.trimmingCharacters(in: .whitespacesAndNewlines)
+        let host = SumbaServerConfiguration.displayHost(fromServerURL: account.server)
+        let identity = [displayName.isEmpty ? user : displayName, host]
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+
+        let message: String
+        if identity.isEmpty {
+            message = NSLocalizedString(
+                "This permanently deletes your account and data from the server. This cannot be undone.",
+                comment: "Delete account confirmation"
+            )
+        } else {
+            message = String(
+                format: NSLocalizedString(
+                    "You are about to permanently delete “%@”. All chats, files, and account data will be removed from the server. This cannot be undone.",
+                    comment: "Delete account confirmation with account identity"
+                ),
+                identity
+            )
+        }
+
+        let alert = UIAlertController(
+            title: NSLocalizedString("Delete account", comment: ""),
+            message: message,
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel))
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Continue", comment: ""), style: .destructive) { [weak self] _ in
+            guard let self else { return }
+            let passwordVC = SumbaDeleteAccountPasswordViewController(account: account)
+            self.navigationController?.pushViewController(passwordVC, animated: true)
+        })
+        present(alert, animated: true)
     }
 
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
@@ -954,6 +1184,10 @@ extension SettingsTableViewController {
         case AccountSettingsOptions.kAccountSettingsReadStatusPrivacy.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: userSettingsCellIdentifier, style: .subtitle)
             cell.textLabel?.text = NSLocalizedString("Read status", comment: "")
+            cell.textLabel?.numberOfLines = 1
+            // Always clear detail so reuse from Typing/Contacts can’t leave a second line.
+            cell.detailTextLabel?.text = nil
+            cell.detailTextLabel?.numberOfLines = 1
             cell.setColoredSettingsIcon(image: UIImage(named: "check-all"), backgroundColor: SettingsIconColor.red)
             cell.accessoryView = readStatusSwitch
             readStatusSwitch.isOn = !(serverCapabilities?.readStatusPrivacy ?? true)
@@ -961,8 +1195,10 @@ extension SettingsTableViewController {
             return cell
 
         case AccountSettingsOptions.kAccountSettingsTypingPrivacy.rawValue:
-            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: userSettingsCellIdentifier, style: .subtitle)
+            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "TypingPrivacyCellIdentifier", style: .subtitle)
             cell.textLabel?.text = NSLocalizedString("Typing indicator", comment: "")
+            cell.textLabel?.numberOfLines = 1
+            cell.detailTextLabel?.numberOfLines = 2
             cell.setColoredSettingsIcon(systemName: "rectangle.and.pencil.and.ellipsis", backgroundColor: SettingsIconColor.red)
             cell.accessoryView = typingIndicatorSwitch
             typingIndicatorSwitch.isOn = !(serverCapabilities?.typingPrivacy ?? true)
@@ -972,6 +1208,11 @@ extension SettingsTableViewController {
             if externalSignalingController == nil {
                 cell.detailTextLabel?.text = NSLocalizedString("Typing indicators are only available when using a high performance backend (HPB)",
                                                                comment: "")
+                cell.detailTextLabel?.textColor = .secondaryLabel
+            } else {
+                // Reserve subtitle space so HPB warning appearing later doesn’t grow the row.
+                cell.detailTextLabel?.text = " "
+                cell.detailTextLabel?.textColor = .clear
             }
 
             return cell
@@ -979,7 +1220,10 @@ extension SettingsTableViewController {
         case AccountSettingsOptions.kAccountSettingsContactsSync.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: userSettingsCellIdentifier, style: .subtitle)
             cell.textLabel?.text = NSLocalizedString("Phone number integration", comment: "")
+            cell.textLabel?.numberOfLines = 1
             cell.detailTextLabel?.text = NSLocalizedString("Match system contacts", comment: "")
+            cell.detailTextLabel?.numberOfLines = 1
+            cell.detailTextLabel?.textColor = .secondaryLabel
             cell.setColoredSettingsIcon(systemName: "iphone", backgroundColor: SettingsIconColor.green)
             cell.accessoryView = contactSyncSwitch
             contactSyncSwitch.isOn = NCSettingsController.sharedInstance().isContactSyncEnabled()
@@ -987,8 +1231,10 @@ extension SettingsTableViewController {
             return cell
 
         case AccountSettingsOptions.kAccountSettingsRecents.rawValue:
-            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: userSettingsCellIdentifier, style: .default)
+            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "RecentsSettingsCellIdentifier", style: .default)
             cell.textLabel?.text = NSLocalizedString("Include calls in call history", comment: "")
+            cell.textLabel?.numberOfLines = 1
+            cell.detailTextLabel?.text = nil
             cell.setColoredSettingsIcon(systemName: "clock.arrow.circlepath", backgroundColor: SettingsIconColor.green)
             cell.selectionStyle = .none
             cell.accessoryView = includeInRecentsSwitch
@@ -1005,22 +1251,45 @@ extension SettingsTableViewController {
 
         let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "AccountCellIdentifier", style: .subtitle)
         cell.textLabel?.text = account.userDisplayName
+        cell.textLabel?.numberOfLines = 1
         cell.detailTextLabel?.text = account.server.replacingOccurrences(of: "https://", with: "")
-        cell.detailTextLabel?.lineBreakMode = .byCharWrapping
+        cell.detailTextLabel?.numberOfLines = 1
+        cell.detailTextLabel?.lineBreakMode = .byTruncatingMiddle
 
-        if let accountImage = self.getProfilePicture(for: account) {
-            cell.setSettingsImage(image: NCUtils.roundedImage(fromImage: accountImage), renderingMode: .alwaysOriginal)
+        let avatarSize = CGSize(width: 40, height: 40)
+        if let accountImage = self.getProfilePicture(for: account),
+           let circled = NCUtils.roundedImage(fromImage: accountImage).cropToCircle(withSize: avatarSize) {
+            cell.imageView?.image = circled
+        } else {
+            cell.imageView?.image = Self.circlePlaceholderImage(size: avatarSize, color: .tertiarySystemFill)
         }
+        cell.imageView?.tintColor = nil
 
+        // Fixed-width trailing slot so badge appearing later doesn’t shift title.
+        let accessorySlot = UIView(frame: CGRect(x: 0, y: 0, width: 36, height: 28))
         if account.unreadBadgeNumber > 0 {
             let badgeView = BadgeView(frame: .zero)
             badgeView.badgeColor = NCAppBranding.themeColor()
             badgeView.badgeTextColor = NCAppBranding.themeTextColor()
             badgeView.setBadgeNumber(account.unreadBadgeNumber)
-            cell.accessoryView = badgeView
+            badgeView.sizeToFit()
+            badgeView.center = CGPoint(x: accessorySlot.bounds.midX, y: accessorySlot.bounds.midY)
+            accessorySlot.addSubview(badgeView)
         }
+        cell.accessoryView = accessorySlot
 
         return cell
+    }
+
+    /// Solid circle used as a stable avatar placeholder (same layout metrics as a real photo).
+    private static func circlePlaceholderImage(size: CGSize, color: UIColor) -> UIImage {
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { context in
+            color.setFill()
+            UIBezierPath(ovalIn: CGRect(origin: .zero, size: size)).fill()
+            // Suppress unused warning in some Swift toolchains.
+            _ = context
+        }
     }
 
     func sectionConfigurationCell(for indexPath: IndexPath) -> UITableViewCell {
@@ -1114,8 +1383,36 @@ extension SettingsTableViewController {
         switch option {
         case AboutSection.kAboutSectionPrivacy.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: aboutCellIdentifier, style: .default)
-            cell.textLabel?.text = NSLocalizedString("Privacy", comment: "")
+            cell.textLabel?.text = NSLocalizedString("Privacy Policy", comment: "")
+            cell.textLabel?.numberOfLines = 1
             cell.setColoredSettingsIcon(systemName: "lock.shield", backgroundColor: SettingsIconColor.gray)
+            cell.accessoryType = .disclosureIndicator
+            return cell
+
+        case AboutSection.kAboutSectionNotifications.rawValue:
+            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "NotificationsSettingsCellIdentifier", style: .value1)
+            cell.textLabel?.text = NSLocalizedString("Notifications", comment: "")
+            cell.textLabel?.numberOfLines = 1
+            cell.detailTextLabel?.text = notificationsStatusText()
+            cell.detailTextLabel?.textColor = .secondaryLabel
+            cell.setColoredSettingsIcon(systemName: "bell.badge", backgroundColor: SettingsIconColor.red)
+            cell.accessoryType = .disclosureIndicator
+            return cell
+
+        case AboutSection.kAboutSectionContactUs.rawValue:
+            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "ContactUsCellIdentifier", style: .default)
+            cell.textLabel?.text = NSLocalizedString("Contact us", comment: "")
+            cell.textLabel?.numberOfLines = 1
+            cell.setColoredSettingsIcon(systemName: "envelope", backgroundColor: SettingsIconColor.blue)
+            cell.accessoryType = .disclosureIndicator
+            return cell
+
+        case AboutSection.kAboutSectionDeleteAccount.rawValue:
+            let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "DeleteAccountCellIdentifier", style: .default)
+            cell.textLabel?.text = NSLocalizedString("Delete account", comment: "")
+            cell.textLabel?.textColor = .systemRed
+            cell.textLabel?.numberOfLines = 1
+            cell.setColoredSettingsIcon(systemName: "person.crop.circle.badge.minus", backgroundColor: SettingsIconColor.red)
             cell.accessoryType = .disclosureIndicator
             return cell
 
@@ -1138,6 +1435,19 @@ extension SettingsTableViewController {
         }
 
         return NCAPIController.sharedInstance().userProfileImage(forAccount: account, withStyle: self.traitCollection.userInterfaceStyle)
+    }
+
+    /// Draws status glyphs into a fixed square so UITableViewCell imageView width stays stable.
+    private static func fixedSizeStatusIcon(_ image: UIImage?, size: CGSize) -> UIImage {
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { _ in
+            guard let image else { return }
+            let maxSide = min(size.width, size.height) * 0.92
+            let scale = min(maxSide / max(image.size.width, 1), maxSide / max(image.size.height, 1))
+            let drawSize = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+            let origin = CGPoint(x: (size.width - drawSize.width) / 2, y: (size.height - drawSize.height) / 2)
+            image.draw(in: CGRect(origin: origin, size: drawSize))
+        }
     }
 
     func updateCacheUsageSizes() {

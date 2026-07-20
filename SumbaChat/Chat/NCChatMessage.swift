@@ -322,7 +322,17 @@ import SwiftyAttributes
     }
 
     public var messageIconName: String? {
+        // Media album (sumba-album-…) — gallery icon in room list / shared-items previews.
+        if SumbaMediaAlbumReference.parse(self.referenceId) != nil {
+            return "photo.on.rectangle"
+        }
+
         if let file = self.file() {
+            // Voice msgs are audio MIME + Talk type; check type first so mic wins over music.note.
+            if self.isVoiceMessage {
+                return "mic"
+            }
+
             if let mimetype = file.mimetype {
                 if NCUtils.isImage(fileType: mimetype) {
                     return "photo"
@@ -333,10 +343,6 @@ import SwiftyAttributes
                 } else if NCUtils.isAudio(fileType: mimetype) {
                     return "music.note"
                 }
-            }
-
-            if self.isVoiceMessage {
-                return "mic"
             }
 
             return "doc"
@@ -408,8 +414,6 @@ import SwiftyAttributes
     }
 
     public func messageForLastMessagePreview() -> NSAttributedString? {
-        guard let message = self.parsedMarkdown(), message.length > 0 else { return nil }
-
         let messageAttributedString = NSMutableAttributedString()
         // Icon
         if let messageIconName = self.messageIconName, let messageIcon = UIImage(systemName: messageIconName) {
@@ -418,7 +422,18 @@ import SwiftyAttributes
             attachmentAttributedString.append(NSAttributedString(string: " "))
             messageAttributedString.append(attachmentAttributedString)
         }
-        // Message
+
+        // Album last-message caption may include push suffix " (N media files)" — show user text only.
+        if SumbaMediaAlbumReference.parse(self.referenceId) != nil {
+            if let caption = SumbaMediaAlbumReference.cleanedUserCaption(self.message) {
+                messageAttributedString.append(NSAttributedString(string: caption))
+            }
+            return messageAttributedString.length > 0 ? messageAttributedString : nil
+        }
+
+        guard let message = self.parsedMarkdown(), message.length > 0 else {
+            return messageAttributedString.length > 0 ? messageAttributedString : nil
+        }
         messageAttributedString.append(message)
 
         return messageAttributedString

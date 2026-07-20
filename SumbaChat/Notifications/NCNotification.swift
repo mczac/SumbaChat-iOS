@@ -143,6 +143,13 @@ public class NCNotification: NSObject {
         return objectId.components(separatedBy: "/").first ?? objectId
     }
 
+    /// Chat message id from `object_id` (`{roomToken}/{messageId}` or with thread suffix).
+    public var messageId: Int {
+        let components = objectId.components(separatedBy: "/")
+        guard components.count >= 2 else { return -1 }
+        return Int(components[1]) ?? -1
+    }
+
     public var threadId: Int {
         // Starting with Talk 22 objectId additionally contains the threadId: "{roomToken}/{messageId}/{threadId}"
         let components = objectId.components(separatedBy: "/")

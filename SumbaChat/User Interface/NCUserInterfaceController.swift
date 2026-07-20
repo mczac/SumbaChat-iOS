@@ -23,6 +23,8 @@ public typealias PresentCallControllerCompletionBlock = () -> Void
     private var pendingLocalNotification: [AnyHashable: Any]?
     private var pendingURL: NSURLComponents?
     private var waitingForServerCapabilities = false
+    /// Used so we don't toast "Network available" on cold launch (`unknown` → `connected`).
+    private var lastConnectionStateForToast: ConnectionState = .unknown
 
     static let shared = NCUserInterfaceController()
 
@@ -93,7 +95,12 @@ public typealias PresentCallControllerCompletionBlock = () -> Void
                 return
             }
 
-            let sumbaLoginViewController = SumbaLoginViewController(serverURL: domain)
+            let sumbaLoginViewController = SumbaLoginViewController(
+                initialSubdomain: serverURL.flatMap {
+                    SumbaServerConfiguration.subdomain(fromServerURL: $0)
+                },
+                initialUsername: user
+            )
             sumbaLoginViewController.delegate = self
             let navigationController = UINavigationController(rootViewController: sumbaLoginViewController)
             navigationController.modalPresentationStyle = NCDatabaseManager.sharedInstance().numberOfAccounts() == 0 ? .fullScreen : .formSheet
@@ -367,6 +374,29 @@ public typealias PresentCallControllerCompletionBlock = () -> Void
         presentConversationsList()
         let storyboard = UIStoryboard(name: "Main", bundle: nil)
         let settingsNC = storyboard.instantiateViewController(withIdentifier: "settingsNC")
+
+        // Load + brand before the sheet animates so nav-bar metrics / content insets
+        // don’t change mid-presentation (cosmetic ~20pt jump on open).
+        settingsNC.loadViewIfNeeded()
+        if let nav = settingsNC as? UINavigationController {
+            nav.view.backgroundColor = .systemGroupedBackground
+            if let settings = nav.topViewController {
+                settings.loadViewIfNeeded()
+                NCAppBranding.styleViewController(settings)
+                settings.view.setNeedsLayout()
+                settings.view.layoutIfNeeded()
+            }
+            nav.view.setNeedsLayout()
+            nav.view.layoutIfNeeded()
+        }
+
+        if let sheet = settingsNC.sheetPresentationController {
+            sheet.detents = [.large()]
+            sheet.selectedDetentIdentifier = .large
+            sheet.prefersGrabberVisible = true
+            sheet.prefersScrollingExpandsWhenScrolledToEdge = false
+        }
+
         mainViewController.present(settingsNC, animated: true)
     }
 
@@ -490,11 +520,20 @@ public typealias PresentCallControllerCompletionBlock = () -> Void
             return
         }
 
+        let previous = lastConnectionStateForToast
+        lastConnectionStateForToast = connectionState
+
         switch connectionState {
         case .disconnected:
-            presentStatusToast(NSLocalizedString("Network not available", comment: ""), customStyle: "sumba.error")
+            // Real drop only — not unknown → disconnected at first probe.
+            if previous == .connected {
+                presentStatusToast(NSLocalizedString("Network not available", comment: ""), customStyle: "sumba.error")
+            }
         case .connected:
-            presentStatusToast(NSLocalizedString("Network available", comment: ""), customStyle: "sumba.success")
+            // Recovered from offline only — not cold-launch unknown → connected.
+            if previous == .disconnected {
+                presentStatusToast(NSLocalizedString("Network available", comment: ""), customStyle: "sumba.success")
+            }
         default:
             break
         }

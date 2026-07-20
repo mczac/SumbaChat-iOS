@@ -21,6 +21,19 @@
 #define NC_BRANDING_PRIVACY_URL @"https://cloud.example.com/privacy"
 #define NC_BRANDING_PUSH_SERVER @"https://push.example.com"
 #define NC_BRANDING_PUSH_SERVER_DEBUG @"https://push-dev.example.com"
+#define NC_BRANDING_BASE_DOMAIN @"example.com"
+#define NC_BRANDING_DEFAULT_SUBDOMAIN @"cloud"
+#define NC_BRANDING_SUPPORT_EMAIL @"support@example.com"
+#endif
+
+#if !defined(NC_BRANDING_BASE_DOMAIN)
+#define NC_BRANDING_BASE_DOMAIN @"example.com"
+#endif
+#if !defined(NC_BRANDING_DEFAULT_SUBDOMAIN)
+#define NC_BRANDING_DEFAULT_SUBDOMAIN @"cloud"
+#endif
+#if !defined(NC_BRANDING_SUPPORT_EMAIL)
+#define NC_BRANDING_SUPPORT_EMAIL @"support@example.com"
 #endif
 
 typedef enum NCTextColorStyle {
@@ -50,6 +63,9 @@ BOOL const multiAccountEnabled = YES;
 BOOL const useAppsGroup = NO;
 BOOL const forceDomain = YES;
 NSString * const domain = NC_BRANDING_DOMAIN;
+NSString * const brandingBaseDomain = NC_BRANDING_BASE_DOMAIN;
+NSString * const brandingDefaultSubdomain = NC_BRANDING_DEFAULT_SUBDOMAIN;
+NSString * const brandingSupportEmail = NC_BRANDING_SUPPORT_EMAIL;
 NSString * const appAlternateVersion = @"";
 
 + (NSString *)getAppVersionString

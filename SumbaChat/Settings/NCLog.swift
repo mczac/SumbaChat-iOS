@@ -6,6 +6,9 @@
 
 @objcMembers public class NCLog: NSObject {
 
+    /// How long daily `debug-yyyy-MM-dd.log` files are retained before automatic cleanup.
+    public static let retentionDays = 10
+
     private static let backgroundLogQueue = DispatchQueue(label: "\(bundleIdentifier).backgroundLogQueue", qos: .background)
 
     /// `CFBundleVersion` (build) — cached so every line can tag the binary that wrote it.
@@ -107,6 +110,8 @@
     }
 
     public static func getLogfiles() -> [URL] {
+        removeOldLogfiles()
+
         guard let logfilePath else { return [] }
 
         let fileManager = FileManager.default
@@ -120,30 +125,53 @@
             .sorted { $0.lastPathComponent > $1.lastPathComponent }
     }
 
+    /// Deletes every `debug-*.log` file immediately.
+    public static func clearAllLogfiles() {
+        guard let logfilePath else { return }
+
+        let fileManager = FileManager.default
+        guard let files = try? fileManager.contentsOfDirectory(at: logfilePath, includingPropertiesForKeys: nil)
+        else { return }
+
+        for file in files where file.lastPathComponent.hasPrefix("debug-") && file.lastPathComponent.hasSuffix(".log") {
+            NSLog("Clearing logfile %@", file.path)
+            try? fileManager.removeItem(at: file)
+        }
+    }
+
+    /// Keeps only the last `retentionDays` of daily log files (by date in the filename).
     public static func removeOldLogfiles() {
         guard let logfilePath else { return }
 
-        let logPath = logfilePath.path
         let fileManager = FileManager.default
+        let calendar = Calendar(identifier: .gregorian)
+        var utcCalendar = calendar
+        utcCalendar.timeZone = TimeZone(secondsFromGMT: 0)!
 
-        var dayComponent = DateComponents()
-        dayComponent.day = -10
-
-        guard let enumerator = fileManager.enumerator(atPath: logPath),
-              let thresholdDate = Calendar.current.date(byAdding: dayComponent, to: Date())
+        let todayStart = utcCalendar.startOfDay(for: Date())
+        guard let thresholdDate = utcCalendar.date(byAdding: .day, value: -(retentionDays - 1), to: todayStart)
         else { return }
 
-        while let file = enumerator.nextObject() as? String {
-            let filePathURL = logfilePath.appendingPathComponent(file)
-            let filePath = filePathURL.path
+        guard let files = try? fileManager.contentsOfDirectory(at: logfilePath, includingPropertiesForKeys: nil)
+        else { return }
 
-            guard let creationDate = (try? FileManager.default.attributesOfItem(atPath: filePath))?[.creationDate] as? Date
-            else { continue }
+        for fileURL in files {
+            let name = fileURL.lastPathComponent
+            guard name.hasPrefix("debug-"), name.hasSuffix(".log") else { continue }
 
-            if creationDate.compare(thresholdDate) == .orderedAscending && file.hasPrefix("debug-") && file.hasSuffix(".log") {
-                NSLog("Deleting old logfile %@", filePath)
-                try? fileManager.removeItem(atPath: filePath)
+            let fileDate: Date?
+            if let parsed = fileNameDateFormatter.date(from: String(name.dropFirst("debug-".count).dropLast(".log".count))) {
+                fileDate = utcCalendar.startOfDay(for: parsed)
+            } else if let creationDate = (try? fileManager.attributesOfItem(atPath: fileURL.path))?[.creationDate] as? Date {
+                fileDate = utcCalendar.startOfDay(for: creationDate)
+            } else {
+                fileDate = nil
             }
+
+            guard let fileDate, fileDate < thresholdDate else { continue }
+
+            NSLog("Deleting old logfile %@", fileURL.path)
+            try? fileManager.removeItem(at: fileURL)
         }
     }
 }

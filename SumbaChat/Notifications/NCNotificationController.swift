@@ -171,13 +171,38 @@ public class NCNotificationController: NSObject, UNUserNotificationCenterDelegat
         userInfo["localNotificationType"] = NCLocalNotificationType.chatNotification.rawValue
         content.userInfo = userInfo
 
-        let identifier = "ChatNotification-\(notification.notificationId)"
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.1, repeats: false)
-        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
-        self.notificationCenter.add(request, withCompletionHandler: nil)
+        let present: (UNMutableNotificationContent) -> Void = { finalContent in
+            let identifier = "ChatNotification-\(notification.notificationId)"
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.1, repeats: false)
+            let request = UNNotificationRequest(identifier: identifier, content: finalContent, trigger: trigger)
+            self.notificationCenter.add(request, withCompletionHandler: nil)
 
-        NCDatabaseManager.sharedInstance().increaseUnreadBadgeNumber(forAccountId: accountId)
-        self.updateAppIconBadgeNumber()
+            NCDatabaseManager.sharedInstance().increaseUnreadBadgeNumber(forAccountId: accountId)
+            self.updateAppIconBadgeNumber()
+        }
+
+        // Enrich album pushes when we can resolve referenceId from the chat message.
+        guard notification.messageRichParameters["file"] != nil,
+              notification.messageId > 0,
+              let account = NCDatabaseManager.sharedInstance().talkAccount(forAccountId: accountId) else {
+            present(content)
+            return
+        }
+
+        NCAPIController.sharedInstance().getMessageContext(inRoom: notification.roomToken,
+                                                           forMessageId: notification.messageId,
+                                                           inThread: max(notification.threadId, 0),
+                                                           withLimit: 10,
+                                                           forAccount: account) { messages, _ in
+            if let message = messages?.first(where: { $0.messageId == notification.messageId }),
+               let albumRef = SumbaMediaAlbumReference.parse(message.referenceId) {
+                let caption = SumbaMediaAlbumReference.cleanedUserCaption(notification.message)
+                    ?? SumbaMediaAlbumReference.cleanedUserCaption(message.message as String?)
+                    ?? notification.message
+                content.body = SumbaMediaAlbumReference.notificationBody(count: albumRef.count, caption: caption)
+            }
+            present(content)
+        }
     }
 
     private func updateAppIconBadgeNumber() {

@@ -31,6 +31,25 @@ extension UserProfileTableViewController {
         }
     }
 
+    /// Opens login for another Sumba host without logging out of the current account.
+    func switchServer() {
+        let subdomain = SumbaServerConfiguration.subdomain(fromServerURL: account.server)
+            ?? SumbaServerConfiguration.preferredSubdomain
+        // Prefer email for login prefill; fall back to Nextcloud username.
+        let prefillUser: String? = {
+            let email = account.email.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !email.isEmpty { return email }
+            let user = account.user.trimmingCharacters(in: .whitespacesAndNewlines)
+            return user.isEmpty ? nil : user
+        }()
+        dismiss(animated: true) {
+            NCUserInterfaceController.sharedInstance().presentLoginViewController(
+                forServerURL: SumbaServerConfiguration.serverURL(subdomain: subdomain),
+                withUser: prefillUser
+            )
+        }
+    }
+
     func showLogoutConfirmationDialog() {
         let confirmDialog = UIAlertController(
             title: NSLocalizedString("Log out", comment: ""),

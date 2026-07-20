@@ -1,28 +1,41 @@
 //
 // SPDX-FileCopyrightText: 2020 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursoroff and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
+import QuickLook
 import UIKit
 import NextcloudKit
+import PassKit
 
-class DirectoryTableViewController: UITableViewController, UISearchResultsUpdating {
+class DirectoryTableViewController: UITableViewController, UISearchResultsUpdating, NCChatFileControllerDelegate, QLPreviewControllerDataSource, QLPreviewControllerDelegate, VLCKitVideoViewControllerDelegate {
+
+    /// Share into a conversation vs browse/preview only (account menu).
+    enum Mode {
+        case share
+        case browse
+    }
 
     /// Shared when pushing into subfolders so the type filter stays applied.
+    /// Icons match `NCChatMessage.messageIconName` (SF Symbols used in chat previews).
     enum FileTypeFilter: Int {
         case all
-        case video
+        case videos
         case audio
+        case images
         case documents
 
         var title: String {
             switch self {
             case .all:
                 return NSLocalizedString("All", comment: "File type filter: show all files")
-            case .video:
-                return NSLocalizedString("Video", comment: "File type filter: videos only")
+            case .videos:
+                return NSLocalizedString("Videos", comment: "File type filter: videos only")
             case .audio:
-                return NSLocalizedString("Audio", comment: "File type filter: audio only")
+                return NSLocalizedString("Audio", comment: "File type filter: audio only (includes voice recordings)")
+            case .images:
+                return NSLocalizedString("Images", comment: "File type filter: images only")
             case .documents:
                 return NSLocalizedString("Documents", comment: "File type filter: documents only")
             }
@@ -32,10 +45,12 @@ class DirectoryTableViewController: UITableViewController, UISearchResultsUpdati
             switch self {
             case .all:
                 return "square.grid.2x2"
-            case .video:
-                return "video"
+            case .videos:
+                return "movieclapper"
             case .audio:
-                return "waveform"
+                return "music.note"
+            case .images:
+                return "photo"
             case .documents:
                 return "doc"
             }
@@ -50,6 +65,7 @@ class DirectoryTableViewController: UITableViewController, UISearchResultsUpdati
     private let path: String
     private let token: String
     private let threadId: Int
+    private let mode: Mode
 
     private var userHomePath = ""
     /// Full folder listing from the server (unfiltered).
@@ -63,11 +79,24 @@ class DirectoryTableViewController: UITableViewController, UISearchResultsUpdati
     private var searchController: UISearchController!
     private let directoryBackgroundView = PlaceholderView()
     private let sharingFileView = UIActivityIndicatorView()
+    private var previewControllerFilePath = ""
+    private var isPreviewControllerShown = false
 
-    init(path: String, inRoom token: String, andThread threadId: Int, fileTypeFilter: FileTypeFilter = .all) {
+    /// Conversation share picker (existing chat attach flow).
+    convenience init(path: String, inRoom token: String, andThread threadId: Int, fileTypeFilter: FileTypeFilter = .all) {
+        self.init(path: path, inRoom: token, andThread: threadId, mode: .share, fileTypeFilter: fileTypeFilter)
+    }
+
+    /// Account-menu browser: navigate folders, preview files, no share.
+    convenience init(browsePath path: String = "", fileTypeFilter: FileTypeFilter = .all) {
+        self.init(path: path, inRoom: "", andThread: 0, mode: .browse, fileTypeFilter: fileTypeFilter)
+    }
+
+    private init(path: String, inRoom token: String, andThread threadId: Int, mode: Mode, fileTypeFilter: FileTypeFilter) {
         self.path = path
         self.token = token
         self.threadId = threadId
+        self.mode = mode
         self.fileTypeFilter = fileTypeFilter
 
         super.init(style: .plain)
@@ -129,52 +158,62 @@ class DirectoryTableViewController: UITableViewController, UISearchResultsUpdati
         let preferredSorting = settings.getPreferredFileSorting()
         let ascending = settings.isPreferredFileSortingAscending()
 
-        let nameAscending = UIAction(
-            title: NSLocalizedString("Name A–Z", comment: "File browser sort: name ascending"),
-            image: UIImage(systemName: "character.square")
-        ) { [weak self] _ in
-            settings.setPreferredFileSorting(.alphabeticalSorting)
-            settings.setPreferredFileSortingAscending(true)
-            self?.applyFilterAndSort()
+        // One row per criterion (icon always visible); tap again toggles direction via subtitle only.
+        let criteria: [(sorting: NCPreferredFileSorting, title: String, image: String)] = [
+            (.alphabeticalSorting,
+             NSLocalizedString("Name", comment: "File browser sort criterion"),
+             "textformat.abc"),
+            (.modificationDateSorting,
+             NSLocalizedString("Date", comment: "File browser sort criterion"),
+             "calendar")
+        ]
+
+        let actions: [UIAction] = criteria.map { item in
+            let isSelected = preferredSorting == item.sorting
+            let subtitle: String? = {
+                guard isSelected else { return nil }
+                switch item.sorting {
+                case .alphabeticalSorting:
+                    return ascending
+                        ? NSLocalizedString("A to Z", comment: "File browser name sort: ascending")
+                        : NSLocalizedString("Z to A", comment: "File browser name sort: descending")
+                case .modificationDateSorting:
+                    return ascending
+                        ? NSLocalizedString("Earliest first", comment: "File browser date sort: oldest first")
+                        : NSLocalizedString("Latest first", comment: "File browser date sort: newest first")
+                @unknown default:
+                    return nil
+                }
+            }()
+
+            let action = UIAction(
+                title: item.title,
+                subtitle: subtitle,
+                image: UIImage(systemName: item.image),
+                attributes: .keepsMenuPresented
+            ) { [weak self] _ in
+                guard let self else { return }
+                if settings.getPreferredFileSorting() == item.sorting {
+                    settings.setPreferredFileSortingAscending(!settings.isPreferredFileSortingAscending())
+                } else {
+                    settings.setPreferredFileSorting(item.sorting)
+                    // Name → A to Z; Date → Latest first.
+                    settings.setPreferredFileSortingAscending(item.sorting == .alphabeticalSorting)
+                }
+                self.applyFilterAndSort()
+            }
+            action.state = isSelected ? .on : .off
+            return action
         }
 
-        let nameDescending = UIAction(
-            title: NSLocalizedString("Name Z–A", comment: "File browser sort: name descending"),
-            image: UIImage(systemName: "character.square")
-        ) { [weak self] _ in
-            settings.setPreferredFileSorting(.alphabeticalSorting)
-            settings.setPreferredFileSortingAscending(false)
-            self?.applyFilterAndSort()
-        }
-
-        let dateNewest = UIAction(
-            title: NSLocalizedString("Date (newest first)", comment: "File browser sort: date descending"),
-            image: UIImage(systemName: "clock")
-        ) { [weak self] _ in
-            settings.setPreferredFileSorting(.modificationDateSorting)
-            settings.setPreferredFileSortingAscending(false)
-            self?.applyFilterAndSort()
-        }
-
-        let dateOldest = UIAction(
-            title: NSLocalizedString("Date (oldest first)", comment: "File browser sort: date ascending"),
-            image: UIImage(systemName: "clock")
-        ) { [weak self] _ in
-            settings.setPreferredFileSorting(.modificationDateSorting)
-            settings.setPreferredFileSortingAscending(true)
-            self?.applyFilterAndSort()
-        }
-
-        nameAscending.state = (preferredSorting == .alphabeticalSorting && ascending) ? .on : .off
-        nameDescending.state = (preferredSorting == .alphabeticalSorting && !ascending) ? .on : .off
-        dateNewest.state = (preferredSorting == .modificationDateSorting && !ascending) ? .on : .off
-        dateOldest.state = (preferredSorting == .modificationDateSorting && ascending) ? .on : .off
-
-        sortingButton?.menu = UIMenu(children: [nameAscending, nameDescending, dateNewest, dateOldest])
+        sortingButton?.menu = UIMenu(
+            title: NSLocalizedString("Sorted by", comment: "File browser sort menu title"),
+            children: actions
+        )
     }
 
     private func addMenuToFilterButton() {
-        let filters: [FileTypeFilter] = [.all, .video, .audio, .documents]
+        let filters: [FileTypeFilter] = [.all, .videos, .audio, .images, .documents]
         let actions = filters.map { filter -> UIAction in
             let action = UIAction(title: filter.title, image: UIImage(systemName: filter.systemImageName)) { [weak self] _ in
                 guard let self, self.fileTypeFilter != filter else { return }
@@ -252,10 +291,12 @@ class DirectoryTableViewController: UITableViewController, UISearchResultsUpdati
             switch fileTypeFilter {
             case .all:
                 return true
-            case .video:
+            case .videos:
                 return NCUtils.isVideo(fileType: item.contentType)
             case .audio:
                 return NCUtils.isAudio(fileType: item.contentType)
+            case .images:
+                return NCUtils.isImage(fileType: item.contentType)
             case .documents:
                 return NCUtils.isDocument(fileType: item.contentType)
             }
@@ -394,21 +435,31 @@ class DirectoryTableViewController: UITableViewController, UISearchResultsUpdati
             self.navigationItem.leftBarButtonItem = UIBarButtonItem(barButtonSystemItem: .cancel, target: self, action: #selector(cancelButtonPressed))
             self.navigationItem.rightBarButtonItems = [sortingButton, filterButton]
 
-            let navigationLogo = UIImage(systemName: "house")
-            let navigationImageView = UIImageView(image: navigationLogo)
-            navigationImageView.image = navigationImageView.image?.withRenderingMode(.alwaysTemplate)
-            if #available(iOS 26.0, *) {
-                navigationImageView.tintColor = .label
+            if mode == .browse {
+                self.navigationItem.title = NSLocalizedString("SumbaFiles", comment: "Browse SumbaFiles navigation title")
+                self.navigationItem.titleView = nil
             } else {
-                navigationImageView.tintColor = NCAppBranding.themeTextColor()
+                let navigationLogo = UIImage(systemName: "house")
+                let navigationImageView = UIImageView(image: navigationLogo)
+                navigationImageView.image = navigationImageView.image?.withRenderingMode(.alwaysTemplate)
+                if #available(iOS 26.0, *) {
+                    navigationImageView.tintColor = .label
+                } else {
+                    navigationImageView.tintColor = NCAppBranding.themeTextColor()
+                }
+                self.navigationItem.titleView = navigationImageView
             }
-            self.navigationItem.titleView = navigationImageView
 
-            self.navigationItem.backBarButtonItem = UIBarButtonItem(image: navigationLogo, style: .plain, target: nil, action: nil)
+            let backImage = UIImage(systemName: "house")
+            self.navigationItem.backBarButtonItem = UIBarButtonItem(image: backImage, style: .plain, target: nil, action: nil)
             // Other directories
         } else {
-            let shareButton = UIBarButtonItem(image: UIImage(named: "sharing"), style: .plain, target: self, action: #selector(shareButtonPressed))
-            self.navigationItem.rightBarButtonItems = [sortingButton, filterButton, shareButton]
+            if mode == .share {
+                let shareButton = UIBarButtonItem(image: UIImage(named: "sharing"), style: .plain, target: self, action: #selector(shareButtonPressed))
+                self.navigationItem.rightBarButtonItems = [sortingButton, filterButton, shareButton]
+            } else {
+                self.navigationItem.rightBarButtonItems = [sortingButton, filterButton]
+            }
 
             self.navigationItem.title = (path as NSString).lastPathComponent
         }
@@ -522,12 +573,115 @@ class DirectoryTableViewController: UITableViewController, UISearchResultsUpdati
             let directoryVC = DirectoryTableViewController(path: selectedItemPath,
                                                            inRoom: token,
                                                            andThread: threadId,
+                                                           mode: mode,
                                                            fileTypeFilter: fileTypeFilter)
             self.navigationController?.pushViewController(directoryVC, animated: true)
+        } else if mode == .browse {
+            previewFile(item, at: selectedItemPath, cell: tableView.cellForRow(at: indexPath) as? DirectoryTableViewCell)
         } else {
             showConfirmationDialogForSharingItem(withPath: selectedItemPath, andName: item.fileName, isDirectory: false)
         }
 
         tableView.deselectRow(at: indexPath, animated: true)
+    }
+
+    // MARK: - Browse preview
+
+    private func previewFile(_ item: NKFile, at path: String, cell: DirectoryTableViewCell?) {
+        let account = NCDatabaseManager.sharedInstance().activeAccount()
+        let fileId = item.fileId
+        guard !fileId.isEmpty else {
+            presentPreviewUnavailable()
+            return
+        }
+
+        if let cell {
+            let parameter = NCMessageFileParameter(dictionary: [
+                "id": fileId,
+                "name": item.fileName,
+                "type": "file",
+                "path": path,
+                "mimetype": item.contentType,
+                "size": item.size,
+                "preview-available": item.hasPreview ? "yes" : "no"
+            ])
+            cell.fileParameter = parameter
+        }
+
+        let downloader = NCChatFileController(account: account)
+        downloader.delegate = self
+        downloader.downloadFile(withFileId: fileId)
+    }
+
+    private func presentPreviewUnavailable() {
+        let alert = UIAlertController(title: NSLocalizedString("Unable to load file", comment: ""),
+                                      message: NSLocalizedString("This file cannot be previewed.", comment: ""),
+                                      preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: ""), style: .default))
+        present(alert, animated: true)
+    }
+
+    func fileControllerDidLoadFile(_ fileController: NCChatFileController, with fileStatus: NCChatFileStatus) {
+        DispatchQueue.main.async {
+            if self.isPreviewControllerShown {
+                return
+            }
+
+            guard let fileLocalPath = fileStatus.fileLocalPath else { return }
+
+            self.previewControllerFilePath = fileLocalPath
+            self.isPreviewControllerShown = true
+
+            let fileExtension = URL(fileURLWithPath: fileLocalPath).pathExtension.lowercased()
+
+            if VLCKitVideoViewController.supportedFileExtensions.contains(fileExtension) {
+                let vlcViewController = VLCKitVideoViewController(filePath: fileLocalPath)
+                vlcViewController.delegate = self
+                vlcViewController.modalPresentationStyle = .fullScreen
+                self.present(vlcViewController, animated: true)
+                return
+            }
+
+            if fileExtension == "pkpass" {
+                if let passData = try? Data(contentsOf: URL(fileURLWithPath: fileLocalPath)),
+                   let pass = try? PKPass(data: passData),
+                   let addPassVC = PKAddPassesViewController(pass: pass) {
+                    self.present(addPassVC, animated: true)
+                    self.isPreviewControllerShown = false
+                    return
+                }
+            }
+
+            let previewController = QLPreviewController()
+            previewController.dataSource = self
+            previewController.delegate = self
+            self.present(previewController, animated: true)
+        }
+    }
+
+    func fileControllerDidFailLoadingFile(_ fileController: NCChatFileController, withFileId fileId: String, withErrorDescription errorDescription: String) {
+        DispatchQueue.main.async {
+            let alert = UIAlertController(title: NSLocalizedString("Unable to load file", comment: ""),
+                                          message: errorDescription,
+                                          preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: ""), style: .default))
+            self.present(alert, animated: true)
+        }
+    }
+
+    func numberOfPreviewItems(in controller: QLPreviewController) -> Int {
+        return 1
+    }
+
+    func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> any QLPreviewItem {
+        return FilePreviewItem(filePath: previewControllerFilePath)
+    }
+
+    func previewControllerDidDismiss(_ controller: QLPreviewController) {
+        isPreviewControllerShown = false
+    }
+
+    func vlckitVideoViewControllerDismissed(_ controller: VLCKitVideoViewController) {
+        isPreviewControllerShown = false
     }
 }

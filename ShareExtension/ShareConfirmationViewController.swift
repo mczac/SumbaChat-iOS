@@ -113,10 +113,49 @@ import AVFoundation
     private var lastAppliedCompressionSizesReady: Bool?
     private var lastAppliedCompressionControlEnabled: Bool?
 
+    /// Serial chat-attach state for multi-file albums (PUTs stay parallel).
+    private var albumShareSession: AlbumShareSession?
+
     private enum ShareConfirmationType {
         case text
         case item
         case objectShare
+    }
+
+    private final class AlbumShareSession {
+        let albumUUID: String?
+        var slots: [AlbumShareSlot]
+        var nextPostIndex = 0
+        var isPosting = false
+        /// Inclusive index from which attaches are skipped (failed PUT/post of an earlier slot).
+        var abortFromIndex: Int?
+
+        init(albumUUID: String?, slots: [AlbumShareSlot]) {
+            self.albumUUID = albumUUID
+            self.slots = slots
+        }
+
+        func slotIndex(for item: ShareItem) -> Int? {
+            slots.firstIndex { $0.item === item }
+        }
+
+        func markAbort(from index: Int) {
+            if let existing = abortFromIndex {
+                abortFromIndex = min(existing, index)
+            } else {
+                abortFromIndex = index
+            }
+        }
+    }
+
+    private struct AlbumShareSlot {
+        let item: ShareItem
+        let referenceId: String?
+        var filePath: String?
+        var draftFolderPath: String?
+        var uploadReady = false
+        var uploadFailed = false
+        var posted = false
     }
 
     private enum UploadHUDPhase {
@@ -1857,6 +1896,7 @@ import AVFoundation
             NCLog.log("Media upload: NK ready user=\(self.account.user) userId=\(self.account.userId) server=\(self.account.server) attachments=\(self.serverCapabilities.attachmentsFolder)")
         }
 
+        var uploadables: [ShareItem] = []
         for shareItem in self.shareItemController.shareItems {
             let byteCount = (try? FileManager.default.attributesOfItem(atPath: shareItem.filePath)[.size] as? NSNumber)?.int64Value ?? 0
             if byteCount == 0 {
@@ -1869,6 +1909,30 @@ import AVFoundation
                 ))
                 continue
             }
+            uploadables.append(shareItem)
+        }
+
+        let albumCount = uploadables.count
+        let canStampAlbum = albumCount >= 2
+            && NCDatabaseManager.sharedInstance().serverHasTalkCapability(.chatReferenceId, forAccountId: self.account.accountId)
+        let albumUUID = canStampAlbum ? SumbaMediaAlbum.makeAlbumUUID() : nil
+        var slots: [AlbumShareSlot] = []
+        for (offset, item) in uploadables.enumerated() {
+            let referenceId: String?
+            if let albumUUID {
+                referenceId = SumbaMediaAlbum.referenceId(uuid: albumUUID, index: offset + 1, count: albumCount)
+            } else {
+                referenceId = nil
+            }
+            slots.append(AlbumShareSlot(item: item, referenceId: referenceId))
+        }
+        self.albumShareSession = AlbumShareSession(albumUUID: albumUUID, slots: slots)
+        if let albumUUID {
+            NCLog.log("Media upload: album \(albumUUID) count=\(albumCount) — parallel PUT, serial attach")
+        }
+
+        for shareItem in uploadables {
+            let byteCount = (try? FileManager.default.attributesOfItem(atPath: shareItem.filePath)[.size] as? NSNumber)?.int64Value ?? 0
             let uploadName = shareItem.fileName ?? "file"
             let uploadPath = shareItem.filePath ?? "?"
             NCLog.log("Media upload: uploading \(uploadName) (\(byteCount) bytes) from \(uploadPath)")
@@ -1887,6 +1951,7 @@ import AVFoundation
                 } else {
                     NCLog.log("Error creating server path for upload")
                     self.uploadErrors.append(NSLocalizedString("Couldn't prepare the upload. Try again.", comment: "User-facing missing server path"))
+                    self.markAlbumSlotUploadFailed(for: shareItem)
                     self.uploadGroup.leave()
                 }
             } else {
@@ -1897,6 +1962,7 @@ import AVFoundation
                         NCLog.log(String(format: "Error finding unique upload name. code=%ld Error: %@", errorCode, errorDescription ?? "Unknown error"))
                         // errorDescription is already user-facing from NCAPIController.
                         self.uploadErrors.append(errorDescription ?? NCAPIController.userFacingFileUploadError(code: errorCode))
+                        self.markAlbumSlotUploadFailed(for: shareItem)
                         self.uploadGroup.leave()
                     }
                 }
@@ -1907,6 +1973,7 @@ import AVFoundation
             self.isUploadingMedia = false
             self.isPreparingForUpload = false
             self.uploadTasks.removeAll()
+            self.albumShareSession = nil
 
             let settle: () -> Void = { [weak self] in
                 guard let self else { return }
@@ -2013,6 +2080,7 @@ import AVFoundation
                             MediaUploadTrace.log("UPLOAD FAIL \(uploadName) PROPFIND \(technical)")
                             NCLog.log("Media upload: PROPFIND rejected \(uploadName) — \(technical)")
                             self.recordUploadError(fileName: uploadName, technical: technical)
+                            self.markAlbumSlotUploadFailed(for: item)
                             self.uploadGroup.leave()
                             return
                         }
@@ -2024,7 +2092,7 @@ import AVFoundation
                                                                  serverFileName: serverName,
                                                                  remoteBytes: remoteBytes,
                                                                  remoteModificationDate: remoteDate)
-                        self.postUploadedFileToRoom(filePath: filePath, draftFolderPath: draftFolderPath, item: item)
+                        self.enqueueAlbumPost(filePath: filePath, draftFolderPath: draftFolderPath, item: item)
                     }
                 } else if nkError.errorCode == 404 || nkError.errorCode == 409 {
                     MediaUploadTrace.log("UPLOAD retry \(uploadName) code=\(nkError.errorCode) (ensure folder)")
@@ -2040,6 +2108,7 @@ import AVFoundation
                         } else {
                             MediaUploadTrace.log("UPLOAD FAIL \(uploadName) code=\(nkError.errorCode) folder-create \(nkError.errorDescription)")
                             self.recordUploadError(code: nkError.errorCode, fileName: uploadName, technical: nkError.errorDescription)
+                            self.markAlbumSlotUploadFailed(for: item)
                             self.uploadGroup.leave()
                         }
                     }
@@ -2047,28 +2116,149 @@ import AVFoundation
                     MediaUploadTrace.log("UPLOAD FAIL \(uploadName) code=\(nkError.errorCode) \(nkError.errorDescription)")
                     NCLog.log(String(format: "Failed to upload file. Error: %@", nkError.errorDescription))
                     self.recordUploadError(code: nkError.errorCode, fileName: uploadName, technical: nkError.errorDescription)
+                    self.markAlbumSlotUploadFailed(for: item)
                     self.uploadGroup.leave()
                 }
             }
         }
     }
 
-    private func postUploadedFileToRoom(filePath: String, draftFolderPath: String?, item: ShareItem) {
+    private func markAlbumSlotUploadFailed(for item: ShareItem) {
+        guard let session = self.albumShareSession,
+              let index = session.slotIndex(for: item)
+        else { return }
+        session.slots[index].uploadFailed = true
+        // Skip this slot and later attaches so caption/order stay coherent.
+        session.markAbort(from: index)
+        self.drainAlbumPosts()
+    }
+
+    /// Mark upload ready and post in index order (never attach out of order).
+    private func enqueueAlbumPost(filePath: String, draftFolderPath: String?, item: ShareItem) {
         if self.mediaFlowCancelled {
             MediaUploadTrace.log("UPLOAD abort post \(item.fileName ?? "?") (cancelled)")
             self.uploadGroup.leave()
             return
         }
 
-        var talkMetaData: [String: Any] = [:]
-
-        let itemCaption = item.caption.trimmingCharacters(in: .whitespaces)
-        if !itemCaption.isEmpty {
-            talkMetaData["caption"] = itemCaption
+        guard let session = self.albumShareSession,
+              let index = session.slotIndex(for: item)
+        else {
+            // Fallback: post immediately (should not happen for normal send path).
+            self.postUploadedFileToRoom(filePath: filePath, draftFolderPath: draftFolderPath, item: item, referenceId: nil) { _ in
+                self.uploadGroup.leave()
+            }
+            return
         }
 
-        if self.shareSilently {
-            talkMetaData["silent"] = self.shareSilently
+        session.slots[index].filePath = filePath
+        session.slots[index].draftFolderPath = draftFolderPath
+        session.slots[index].uploadReady = true
+        NCLog.log("Media upload: PUT ready for attach index=\(index + 1)/\(session.slots.count) \(item.fileName ?? "file")")
+        self.drainAlbumPosts()
+    }
+
+    private func drainAlbumPosts() {
+        guard let session = self.albumShareSession, !session.isPosting else { return }
+
+        while session.nextPostIndex < session.slots.count {
+            if self.mediaFlowCancelled {
+                // Leave every remaining entered upload that is waiting on attach.
+                for index in session.nextPostIndex..<session.slots.count where session.slots[index].uploadReady && !session.slots[index].posted {
+                    session.slots[index].posted = true
+                    self.uploadGroup.leave()
+                }
+                return
+            }
+
+            let index = session.nextPostIndex
+            var slot = session.slots[index]
+
+            // PUT already failed — enter/leave handled by upload path; advance drain.
+            if slot.uploadFailed {
+                session.nextPostIndex += 1
+                continue
+            }
+
+            if let abortFrom = session.abortFromIndex, index >= abortFrom {
+                if slot.uploadReady && !slot.posted {
+                    NCLog.log("Media upload: skipping attach for \(slot.item.fileName ?? "file") (album aborted)")
+                    self.uploadErrors.append(String.localizedStringWithFormat(
+                        NSLocalizedString("“%@” was not shared because an earlier file failed.", comment: "Album attach aborted after prior failure"),
+                        slot.item.fileName ?? "file"
+                    ))
+                    slot.posted = true
+                    session.slots[index] = slot
+                    session.nextPostIndex += 1
+                    self.uploadGroup.leave()
+                    continue
+                }
+                // Still uploading — wait until PUT finishes, then skip.
+                return
+            }
+
+            guard slot.uploadReady, !slot.posted else { return }
+
+            session.isPosting = true
+            let referenceId = slot.referenceId
+            let filePath = slot.filePath ?? ""
+            let draftFolderPath = slot.draftFolderPath
+            let item = slot.item
+
+            NCLog.log("Media upload: attaching index=\(index + 1)/\(session.slots.count) ref=\(referenceId ?? "nil") \(item.fileName ?? "file")")
+            self.postUploadedFileToRoom(filePath: filePath, draftFolderPath: draftFolderPath, item: item, referenceId: referenceId) { success in
+                session.isPosting = false
+                session.slots[index].posted = true
+                session.nextPostIndex += 1
+                if !success {
+                    session.markAbort(from: index + 1)
+                }
+                self.uploadGroup.leave()
+                self.drainAlbumPosts()
+            }
+            return
+        }
+    }
+
+    private func postUploadedFileToRoom(filePath: String,
+                                        draftFolderPath: String?,
+                                        item: ShareItem,
+                                        referenceId: String?,
+                                        completion: @escaping (_ success: Bool) -> Void) {
+        if self.mediaFlowCancelled {
+            MediaUploadTrace.log("UPLOAD abort post \(item.fileName ?? "?") (cancelled)")
+            completion(false)
+            return
+        }
+
+        var talkMetaData: [String: Any] = [:]
+
+        let itemCaption = item.caption.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Album: only the last member notifies (1 push for N files). Earlier members are silent.
+        // Requires media-caption on the server (same capability as talkMetaData.silent).
+        let albumRef = SumbaMediaAlbum.parse(referenceId)
+        let silentAlbumMember = albumRef.map { !$0.isLastMember } ?? false
+        let silent = self.shareSilently || silentAlbumMember
+        if silent {
+            talkMetaData["silent"] = true
+        }
+
+        // Last album member: store push-ready caption (`Yo (3 media files)`) so the server
+        // notification body is correct without relying on the NSE. Chat strips the suffix.
+        if let albumRef, albumRef.isLastMember {
+            let body = SumbaMediaAlbumReference.notificationBody(count: albumRef.count, caption: itemCaption.isEmpty ? nil : itemCaption)
+            talkMetaData["caption"] = body
+            NCLog.log("Media upload: album attach \(albumRef.index)/\(albumRef.count) silent=\(silent) pushCaption=\(body.debugDescription) \(item.fileName ?? "file")")
+        } else if !itemCaption.isEmpty {
+            talkMetaData["caption"] = itemCaption
+            if let albumRef {
+                NCLog.log("Media upload: album attach \(albumRef.index)/\(albumRef.count) silent=\(silent) (albumMember=\(silentAlbumMember) shareSilent=\(self.shareSilently)) \(item.fileName ?? "file")")
+            }
+        } else if let albumRef {
+            NCLog.log("Media upload: album attach \(albumRef.index)/\(albumRef.count) silent=\(silent) (albumMember=\(silentAlbumMember) shareSilent=\(self.shareSilently)) \(item.fileName ?? "file")")
+        } else if silent {
+            NCLog.log("Media upload: attach silent=\(silent) \(item.fileName ?? "file")")
         }
 
         if let thread = self.thread {
@@ -2079,45 +2269,45 @@ import AVFoundation
             NCAPIController.sharedInstance().postConversationAttachment(inRoom: self.room.token,
                                                                         filePath: draftFolderPath,
                                                                         fileName: item.fileName,
-                                                                        referenceId: nil,
+                                                                        referenceId: referenceId,
                                                                         talkMetaData: talkMetaData,
                                                                         forAccount: self.account) { error in
                 if self.mediaFlowCancelled {
                     // Request may already have reached the server; do not count as local success.
                     MediaUploadTrace.log("UPLOAD abort post-callback \(item.fileName ?? "?") (cancelled)")
-                    self.uploadGroup.leave()
+                    completion(false)
                     return
                 }
                 if let error {
                     NCLog.log("Failed to post attachment. Error: \(error.localizedDescription)")
                     self.recordUploadError(fileName: item.fileName, technical: error.localizedDescription)
+                    completion(false)
                 } else {
-                    NCLog.log("Media upload: posted attachment \(item.fileName ?? "file") to room \(self.room.token ?? "?")")
+                    NCLog.log("Media upload: posted attachment \(item.fileName ?? "file") to room \(self.room.token ?? "?") ref=\(referenceId ?? "nil")")
                     self.uploadSuccess.append(item)
+                    completion(true)
                 }
-
-                self.uploadGroup.leave()
             }
         } else {
             NCAPIController.sharedInstance().shareFileOrFolder(forAccount: self.account,
                                                                atPath: filePath,
                                                                toRoom: self.room.token,
                                                                withTalkMetaData: talkMetaData,
-                                                               withReferenceId: nil) { error in
+                                                               withReferenceId: referenceId) { error in
                 if self.mediaFlowCancelled {
                     MediaUploadTrace.log("UPLOAD abort share-callback \(item.fileName ?? "?") (cancelled)")
-                    self.uploadGroup.leave()
+                    completion(false)
                     return
                 }
                 if let error {
                     NCLog.log(String(format: "Failed to share file. Error: %@", error.localizedDescription))
                     self.recordUploadError(fileName: item.fileName, technical: error.localizedDescription)
+                    completion(false)
                 } else {
-                    NCLog.log("Media upload: shared \(item.fileName ?? "file") to room \(self.room.token ?? "?")")
+                    NCLog.log("Media upload: shared \(item.fileName ?? "file") to room \(self.room.token ?? "?") ref=\(referenceId ?? "nil")")
                     self.uploadSuccess.append(item)
+                    completion(true)
                 }
-
-                self.uploadGroup.leave()
             }
         }
     }

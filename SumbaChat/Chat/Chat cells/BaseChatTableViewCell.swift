@@ -147,6 +147,11 @@ class BaseChatTableViewCell: UITableViewCell, AudioPlayerViewDelegate, Reactions
     internal var filePreviewActivityIndicator: MDCActivityIndicator?
     internal var filePreviewPlayIconImageView: UIImageView?
     internal var fileCurrentRequest: SDWebImageCombinedOperation?
+    internal var fileDownloadOverlayView: UIView?
+    internal var fileDownloadProgressView: UIProgressView?
+    internal var fileDownloadLabel: UILabel?
+    /// Left-aligned footer cache status (single icon, or album drive/cloud counts).
+    internal var cacheHitIconView: UIView?
 
     // Location cell
     internal var locationPreviewImageView: UIImageView?
@@ -203,8 +208,10 @@ class BaseChatTableViewCell: UITableViewCell, AudioPlayerViewDelegate, Reactions
         self.referenceView?.prepareForReuse()
 
         self.prepareForReuseFileCell()
+        self.prepareForReuseAlbumCell()
         self.prepareForReuseLocationCell()
         self.prepareForReuseAudioCell()
+        self.removeCacheHitIndicator()
 
         if let replyGestureRecognizer {
             self.removeGestureRecognizer(replyGestureRecognizer)
@@ -302,6 +309,7 @@ class BaseChatTableViewCell: UITableViewCell, AudioPlayerViewDelegate, Reactions
                 $0.removeFromSuperview()
             }
         }
+        self.removeCacheHitIndicator()
 
         if message.isDeleting {
             self.setDeliveryState(to: .deleting)
@@ -368,12 +376,18 @@ class BaseChatTableViewCell: UITableViewCell, AudioPlayerViewDelegate, Reactions
         if message.isVoiceMessage {
             // Audio message
             self.setupForAudioCell(with: message)
+            self.updateCacheHitIndicator(for: message, account: account)
         } else if message.poll != nil {
             // Poll message
             self.setupForPollCell(with: message)
         } else if message.file() != nil {
-            // File message
-            self.setupForFileCell(with: message, with: account)
+            // File / album message
+            if message.sumbaIsAlbumPrimary {
+                self.setupForAlbumCell(with: message, with: account)
+            } else {
+                self.setupForFileCell(with: message, with: account)
+            }
+            self.updateCacheHitIndicator(for: message, account: account)
         } else if message.geoLocation() != nil {
             // Location message
             self.setupForLocationCell(with: message)
@@ -384,9 +398,11 @@ class BaseChatTableViewCell: UITableViewCell, AudioPlayerViewDelegate, Reactions
 
         if message.isDeletedMessage {
             self.statusView.isHidden = true
+            self.cacheHitIconView?.isHidden = true
             self.messageTextView?.textColor = .tertiaryLabel
         } else {
             self.statusView.isHidden = false
+            self.cacheHitIconView?.isHidden = false
         }
 
         NotificationCenter.default.addObserver(self, selector: #selector(didChangeIsDownloading(notification:)), name: NSNotification.Name.NCChatFileControllerDidChangeIsDownloading, object: nil)
@@ -403,6 +419,146 @@ class BaseChatTableViewCell: UITableViewCell, AudioPlayerViewDelegate, Reactions
         view.heightAnchor.constraint(equalToConstant: 14).isActive = true
 
         self.statusView.addArrangedSubview(view)
+    }
+
+    private func removeCacheHitIndicator() {
+        cacheHitIconView?.removeFromSuperview()
+        cacheHitIconView = nil
+    }
+
+    private func isMessageFileCached(_ message: NCChatMessage, account: TalkAccount) -> Bool {
+        guard let file = message.file() else { return false }
+        let fileName: String
+        if !file.name.isEmpty {
+            fileName = file.name
+        } else if let path = file.path, !path.isEmpty {
+            fileName = (path as NSString).lastPathComponent
+        } else {
+            return false
+        }
+        let size = Int64(file.size ?? 0)
+        return size > 0
+            && MediaUploadDiskStore.hasCachedDownload(named: fileName, size: size, accountId: account.accountId)
+    }
+
+    /// Left-aligned footer: single-file drive/cloud icon; albums show `drive N · cloud M` (omit zero sides).
+    /// Time and delivery checks stay right-aligned in `statusView`.
+    private func updateCacheHitIndicator(for message: NCChatMessage, account: TalkAccount) {
+        removeCacheHitIndicator()
+
+        guard message.file() != nil else { return }
+
+        let tint = dateLabel.textColor ?? .secondaryLabel
+        let symbolConfig = UIImage.SymbolConfiguration(pointSize: 10, weight: .medium)
+        let container = UIStackView()
+        container.axis = .horizontal
+        container.alignment = .center
+        container.spacing = 3
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.accessibilityIdentifier = "CacheHitIcon"
+        container.isHidden = statusView.isHidden
+        container.setContentHuggingPriority(.required, for: .horizontal)
+        container.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        if message.sumbaIsAlbumPrimary, let members = message.sumbaAlbumMembers, members.count >= 2 {
+            var onDisk = 0
+            var inCloud = 0
+            for member in members {
+                if isMessageFileCached(member, account: account) {
+                    onDisk += 1
+                } else {
+                    inCloud += 1
+                }
+            }
+
+            if onDisk > 0 {
+                container.addArrangedSubview(cacheStatusIcon(systemName: "internaldrive", config: symbolConfig, tint: tint))
+                container.addArrangedSubview(cacheStatusCountLabel("\(onDisk)", tint: tint))
+            }
+            if onDisk > 0, inCloud > 0 {
+                container.addArrangedSubview(cacheStatusSeparator(tint: tint))
+            }
+            if inCloud > 0 {
+                container.addArrangedSubview(cacheStatusIcon(systemName: "cloud", config: symbolConfig, tint: tint))
+                container.addArrangedSubview(cacheStatusCountLabel("\(inCloud)", tint: tint))
+            }
+
+            var a11yParts: [String] = []
+            if onDisk > 0 {
+                a11yParts.append(String.localizedStringWithFormat(
+                    NSLocalizedString("%d saved on device", comment: "Album cache: count of locally cached files"),
+                    onDisk
+                ))
+            }
+            if inCloud > 0 {
+                a11yParts.append(String.localizedStringWithFormat(
+                    NSLocalizedString("%d not downloaded", comment: "Album cache: count of remote-only files"),
+                    inCloud
+                ))
+            }
+            container.isAccessibilityElement = true
+            container.accessibilityLabel = a11yParts.joined(separator: ", ")
+        } else {
+            let cached = isMessageFileCached(message, account: account)
+            let icon = cacheStatusIcon(systemName: cached ? "internaldrive" : "cloud", config: symbolConfig, tint: tint)
+            container.addArrangedSubview(icon)
+            container.isAccessibilityElement = true
+            container.accessibilityLabel = cached
+                ? NSLocalizedString("Saved on device", comment: "File is in local download cache")
+                : NSLocalizedString("Not downloaded", comment: "File is not in local download cache")
+        }
+
+        guard !container.arrangedSubviews.isEmpty else { return }
+
+        footerPart.addSubview(container)
+        NSLayoutConstraint.activate([
+            container.leadingAnchor.constraint(equalTo: footerPart.leadingAnchor, constant: 10),
+            container.centerYAnchor.constraint(equalTo: statusView.centerYAnchor),
+            container.heightAnchor.constraint(equalToConstant: 14),
+            // Stay clear of the trailing time/checks cluster on narrow bubbles.
+            container.trailingAnchor.constraint(lessThanOrEqualTo: statusView.leadingAnchor, constant: -6)
+        ])
+        cacheHitIconView = container
+    }
+
+    private func cacheStatusIcon(systemName: String, config: UIImage.SymbolConfiguration, tint: UIColor) -> UIImageView {
+        let icon = UIImageView(image: UIImage(systemName: systemName, withConfiguration: config))
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.contentMode = .scaleAspectFit
+        icon.tintColor = tint
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 14),
+            icon.heightAnchor.constraint(equalToConstant: 14)
+        ])
+        return icon
+    }
+
+    private func cacheStatusCountLabel(_ text: String, tint: UIColor) -> UILabel {
+        let label = UILabel()
+        label.text = text
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        label.textColor = tint
+        label.setContentHuggingPriority(.required, for: .horizontal)
+        return label
+    }
+
+    private func cacheStatusSeparator(tint: UIColor) -> UIView {
+        let wrap = UIView()
+        wrap.translatesAutoresizingMaskIntoConstraints = false
+        let line = UIView()
+        line.translatesAutoresizingMaskIntoConstraints = false
+        line.backgroundColor = tint.withAlphaComponent(0.35)
+        wrap.addSubview(line)
+        NSLayoutConstraint.activate([
+            wrap.widthAnchor.constraint(equalToConstant: 7),
+            wrap.heightAnchor.constraint(equalToConstant: 14),
+            line.widthAnchor.constraint(equalToConstant: 1),
+            line.heightAnchor.constraint(equalToConstant: 10),
+            line.centerXAnchor.constraint(equalTo: wrap.centerXAnchor),
+            line.centerYAnchor.constraint(equalTo: wrap.centerYAnchor)
+        ])
+        return wrap
     }
 
     func addSlideToReplyGestureRecognizer(for message: NCChatMessage) {
@@ -459,19 +615,16 @@ class BaseChatTableViewCell: UITableViewCell, AudioPlayerViewDelegate, Reactions
             self.statusView.addArrangedSubview(errorView)
 
         } else if deliveryState == .sent || deliveryState == .read {
-            var checkImageName = "check"
-
-            if deliveryState == .read {
-                checkImageName = "check-all"
-            }
-
+            let isRead = deliveryState == .read
+            let checkImageName = isRead ? "check-all" : "check"
             let checkImage = UIImage(named: checkImageName)?.withRenderingMode(.alwaysTemplate)
             let checkView = UIImageView(frame: .init(x: 0, y: 0, width: 20, height: 20))
 
             checkView.image = checkImage
             checkView.contentMode = .scaleAspectFit
-            checkView.tintColor = .secondaryLabel
-            checkView.accessibilityIdentifier = "MessageSent"
+            // WhatsApp-style: gray single tick when sent, blue double tick when read.
+            checkView.tintColor = isRead ? .systemBlue : .secondaryLabel
+            checkView.accessibilityIdentifier = isRead ? "MessageRead" : "MessageSent"
             checkView.widthAnchor.constraint(equalToConstant: 20).isActive = true
 
             self.statusView.addArrangedSubview(checkView)
@@ -687,16 +840,20 @@ class BaseChatTableViewCell: UITableViewCell, AudioPlayerViewDelegate, Reactions
         }
     }
 
-    // MARK: - File status / activity indicator
+    // MARK: - File status / download progress
 
     func clearFileStatusView() {
-            self.fileActivityIndicator?.stopAnimating()
-            self.fileActivityIndicator?.removeFromSuperview()
-            self.fileActivityIndicator = nil
+        self.fileActivityIndicator?.stopAnimating()
+        self.fileActivityIndicator?.removeFromSuperview()
+        self.fileActivityIndicator = nil
+        self.hideFileDownloadOverlay()
     }
 
+    /// Legacy corner spinner — kept for voice/temporary upload when no file preview thumb exists.
     func addActivityIndicator(with progress: Float) {
-        self.clearFileStatusView()
+        self.fileActivityIndicator?.stopAnimating()
+        self.fileActivityIndicator?.removeFromSuperview()
+        self.fileActivityIndicator = nil
 
         let fileActivityIndicator = MDCActivityIndicator(frame: .init(x: 0, y: 0, width: 20, height: 20))
         self.fileActivityIndicator = fileActivityIndicator
@@ -715,20 +872,150 @@ class BaseChatTableViewCell: UITableViewCell, AudioPlayerViewDelegate, Reactions
         self.statusView.addArrangedSubview(fileActivityIndicator)
     }
 
+    func updateFileDownloadProgress(with status: NCChatFileStatus) {
+        if self.filePreviewImageView != nil {
+            self.showFileDownloadOverlay(progress: status.downloadProgress,
+                                         completedBytes: status.completedBytes,
+                                         totalBytes: status.totalBytes,
+                                         canReportProgress: status.canReportProgress)
+        } else {
+            self.addActivityIndicator(with: status.canReportProgress ? status.downloadProgress : 0)
+        }
+    }
+
+    private func ensureFileDownloadOverlay() {
+        guard let preview = filePreviewImageView, fileDownloadOverlayView == nil else { return }
+
+        let overlay = UIView()
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        overlay.backgroundColor = UIColor.black.withAlphaComponent(0.40)
+        overlay.isUserInteractionEnabled = false
+        overlay.accessibilityIdentifier = "FileDownloadOverlay"
+
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .preferredFont(forTextStyle: .caption1)
+        label.adjustsFontForContentSizeCategory = true
+        label.textColor = .white
+        label.textAlignment = .center
+        label.numberOfLines = 1
+        label.adjustsFontSizeToFitWidth = true
+        label.minimumScaleFactor = 0.7
+        label.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+
+        let progress = UIProgressView(progressViewStyle: .bar)
+        progress.translatesAutoresizingMaskIntoConstraints = false
+        progress.progressTintColor = .white
+        progress.trackTintColor = UIColor.white.withAlphaComponent(0.28)
+        progress.layer.cornerRadius = 1.5
+        progress.clipsToBounds = true
+        progress.setContentHuggingPriority(.required, for: .vertical)
+        progress.setContentCompressionResistancePriority(.required, for: .vertical)
+
+        overlay.addSubview(label)
+        overlay.addSubview(progress)
+        preview.addSubview(overlay)
+
+        let labelBottom = label.bottomAnchor.constraint(equalTo: progress.topAnchor, constant: -6)
+        labelBottom.priority = .defaultHigh
+
+        NSLayoutConstraint.activate([
+            overlay.leadingAnchor.constraint(equalTo: preview.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: preview.trailingAnchor),
+            overlay.topAnchor.constraint(equalTo: preview.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: preview.bottomAnchor),
+
+            progress.leadingAnchor.constraint(equalTo: overlay.leadingAnchor, constant: 8),
+            progress.trailingAnchor.constraint(equalTo: overlay.trailingAnchor, constant: -8),
+            progress.bottomAnchor.constraint(equalTo: overlay.bottomAnchor, constant: -8),
+            progress.heightAnchor.constraint(equalToConstant: 3),
+
+            label.leadingAnchor.constraint(equalTo: overlay.leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: overlay.trailingAnchor, constant: -6),
+            labelBottom,
+            label.topAnchor.constraint(greaterThanOrEqualTo: overlay.topAnchor, constant: 4),
+            label.centerXAnchor.constraint(equalTo: overlay.centerXAnchor)
+        ])
+
+        self.fileDownloadOverlayView = overlay
+        self.fileDownloadProgressView = progress
+        self.fileDownloadLabel = label
+    }
+
+    private func showFileDownloadOverlay(progress: Float, completedBytes: Int64, totalBytes: Int64, canReportProgress: Bool) {
+        ensureFileDownloadOverlay()
+        fileDownloadOverlayView?.isHidden = false
+        filePreviewPlayIconImageView?.isHidden = true
+
+        // Short previews: bar only — label would clip.
+        let previewHeight = filePreviewImageView?.bounds.height
+            ?? filePreviewImageViewHeightConstraint?.constant
+            ?? 0
+        let showLabel = previewHeight >= 48
+        fileDownloadLabel?.isHidden = !showLabel
+
+        let indeterminate = !canReportProgress || totalBytes <= 0 || progress <= 0
+        if indeterminate {
+            fileDownloadProgressView?.setProgress(0, animated: false)
+            fileDownloadLabel?.text = NSLocalizedString("Loading…", comment: "File download in progress")
+        } else {
+            fileDownloadProgressView?.setProgress(min(max(progress, 0), 1), animated: true)
+            let loaded = NCUtils.readableFileSize(completedBytes)
+            let total = NCUtils.readableFileSize(totalBytes)
+            if loaded.isEmpty || total.isEmpty {
+                fileDownloadLabel?.text = NSLocalizedString("Loading…", comment: "File download in progress")
+            } else {
+                fileDownloadLabel?.text = String(format: NSLocalizedString("Loading %@ of %@", comment: "File download progress, e.g. Loading 12 MB of 40 MB"), loaded, total)
+            }
+        }
+    }
+
+    private func hideFileDownloadOverlay() {
+        fileDownloadOverlayView?.isHidden = true
+        fileDownloadProgressView?.setProgress(0, animated: false)
+        fileDownloadLabel?.text = nil
+    }
+
     // MARK: - File notifications
 
     @objc func didChangeIsDownloading(notification: Notification) {
         DispatchQueue.main.async {
-            // Make sure this notification is really for this cell
-            guard let fileParameter = self.message?.file(),
-                  let receivedStatus = NCChatFileStatus.getStatus(from: notification, for: fileParameter)
+            guard let message = self.message else { return }
+
+            // Single-file cell, or any member of an album mosaic.
+            let trackedFiles: [NCMessageFileParameter] = {
+                if let members = message.sumbaAlbumMembers, members.count >= 2 {
+                    return members.compactMap { $0.file() }
+                }
+                if let file = message.file() {
+                    return [file]
+                }
+                return []
+            }()
+
+            guard let receivedStatus = notification.userInfo?["fileStatus"] as? NCChatFileStatus,
+                  trackedFiles.contains(where: { $0.parameterId == receivedStatus.fileId })
             else { return }
 
-            if receivedStatus.isDownloading, self.fileActivityIndicator == nil {
-                // Immediately show an indeterminate indicator as long as we don't have a progress value
-                self.addActivityIndicator(with: 0)
-            } else if !receivedStatus.isDownloading, self.fileActivityIndicator != nil {
-                self.clearFileStatusView()
+            let isPrimaryFile = message.file()?.parameterId == receivedStatus.fileId
+
+            if receivedStatus.isDownloading {
+                if isPrimaryFile {
+                    self.updateFileDownloadProgress(with: receivedStatus)
+                }
+            } else {
+                if isPrimaryFile {
+                    self.clearFileStatusView()
+                    if let mimetype = message.file()?.mimetype,
+                       NCUtils.isVideo(fileType: mimetype),
+                       self.filePreviewImageView?.image != nil {
+                        self.filePreviewPlayIconImageView?.isHidden = false
+                    }
+                }
+                // Download finished (or cache hit) — refresh drive/cloud counts live.
+                if let account = self.account {
+                    self.updateCacheHitIndicator(for: message, account: account)
+                }
             }
         }
     }
@@ -740,16 +1027,7 @@ class BaseChatTableViewCell: UITableViewCell, AudioPlayerViewDelegate, Reactions
                   let receivedStatus = NCChatFileStatus.getStatus(from: notification, for: fileParameter)
             else { return }
 
-            if self.fileActivityIndicator != nil {
-                // Switch to determinate-mode and show progress
-                if receivedStatus.canReportProgress {
-                    self.fileActivityIndicator?.indicatorMode = .determinate
-                    self.fileActivityIndicator?.setProgress(Float(receivedStatus.downloadProgress), animated: true)
-                }
-            } else {
-                // Make sure we have an activity indicator added to this cell
-                self.addActivityIndicator(with: Float(receivedStatus.downloadProgress))
-            }
+            self.updateFileDownloadProgress(with: receivedStatus)
         }
     }
 }

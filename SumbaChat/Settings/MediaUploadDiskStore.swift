@@ -75,6 +75,21 @@ import UIKit
         return url
     }
 
+    /// Wipe per-account download + convert caches only. Does not touch other accounts or shared upload/thumbs.
+    @objc(purgeLocalCachesForAccountId:)
+    public func purgeLocalCaches(forAccountId accountId: String) {
+        guard !accountId.isEmpty else { return }
+        let encoded = accountId.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? accountId
+        let downloadURL = downloadRootURL.appendingPathComponent(encoded, isDirectory: true)
+        let convertURL = convertRootURL.appendingPathComponent(encoded, isDirectory: true)
+        for url in [downloadURL, convertURL] {
+            if fileManager.fileExists(atPath: url.path) {
+                try? fileManager.removeItem(at: url)
+                NCLog.log("MediaUploadDiskStore: purged \(url.lastPathComponent) cache for account \(accountId)")
+            }
+        }
+    }
+
     public func ensureDirectories() {
         for url in [cachesRootURL, downloadRootURL, uploadRootURL, convertRootURL, thumbsRootURL] {
             Self.createProtectedDirectory(at: url)
@@ -214,6 +229,17 @@ import UIKit
         var values = URLResourceValues()
         values.contentAccessDate = Date()
         try? url.setResourceValues(values)
+    }
+
+    /// Cheap chat-UI probe: download cache has `fileName` with matching byte size.
+    /// Does not delete stale files (unlike the download path’s mtime check).
+    public static func hasCachedDownload(named fileName: String, size: Int64, accountId: String) -> Bool {
+        guard !fileName.isEmpty, size > 0, !accountId.isEmpty else { return false }
+        let dir = shared.downloadDirectoryPath(forAccountId: accountId)
+        let path = (dir as NSString).appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: path) else { return false }
+        let localSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
+        return localSize == size
     }
 
     // MARK: - Convert cache

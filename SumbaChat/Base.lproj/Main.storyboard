@@ -144,7 +144,7 @@
         <scene sceneID="ZbW-mC-4pI">
             <objects>
                 <tableViewController id="IZS-G3-LBe" customClass="SettingsTableViewController" customModule="NextcloudTalk" customModuleProvider="target" sceneMemberID="viewController">
-                    <tableView key="view" clipsSubviews="YES" contentMode="scaleToFill" alwaysBounceVertical="YES" dataMode="prototypes" style="insetGrouped" separatorStyle="default" rowHeight="-1" estimatedRowHeight="-1" sectionHeaderHeight="18" sectionFooterHeight="18" id="b5X-rI-l6i">
+                    <tableView key="view" clipsSubviews="YES" contentMode="scaleToFill" alwaysBounceVertical="YES" dataMode="prototypes" style="insetGrouped" separatorStyle="default" rowHeight="-1" estimatedRowHeight="-1" sectionHeaderHeight="-1" estimatedSectionHeaderHeight="36" sectionFooterHeight="18" id="b5X-rI-l6i">
                         <rect key="frame" x="0.0" y="0.0" width="1366" height="946"/>
                         <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
                         <prototypes>

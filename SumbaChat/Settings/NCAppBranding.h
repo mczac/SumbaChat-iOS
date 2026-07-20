@@ -26,6 +26,12 @@ extern BOOL const multiAccountEnabled;
 extern BOOL const useAppsGroup;
 extern BOOL const forceDomain;
 extern NSString * const domain;
+/// Parent DNS label for branded login hosts (`{subdomain}.{baseDomain}`).
+extern NSString * const brandingBaseDomain;
+/// Default subdomain prefill when none is stored locally.
+extern NSString * const brandingDefaultSubdomain;
+/// Support inbox for Contact us.
+extern NSString * const brandingSupportEmail;
 extern BOOL const customNavigationLogo;
 
 + (NSString *)getAppVersionString;

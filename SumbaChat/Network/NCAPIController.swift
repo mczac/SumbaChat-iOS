@@ -2803,7 +2803,10 @@ class NCAPIController: NSObject, NKCommonDelegate {
     public func getMessageContext(inRoom token: String, forMessageId messageId: Int, inThread threadId: Int, withLimit limit: Int = 50, forAccount account: TalkAccount, completionBlock: @escaping (_ messages: [NCChatMessage]?, _ error: OcsError?) -> Void) {
         guard let apiSessionManager = self.getAPISessionManager(forAccountId: account.accountId),
               let encodedToken = token.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed)
-        else { return }
+        else {
+            completionBlock(nil, nil)
+            return
+        }
 
         let urlString = self.getRequestURL(forEndpoint: "chat/\(encodedToken)/\(messageId)/context", withAPIType: .chat, forAccount: account)
 
@@ -3658,17 +3661,36 @@ class NCAPIController: NSObject, NKCommonDelegate {
 
     // MARK: - User status
 
-    public func getUserStatus(forAccount account: TalkAccount, completionBlock: @escaping (_ userStatus: NCUserStatus?) -> Void) {
+    /// - Parameters:
+    ///   - completionBlock: `userStatus` is set on success. On failure `userStatus` is nil and
+    ///     `statusCode` is the HTTP status (404 = no status row yet for a brand-new account).
+    public func getUserStatus(forAccount account: TalkAccount, completionBlock: @escaping (_ userStatus: NCUserStatus?, _ statusCode: Int) -> Void) {
         guard let apiSessionManager = self.getAPISessionManager(forAccountId: account.accountId)
         else {
-            completionBlock(nil)
+            NCLog.log("getUserStatus: no API session for \(account.accountId)")
+            completionBlock(nil, 0)
             return
         }
 
         let urlString = "\(account.server)/ocs/v2.php/apps/user_status/api/v1/user_status"
 
-        apiSessionManager.getOcs(urlString, account: account) { ocsResponse, _ in
-            completionBlock(NCUserStatus(dictionary: ocsResponse?.dataDict))
+        apiSessionManager.getOcs(urlString, account: account) { ocsResponse, ocsError in
+            if let ocsError {
+                let code = ocsError.responseStatusCode
+                if code == 404 {
+                    // Expected for brand-new accounts until something creates oc_user_status.
+                    NCLog.log("getUserStatus: no status row yet for \(account.accountId) (HTTP 404)")
+                } else {
+                    NCLog.log("getUserStatus failed for \(account.accountId): HTTP \(code) — \(ocsError.underlyingError.localizedDescription)")
+                }
+                completionBlock(nil, code)
+                return
+            }
+            let status = NCUserStatus(dictionary: ocsResponse?.dataDict)
+            if status == nil {
+                NCLog.log("getUserStatus: empty/invalid payload for \(account.accountId)")
+            }
+            completionBlock(status, ocsResponse?.responseStatusCode ?? 200)
         }
     }
 
@@ -3676,13 +3698,17 @@ class NCAPIController: NSObject, NKCommonDelegate {
     public func setUserStatus(_ status: String, forAccount account: TalkAccount, completionBlock: @escaping (_ error: OcsError?) -> Void) {
         guard let apiSessionManager = self.getAPISessionManager(forAccountId: account.accountId)
         else {
-            completionBlock(nil)
+            NCLog.log("setUserStatus: no API session for \(account.accountId)")
+            completionBlock(OcsError.genericError())
             return
         }
 
         let urlString = "\(account.server)/ocs/v2.php/apps/user_status/api/v1/user_status/status"
 
         apiSessionManager.putOcs(urlString, account: account, parameters: ["statusType": status]) { _, ocsError in
+            if let ocsError {
+                NCLog.log("setUserStatus(\(status)) failed for \(account.accountId): HTTP \(ocsError.responseStatusCode) — \(ocsError.underlyingError.localizedDescription)")
+            }
             completionBlock(ocsError)
         }
     }

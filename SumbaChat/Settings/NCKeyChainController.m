@@ -116,6 +116,21 @@ NSString * const kNCPNPrivateKey                = @"ncPNPrivateKey";
     return status == errSecSuccess;
 }
 
+- (void)removeSecItemForKey:(NSString *)key accessGroup:(NSString *)accessGroup
+{
+    if (key.length == 0 || accessGroup.length == 0) {
+        return;
+    }
+
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: bundleIdentifier,
+        (__bridge id)kSecAttrAccount: key,
+        (__bridge id)kSecAttrAccessGroup: accessGroup
+    };
+    SecItemDelete((__bridge CFDictionaryRef)query);
+}
+
 - (void)setToken:(NSString *)token forAccountId:(NSString *)accountId
 {
     NSString *key = [NSString stringWithFormat:@"%@-%@", kNCTokenKey, accountId];
@@ -229,6 +244,28 @@ NSString * const kNCPNPrivateKey                = @"ncPNPrivateKey";
 - (void)removeAllItems
 {
     [UICKeyChainStore removeAllItemsForService:bundleIdentifier accessGroup:groupIdentifier];
+}
+
+- (void)removeCredentialsForAccountId:(NSString *)accountId
+{
+    if (accountId.length == 0) {
+        return;
+    }
+
+    NSString *tokenKey = [NSString stringWithFormat:@"%@-%@", kNCTokenKey, accountId];
+    NSString *publicKey = [NSString stringWithFormat:@"%@-%@", kNCPNPublicKey, accountId];
+    NSString *privateKey = [NSString stringWithFormat:@"%@-%@", kNCPNPrivateKey, accountId];
+
+    [_keychain removeItemForKey:tokenKey];
+    [_keychain removeItemForKey:publicKey];
+    [_keychain removeItemForKey:privateKey];
+
+    NSString *accessGroup = [self mainAppKeychainAccessGroup];
+    if (accessGroup.length > 0) {
+        [self removeSecItemForKey:tokenKey accessGroup:accessGroup];
+        [self removeSecItemForKey:publicKey accessGroup:accessGroup];
+        [self removeSecItemForKey:privateKey accessGroup:accessGroup];
+    }
 }
 
 #pragma mark - Utils

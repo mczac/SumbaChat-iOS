@@ -134,7 +134,7 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
 
     override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
         switch Section(rawValue: section)! {
-        case .engine: return NSLocalizedString("Video engine", comment: "")
+        case .engine: return NSLocalizedString("How videos are prepared", comment: "Section header for video encode method")
         case .caps: return NSLocalizedString("Automatic", comment: "")
         case .lowPhoto: return NSLocalizedString("Low compression", comment: "")
         case .mediumPhoto: return NSLocalizedString("Medium compression", comment: "")
@@ -183,32 +183,32 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
         switch Section(rawValue: section)! {
         case .engine:
             return NSLocalizedString(
-                "Presets use Apple export presets. Bitrate uses AVAssetWriter (rate, max size, edge, FPS, AAC bitrate/channels). Multiple videos encode one at a time; Bitrate batches use a lower max-edge cap for memory.",
+                "Choose how videos are prepared. Bitrate gives finer control over quality and size. Videos are prepared one at a time.",
                 comment: "Footer under video engine picker in Media Compression Settings"
             )
         case .caps:
             return NSLocalizedString(
-                "Automatic picks the best quality per file that stays under Max file size after the estimate margin: accept a level only when estimate × (1 + margin) < max. Photos default 20%, videos 10%. Selection is still limited to 10 files.",
+                "In Automatic mode, each file stays under Max file size when possible: originals first, then Low, Medium, and High as needed. You can attach up to 10 files at a time.",
                 comment: "Footer under Automatic caps in Media Compression Settings"
             )
         case .lowVideo:
             return NSLocalizedString(
-                "Top card: photos (JPEG quality and longest edge). Bottom card: video for this level. Low is the mildest shrink — larger files, better quality.",
+                "Photos above, video below. Low keeps more quality and larger files.",
                 comment: "Footer under Low compression photo+video pair"
             )
         case .mediumVideo:
             return NSLocalizedString(
-                "Medium is the balanced default for Manual chips and a common Automatic pick.",
+                "A balanced choice for most sends — good quality with smaller files.",
                 comment: "Footer under Medium compression photo+video pair"
             )
         case .highVideo:
             return NSLocalizedString(
-                "High is the most aggressive — smallest files, more quality loss. Chip size estimates are approximate.",
+                "Smallest files and faster sends, with more quality loss. Size previews are approximate.",
                 comment: "Footer under High compression photo+video pair"
             )
         case .actions:
             return NSLocalizedString(
-                "Restores Low, Medium, High, video engine, Automatic max size, and estimate margins to built-in defaults.",
+                "Restores all compression options on this screen to the built-in defaults.",
                 comment: "Footer under Reset to defaults in Media Compression Settings"
             )
         case .lowPhoto, .mediumPhoto, .highPhoto:
@@ -243,11 +243,11 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
         case .engine:
             if indexPath.row == 0 {
                 cell.textLabel?.text = NSLocalizedString("Presets", comment: "")
-                cell.detailTextLabel?.text = "AVAssetExportSession"
+                cell.detailTextLabel?.text = NSLocalizedString("Simple quality levels", comment: "Subtitle for Presets video engine")
                 cell.accessoryType = usesWriter ? .none : .checkmark
             } else {
                 cell.textLabel?.text = NSLocalizedString("Bitrate", comment: "")
-                cell.detailTextLabel?.text = "AVAssetWriter"
+                cell.detailTextLabel?.text = NSLocalizedString("Fine control of size and quality", comment: "Subtitle for Bitrate video engine")
                 cell.accessoryType = usesWriter ? .checkmark : .none
             }
         case .caps:
@@ -276,10 +276,10 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
             cell.textLabel?.text = NSLocalizedString("Max file size", comment: "")
             cell.detailTextLabel?.text = String(format: "%.1f MB", Double(settings.perFileMaxBytes) / 1_048_576)
         case .photoEstimateMargin:
-            cell.textLabel?.text = NSLocalizedString("Photo estimate margin", comment: "")
+            cell.textLabel?.text = NSLocalizedString("Photo size cushion", comment: "Optional Automatic safety margin for photos")
             cell.detailTextLabel?.text = String(format: "%.0f%%", settings.automaticPhotoEstimateMarginPercent)
         case .videoEstimateMargin:
-            cell.textLabel?.text = NSLocalizedString("Video estimate margin", comment: "")
+            cell.textLabel?.text = NSLocalizedString("Video size cushion", comment: "Optional Automatic safety margin for videos")
             cell.detailTextLabel?.text = String(format: "%.0f%%", settings.automaticVideoEstimateMarginPercent)
         }
     }
@@ -293,7 +293,7 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
                 currentMB: Double(settings.perFileMaxBytes) / 1_048_576,
                 values: [8, 12, 16, 20, 25, 30, 40, 50, 75, 100, 150, 200],
                 footer: NSLocalizedString(
-                    "Automatic tries High quality, else Medium, else Low quality. A level is accepted only when estimate × (1 + margin) stays under this size.",
+                    "Automatic aims to keep each file under this size. It tries the original first, then gentler compression, then stronger levels if needed.",
                     comment: "Footer under Automatic max file size picker"
                 )
             ) { mb in
@@ -304,13 +304,13 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
             }
         case .photoEstimateMargin:
             pushIntChoices(
-                title: NSLocalizedString("Photo estimate margin", comment: ""),
+                title: NSLocalizedString("Photo size cushion", comment: "Optional Automatic safety margin for photos"),
                 current: Int(settings.automaticPhotoEstimateMarginPercent.rounded()),
                 values: [0, 5, 10, 15, 20, 25, 30, 40, 50],
                 unit: "%",
                 footer: NSLocalizedString(
-                    "Extra headroom for Automatic photo size estimates. Default 20%. Accept a compression level only when estimate × (1 + margin) is under Max file size.",
-                    comment: "Footer under Automatic photo estimate margin picker"
+                    "Optional extra room when guessing photo sizes in Automatic mode. 0% uses Max file size as-is.",
+                    comment: "Footer under Automatic photo size cushion picker"
                 )
             ) { value in
                 self.settings.automaticPhotoEstimateMarginPercent = MediaUploadDebugSettings.clampedMarginPercent(Double(value))
@@ -318,13 +318,13 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
             }
         case .videoEstimateMargin:
             pushIntChoices(
-                title: NSLocalizedString("Video estimate margin", comment: ""),
+                title: NSLocalizedString("Video size cushion", comment: "Optional Automatic safety margin for videos"),
                 current: Int(settings.automaticVideoEstimateMarginPercent.rounded()),
                 values: [0, 5, 10, 15, 20, 25, 30, 40, 50],
                 unit: "%",
                 footer: NSLocalizedString(
-                    "Extra headroom for Automatic video size estimates. Default 10%. Accept a compression level only when estimate × (1 + margin) is under Max file size.",
-                    comment: "Footer under Automatic video estimate margin picker"
+                    "Optional extra room when guessing video sizes in Automatic mode. 0% uses Max file size as-is.",
+                    comment: "Footer under Automatic video size cushion picker"
                 )
             ) { value in
                 self.settings.automaticVideoEstimateMarginPercent = MediaUploadDebugSettings.clampedMarginPercent(Double(value))
@@ -341,10 +341,10 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
         }
         switch photoRow {
         case .jpegQuality:
-            cell.textLabel?.text = NSLocalizedString("JPEG quality", comment: "")
+            cell.textLabel?.text = NSLocalizedString("Photo quality", comment: "JPEG quality setting label")
             cell.detailTextLabel?.text = "\(profile.imageJPEGQuality)"
         case .imageMaxEdge:
-            cell.textLabel?.text = NSLocalizedString("Image max edge", comment: "")
+            cell.textLabel?.text = NSLocalizedString("Max photo size", comment: "Longest side of photo after resize")
             cell.detailTextLabel?.text = "\(profile.imageMaxDimension) px"
         }
     }
@@ -358,28 +358,28 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
             }
             switch videoRow {
             case .videoRate:
-                cell.textLabel?.text = NSLocalizedString("Video rate", comment: "")
+                cell.textLabel?.text = NSLocalizedString("Video quality", comment: "Video bitrate setting label")
                 cell.detailTextLabel?.text = String(format: "%.2f Mbps", profile.videoRateMbps)
             case .videoMaxMB:
-                cell.textLabel?.text = NSLocalizedString("Video max", comment: "")
+                cell.textLabel?.text = NSLocalizedString("Max video file size", comment: "")
                 cell.detailTextLabel?.text = String(format: "%.1f MB", Double(profile.videoMaxBytes) / 1_048_576)
             case .videoMaxEdge:
-                cell.textLabel?.text = NSLocalizedString("Video max edge", comment: "")
+                cell.textLabel?.text = NSLocalizedString("Max video size", comment: "Longest side of video after resize")
                 cell.detailTextLabel?.text = "\(profile.videoMaxEdge) px"
             case .videoFPS:
-                cell.textLabel?.text = NSLocalizedString("Video FPS", comment: "")
+                cell.textLabel?.text = NSLocalizedString("Frame rate", comment: "")
                 cell.detailTextLabel?.text = String(format: "%.0f", profile.videoFPS)
             case .audioBitrate:
-                cell.textLabel?.text = NSLocalizedString("Audio bitrate", comment: "")
+                cell.textLabel?.text = NSLocalizedString("Audio quality", comment: "Audio bitrate setting label")
                 cell.detailTextLabel?.text = "\(profile.audioBitrateKbps) kbps"
             case .audioChannels:
-                cell.textLabel?.text = NSLocalizedString("Audio channels", comment: "")
+                cell.textLabel?.text = NSLocalizedString("Audio", comment: "Mono/Stereo setting label")
                 cell.detailTextLabel?.text = profile.audioChannels > 1
                     ? NSLocalizedString("Stereo", comment: "")
                     : NSLocalizedString("Mono", comment: "")
             }
         } else {
-            cell.textLabel?.text = NSLocalizedString("Video preset", comment: "")
+            cell.textLabel?.text = NSLocalizedString("Video quality", comment: "Video preset setting label")
             cell.detailTextLabel?.text = MediaUploadDebugSettings.shortAVExportPreset(profile.exportPreset)
             cell.detailTextLabel?.numberOfLines = 1
             cell.detailTextLabel?.lineBreakMode = .byTruncatingTail
@@ -415,11 +415,11 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
         guard let photoRow = PhotoRow(rawValue: row) else { return }
         switch photoRow {
         case .jpegQuality:
-            pushIntChoices(title: "JPEG quality", current: profile.imageJPEGQuality,
+            pushIntChoices(title: NSLocalizedString("Photo quality", comment: "JPEG quality setting label"), current: profile.imageJPEGQuality,
                            values: [40, 50, 60, 70, 75, 80, 85, 90, 95, 100],
                            unit: nil,
                            footer: NSLocalizedString(
-                            "1–100 for re-encoded JPEG. Lower values shrink more and look softer.",
+                            "Photo quality from 1–100. Lower values make smaller, softer photos.",
                             comment: "Footer under JPEG quality picker"
                            )) { value in
                 var updated = self.settings[keyPath: keyPath]
@@ -428,11 +428,11 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
                 self.persistAndReload()
             }
         case .imageMaxEdge:
-            pushIntChoices(title: "Image max edge", current: profile.imageMaxDimension,
+            pushIntChoices(title: NSLocalizedString("Max photo size", comment: "Longest side of photo after resize"), current: profile.imageMaxDimension,
                            values: [640, 960, 1280, 1600, 1920, 2560, 3840, 4096, 8192],
                            unit: "px",
                            footer: NSLocalizedString(
-                            "Longest side after resize. Images already smaller than this are not upscaled.",
+                            "Longest side of the photo after resize. Smaller photos are left as they are.",
                             comment: "Footer under image max edge picker"
                            )) { value in
                 var updated = self.settings[keyPath: keyPath]
@@ -449,11 +449,11 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
             guard let videoRow = WriterVideoRow(rawValue: row) else { return }
             switch videoRow {
             case .videoRate:
-                pushDoubleChoices(title: "Video rate", current: profile.videoRateMbps,
+                pushDoubleChoices(title: NSLocalizedString("Video quality", comment: "Video bitrate setting label"), current: profile.videoRateMbps,
                                   values: [0.4, 0.8, 1.0, 1.5, 2.0, 2.5, 3.2, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0],
                                   unit: "Mbps", format: "%.2f",
                                   footer: NSLocalizedString(
-                                    "Target total bitrate for AVAssetWriter (video + audio) in megabits per second. Audio is reserved first; the rest goes to H.264. Lower is smaller and softer.",
+                                    "Overall video quality target. Lower values make smaller, softer videos.",
                                     comment: "Footer under video rate picker"
                                   )) { value in
                     var updated = self.settings[keyPath: keyPath]
@@ -462,11 +462,11 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
                     self.persistAndReload()
                 }
             case .videoMaxMB:
-                pushMegabyteChoices(title: "Video max size",
+                pushMegabyteChoices(title: NSLocalizedString("Max video file size", comment: ""),
                                     currentMB: Double(profile.videoMaxBytes) / 1_048_576,
                                     values: [5, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200],
                                     footer: NSLocalizedString(
-                                        "Soft ceiling for Writer output. Rate is reduced on long clips so size stays near this cap.",
+                                        "Preferred maximum size for this level. Longer clips may be compressed a bit more to stay near it.",
                                         comment: "Footer under video max size picker"
                                     )) { mb in
                     var updated = self.settings[keyPath: keyPath]
@@ -475,11 +475,11 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
                     self.persistAndReload()
                 }
             case .videoMaxEdge:
-                pushIntChoices(title: "Video max edge", current: profile.videoMaxEdge,
+                pushIntChoices(title: NSLocalizedString("Max video size", comment: "Longest side of video after resize"), current: profile.videoMaxEdge,
                                values: [480, 640, 720, 960, 1080, 1280, 1440, 1920, 2560, 3840],
                                unit: "px",
                                footer: NSLocalizedString(
-                                "Longest side for Writer output. Multi-video batches may apply a lower temporary cap.",
+                                "Longest side of the video after resize. Smaller videos are left as they are.",
                                 comment: "Footer under video max edge picker"
                                )) { value in
                     var updated = self.settings[keyPath: keyPath]
@@ -488,11 +488,11 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
                     self.persistAndReload()
                 }
             case .videoFPS:
-                pushDoubleChoices(title: "Video FPS", current: profile.videoFPS,
+                pushDoubleChoices(title: NSLocalizedString("Frame rate", comment: ""), current: profile.videoFPS,
                                   values: [15, 20, 24, 25, 30, 48, 50, 60],
                                   unit: "fps", format: "%.0f",
                                   footer: NSLocalizedString(
-                                    "Frame-rate cap for Writer. Source below this is left as-is.",
+                                    "Maximum frames per second. Videos already below this stay as they are.",
                                     comment: "Footer under video FPS picker"
                                   )) { value in
                     var updated = self.settings[keyPath: keyPath]
@@ -501,11 +501,11 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
                     self.persistAndReload()
                 }
             case .audioBitrate:
-                pushIntChoices(title: "Audio bitrate", current: profile.audioBitrateKbps,
+                pushIntChoices(title: NSLocalizedString("Audio quality", comment: "Audio bitrate setting label"), current: profile.audioBitrateKbps,
                                values: [32, 48, 64, 80, 96, 112, 128, 160, 192],
                                unit: "kbps",
                                footer: NSLocalizedString(
-                                "AAC bitrate for Writer. Reserved from the total video rate before H.264 encoding. Lower shrinks more.",
+                                "Audio quality for this level. Lower values make smaller files.",
                                 comment: "Footer under audio bitrate picker"
                                )) { value in
                     var updated = self.settings[keyPath: keyPath]
@@ -514,14 +514,14 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
                     self.persistAndReload()
                 }
             case .audioChannels:
-                pushChoices(title: NSLocalizedString("Audio channels", comment: ""),
+                pushChoices(title: NSLocalizedString("Audio", comment: "Mono/Stereo setting label"),
                             selectedId: profile.audioChannels > 1 ? "2" : "1",
                             choices: [
                                 ("1", NSLocalizedString("Mono", comment: ""), nil),
                                 ("2", NSLocalizedString("Stereo", comment: ""), nil)
                             ],
                             footer: NSLocalizedString(
-                                "AAC channel layout for Writer. Mono is smaller; stereo keeps left/right.",
+                                "Mono makes smaller files. Stereo keeps left and right channels.",
                                 comment: "Footer under audio channels picker"
                             )) { id in
                     var updated = self.settings[keyPath: keyPath]
@@ -614,9 +614,9 @@ final class MediaUploadCompressionDebugViewController: UITableViewController, De
         guard let selector = DetailedOptionsSelectorTableViewController(options: options,
                                                                         forSenderIdentifier: presetSenderId,
                                                                         andStyle: .insetGrouped) else { return }
-        selector.title = NSLocalizedString("Video preset", comment: "")
+        selector.title = NSLocalizedString("Video quality", comment: "Video preset setting label")
         selector.footerText = NSLocalizedString(
-            "Apple export preset for this compression level when using Presets. Low / Medium / High here are aggressiveness levels — not the same names as Apple’s LowQuality / MediumQuality / HighestQuality presets.",
+            "Built-in quality preset used when Presets is selected. Higher presets keep more detail and larger files.",
             comment: "Footer under video preset picker"
         )
         selector.delegate = self

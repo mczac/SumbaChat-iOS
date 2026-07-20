@@ -73,6 +73,7 @@ class DiagnosticsTableViewController: UITableViewController {
 
     enum LogsSections: Int {
         case kLogsSectionShowLogs = 0
+        case kLogsSectionClearLogs
         case kLogsSectionCount
     }
 
@@ -257,6 +258,18 @@ class DiagnosticsTableViewController: UITableViewController {
         }
     }
 
+    override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
+        switch section {
+        case DiagnosticsSections.kDiagnosticsSectionLogs.rawValue:
+            return String.localizedStringWithFormat(
+                NSLocalizedString("Logs are kept for %d days, then deleted automatically.", comment: "Diagnostics logs retention footer"),
+                NCLog.retentionDays
+            )
+        default:
+            return nil
+        }
+    }
+
     override func tableView(_ tableView: UITableView, willDisplayHeaderView view: UIView, forSection section: Int) {
         applyAppleStyleSectionHeader(view, title: self.tableView(tableView, titleForHeaderInSection: section))
     }
@@ -311,6 +324,11 @@ class DiagnosticsTableViewController: UITableViewController {
                   indexPath.row == LogsSections.kLogsSectionShowLogs.rawValue {
 
             presentLogfiles()
+
+        } else if indexPath.section == DiagnosticsSections.kDiagnosticsSectionLogs.rawValue,
+                  indexPath.row == LogsSections.kLogsSectionClearLogs.rawValue {
+
+            confirmClearAllLogs()
 
         } else if indexPath.section == DiagnosticsSections.kDiagnosticsSectionReset.rawValue,
                   indexPath.row == ResetSections.kResetSectionStoredMessages.rawValue {
@@ -682,13 +700,21 @@ class DiagnosticsTableViewController: UITableViewController {
     }
 
     func logsCell(for indexPath: IndexPath) -> UITableViewCell {
+        if indexPath.row == LogsSections.kLogsSectionClearLogs.rawValue {
+            let cell = tableView.dequeueReusableCell(withIdentifier: cellIdentifierAction, for: indexPath)
+            cell.textLabel?.text = NSLocalizedString("Clear all logs", comment: "Diagnostics: delete all saved logs")
+            cell.textLabel?.textAlignment = .center
+            cell.textLabel?.textColor = .systemRed
+            return cell
+        }
+
         let cell = tableView.dequeueReusableCell(withIdentifier: cellIdentifierSubtitleAccessory, for: indexPath)
         cell.accessoryType = .none
         cell.accessoryView = nil
 
         if indexPath.row == LogsSections.kLogsSectionShowLogs.rawValue {
             cell.accessoryType = .disclosureIndicator
-            cell.textLabel?.text = NSLocalizedString("Browse log files", comment: "")
+            cell.textLabel?.text = NSLocalizedString("Browse logs", comment: "")
             cell.detailTextLabel?.text = nil
         }
 
@@ -792,6 +818,24 @@ class DiagnosticsTableViewController: UITableViewController {
     func presentLogfiles() {
         let logfilesVC = LogfilesTableViewController()
         self.navigationController?.pushViewController(logfilesVC, animated: true)
+    }
+
+    func confirmClearAllLogs() {
+        let alert = UIAlertController(
+            title: NSLocalizedString("Clear all logs?", comment: ""),
+            message: NSLocalizedString("This permanently deletes all saved logs on this device.", comment: ""),
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel))
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Clear", comment: ""), style: .destructive) { _ in
+            NCLog.clearAllLogfiles()
+            NotificationPresenter.shared().present(
+                text: NSLocalizedString("Logs cleared", comment: ""),
+                dismissAfterDelay: 3.0,
+                includedStyle: .dark
+            )
+        })
+        present(alert, animated: true)
     }
 
     // MARK: Reset actions

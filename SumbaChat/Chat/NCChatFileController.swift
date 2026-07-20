@@ -24,9 +24,25 @@ public class NCChatFileController: NSObject {
     public var messageType: String?
     public var actionType: String?
     public private(set) var tempDirectoryPath = ""
+    public private(set) var isCancelled = false
 
     private let account: TalkAccount
     private var fileStatus: NCChatFileStatus?
+    private var downloadTask: URLSessionTask?
+
+    /// In-flight downloads survive leaving chat; cells re-bind via this registry.
+    private static let activeLock = NSLock()
+    private static var activeStatusByFileId: [String: NCChatFileStatus] = [:]
+
+    public static func activeStatus(forFileId fileId: String) -> NCChatFileStatus? {
+        activeLock.lock()
+        defer { activeLock.unlock() }
+        return activeStatusByFileId[fileId]
+    }
+
+    public static func isDownloading(fileId: String) -> Bool {
+        activeStatus(forFileId: fileId)?.isDownloading == true
+    }
 
     init(account: TalkAccount) {
         self.account = account
@@ -38,7 +54,39 @@ public class NCChatFileController: NSObject {
     }
 
     deinit {
+        unregisterActiveStatus()
         AllocationTracker.shared.removeAllocation()
+    }
+
+    /// Explicit cancel (does not run when merely leaving chat — downloads keep going).
+    public func cancel() {
+        isCancelled = true
+        downloadTask?.cancel()
+        downloadTask = nil
+        removePartialDownloadIfNeeded()
+        if fileStatus?.isDownloading == true {
+            didChangeIsDownloadingNotification(isDownloading: false)
+        }
+        MediaUploadTrace.log("CACHE download-CANCEL fileId=\(fileStatus?.fileId ?? "?")")
+    }
+
+    private func registerActiveStatus() {
+        guard let fileStatus else { return }
+        Self.activeLock.lock()
+        Self.activeStatusByFileId[fileStatus.fileId] = fileStatus
+        Self.activeLock.unlock()
+    }
+
+    private func unregisterActiveStatus() {
+        guard let fileId = fileStatus?.fileId else { return }
+        Self.activeLock.lock()
+        Self.activeStatusByFileId.removeValue(forKey: fileId)
+        Self.activeLock.unlock()
+    }
+
+    private func removePartialDownloadIfNeeded() {
+        guard let localPath = fileStatus?.fileLocalPath, !localPath.isEmpty else { return }
+        try? FileManager.default.removeItem(atPath: localPath)
     }
 
     private func initDownloadDirectory() {
@@ -138,8 +186,11 @@ public class NCChatFileController: NSObject {
     }
 
     public func downloadFile(withFileId fileId: String) {
+        isCancelled = false
         // getFileById already sets up NextcloudKit
         NCAPIController.sharedInstance().getFileById(forAccount: self.account, withFileId: fileId) { file, error in
+            guard !self.isCancelled else { return }
+
             guard let file else {
                 print("An error occurred while getting file with fileId \(fileId): \(error?.errorDescription ?? "")")
                 self.delegate?.fileControllerDidFailLoadingFile(self, withFileId: fileId, withErrorDescription: error?.errorDescription ?? "")
@@ -152,6 +203,7 @@ public class NCChatFileController: NSObject {
             let filePath = "\(directoryPath)\(file.fileName)"
 
             let fileStatus = NCChatFileStatus(fileId: file.fileId, fileName: file.fileName, filePath: filePath)
+            fileStatus.totalBytes = file.size
             self.fileStatus = fileStatus
 
             let serverUrlFileName = "\(self.account.server)\(NCAPIController.sharedInstance().filesPath(forAccount: self.account))/\(fileStatus.filePath)"
@@ -174,13 +226,30 @@ public class NCChatFileController: NSObject {
                 return
             }
 
+            guard !self.isCancelled else {
+                self.didChangeIsDownloadingNotification(isDownloading: false)
+                return
+            }
+
             MediaUploadTrace.log("CACHE download-MISS \(file.fileName) \(MediaUploadTrace.mb(file.size)) fileId=\(fileId) → \(fileLocalPath)")
 
-            NextcloudKit.shared.download(serverUrlFileName: serverUrlFileName, fileNameLocalPath: fileLocalPath, queue: .main) { _ in
-                print("Download task")
+            NextcloudKit.shared.download(serverUrlFileName: serverUrlFileName, fileNameLocalPath: fileLocalPath, queue: .main) { task in
+                self.downloadTask = task
+                if self.isCancelled {
+                    task.cancel()
+                }
             } progressHandler: { progress in
                 self.didChangeDownloadProgressNotification(progress: progress)
             } completionHandler: { _, _, _, _, _, error in
+                self.downloadTask = nil
+
+                if self.isCancelled || error.errorCode == URLError.cancelled.rawValue {
+                    try? FileManager.default.removeItem(atPath: fileLocalPath)
+                    MediaUploadTrace.log("CACHE download-CANCEL \(fileStatus.fileName)")
+                    self.didChangeIsDownloadingNotification(isDownloading: false)
+                    return
+                }
+
                 if error.errorCode == 0 {
                     // modificationDate = remote (STALE). creationDate + access = LRU seed.
                     self.setDate(onFile: fileLocalPath, withCreationDate: Date(), withModificationDate: file.date as Date)
@@ -197,6 +266,8 @@ public class NCChatFileController: NSObject {
                         NCChatFileController.enforceCacheSizeLimit(excludingPath: fileLocalPath)
                     }
                 } else {
+                    // Incomplete / failed download must not look like a cache hit.
+                    try? FileManager.default.removeItem(atPath: fileLocalPath)
                     MediaUploadTrace.log("CACHE download-FAIL \(fileStatus.fileName) code=\(error.errorCode) \(error.errorDescription)")
                     print("Error downloading file: \(error.errorCode) - \(error.errorDescription)")
                     self.delegate?.fileControllerDidFailLoadingFile(self, withFileId: fileStatus.fileId, withErrorDescription: error.errorDescription)
@@ -211,6 +282,14 @@ public class NCChatFileController: NSObject {
         guard let fileStatus else { return }
 
         fileStatus.isDownloading = isDownloading
+        if isDownloading {
+            registerActiveStatus()
+        } else {
+            fileStatus.downloadProgress = 0
+            fileStatus.completedBytes = 0
+            fileStatus.canReportProgress = false
+            unregisterActiveStatus()
+        }
 
         NotificationCenter.default.post(name: .NCChatFileControllerDidChangeIsDownloading, object: self, userInfo: ["fileStatus": fileStatus])
     }
@@ -219,7 +298,12 @@ public class NCChatFileController: NSObject {
         guard let fileStatus else { return }
 
         fileStatus.downloadProgress = Float(progress.fractionCompleted)
-        fileStatus.canReportProgress = progress.totalUnitCount != -1
+        fileStatus.canReportProgress = progress.totalUnitCount > 0
+        fileStatus.completedBytes = progress.completedUnitCount
+        if progress.totalUnitCount > 0 {
+            fileStatus.totalBytes = progress.totalUnitCount
+        }
+        registerActiveStatus()
 
         NotificationCenter.default.post(name: .NCChatFileControllerDidChangeDownloadProgress, object: self, userInfo: ["fileStatus": fileStatus])
     }

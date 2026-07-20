@@ -1423,11 +1423,14 @@ import Toast
     }
 
     func didPressTranscribeVoiceMessage(for message: NCChatMessage) {
+        guard let fileId = message.file()?.parameterId else { return }
+        if NCChatFileController.isDownloading(fileId: fileId) { return }
+
         let downloader = NCChatFileController(account: self.account)
         downloader.delegate = self
         downloader.messageType = kMessageTypeVoiceMessage
         downloader.actionType = actionTypeTranscribeVoiceMessage
-        downloader.downloadFile(withFileId: message.file().parameterId)
+        downloader.downloadFile(withFileId: fileId)
     }
 
     func didPressEdit(for message: NCChatMessage) {
@@ -2607,6 +2610,7 @@ import Toast
         var historyDict: [Date: [NCChatMessage]] = [:]
 
         self.internalAppendMessages(messages: historyMessages, inDictionary: &historyDict)
+        self.regroupMediaAlbums(in: &historyDict)
 
         var chatSection: Date?
         var historyMessagesForSection: [NCChatMessage]?
@@ -2648,7 +2652,7 @@ import Toast
 
                     firstChatMessage.isGroupMessage = self.shouldGroupMessage(newMessage: firstChatMessage, withMessage: lastHistoryMessage)
                     historyMessagesForSection.append(contentsOf: chatMessages)
-                    self.messages[chatSection] = historyMessagesForSection
+                    self.messages[chatSection] = SumbaMediaAlbum.collapseForDisplay(historyMessagesForSection)
                 }
             }
 
@@ -2699,6 +2703,7 @@ import Toast
             }
         }
 
+        self.regroupMediaAlbums(in: &self.messages)
         self.sortDateSections()
     }
 
@@ -2706,7 +2711,15 @@ import Toast
         // Because of the inout parameter, we can't call self.sortDateSections() inside the append function
         // Therefore we wrap it in this append function
         self.internalAppendMessages(messages: messages, inDictionary: &self.messages)
+        self.regroupMediaAlbums(in: &self.messages)
         self.sortDateSections()
+    }
+
+    private func regroupMediaAlbums(in dictionary: inout [Date: [NCChatMessage]]) {
+        for key in dictionary.keys {
+            guard let section = dictionary[key] else { continue }
+            dictionary[key] = SumbaMediaAlbum.collapseForDisplay(section)
+        }
     }
 
     private func internalAppendMessages(messages: [NCChatMessage], inDictionary dictionary: inout [Date: [NCChatMessage]]) {
@@ -2724,7 +2737,7 @@ import Toast
             let newMessageDate = Date(timeIntervalSince1970: TimeInterval(newMessage.timestamp))
             let keyDate = self.getKeyForDate(date: newMessageDate, inDictionary: dictionary)
 
-            if let keyDate, let messagesForDate = dictionary[keyDate] {
+            if let keyDate, var messagesForDate = dictionary[keyDate] {
                 var messageUpdated = false
 
                 // Check if we can update the message instead of adding a new one
@@ -2737,16 +2750,58 @@ import Toast
                         // even if the original message was grouped.
                         // Edited messages should not be grouped to make it clear, that the message was edited
                         newMessage.isGroupMessage = currentMessage.isGroupMessage && newMessage.actorType != "bots" && newMessage.lastEditTimestamp == 0
-                        dictionary[keyDate]?[messageIndex] = newMessage
+                        // Rebuild album from a flat member list (never nest a primary that still carries members).
+                        if let members = currentMessage.sumbaAlbumMembers, members.count >= 2 {
+                            var updatedMembers = members.map { member -> NCChatMessage in
+                                member.sumbaAlbumMembers = nil
+                                member.sumbaIsAlbumSatellite = false
+                                return member
+                            }
+                            if let memberIndex = updatedMembers.firstIndex(where: { $0.isSameMessage(currentMessage) || $0.isSameMessage(newMessage) }) {
+                                updatedMembers[memberIndex] = newMessage
+                            }
+                            let collapsed = SumbaMediaAlbum.collapseForDisplay(updatedMembers)
+                            if let primary = collapsed.first {
+                                primary.isGroupMessage = newMessage.isGroupMessage
+                                messagesForDate[messageIndex] = primary
+                            } else {
+                                messagesForDate[messageIndex] = newMessage
+                            }
+                        } else {
+                            messagesForDate[messageIndex] = newMessage
+                        }
+                        messageUpdated = true
+                        break
+                    }
+
+                    if let members = currentMessage.sumbaAlbumMembers,
+                       let memberIndex = members.firstIndex(where: { $0.isSameMessage(newMessage) }) {
+                        var updatedMembers = members.map { member -> NCChatMessage in
+                            member.sumbaAlbumMembers = nil
+                            member.sumbaIsAlbumSatellite = false
+                            return member
+                        }
+                        updatedMembers[memberIndex] = newMessage
+                        let collapsed = SumbaMediaAlbum.collapseForDisplay(updatedMembers)
+                        if let primary = collapsed.first {
+                            primary.isGroupMessage = currentMessage.isGroupMessage
+                            messagesForDate[messageIndex] = primary
+                        }
                         messageUpdated = true
                         break
                     }
                 }
 
-                if !messageUpdated, let lastMessage = messagesForDate.last {
-                    newMessage.isGroupMessage = self.shouldGroupMessage(newMessage: newMessage, withMessage: lastMessage)
-                    dictionary[keyDate]?.append(newMessage)
+                if !messageUpdated {
+                    if SumbaMediaAlbum.mergeIncoming(newMessage, into: &messagesForDate) {
+                        messageUpdated = true
+                    } else if let lastMessage = messagesForDate.last {
+                        newMessage.isGroupMessage = self.shouldGroupMessage(newMessage: newMessage, withMessage: lastMessage)
+                        messagesForDate.append(newMessage)
+                    }
                 }
+
+                dictionary[keyDate] = messagesForDate
             } else {
                 // Section not found, create new section and add message
                 dictionary[newMessageDate] = [newMessage]
@@ -3534,7 +3589,9 @@ import Toast
             height += voiceMessageCellPlayerHeight
 
         } else if let file = message.file() {
-            if file.previewImageHeight > 0 {
+            if message.sumbaIsAlbumPrimary, let members = message.sumbaAlbumMembers {
+                height += SumbaMediaAlbum.mosaicSize(forCount: members.count).height
+            } else if file.previewImageHeight > 0 {
                 height += CGFloat(file.previewImageHeight)
             } else if case let estimatedSize = BaseChatTableViewCell.getEstimatedPreviewSize(for: message), estimatedSize.height > 0 {
                 height += estimatedSize.height
@@ -3845,6 +3902,11 @@ import Toast
             if chatMessage.isSameMessage(message) {
                 return IndexPath(row: i, section: dateSection)
             }
+
+            if let members = chatMessage.sumbaAlbumMembers,
+               members.contains(where: { $0.isSameMessage(message) }) {
+                return IndexPath(row: i, section: dateSection)
+            }
         }
 
         return nil
@@ -4049,7 +4111,7 @@ import Toast
             }
         }
 
-        if fileParameter.fileStatus != nil && fileParameter.fileStatus?.isDownloading ?? false {
+        if NCChatFileController.isDownloading(fileId: fileParameter.parameterId) {
             print("File already downloading -> skipping new download")
             return
         }
@@ -4094,7 +4156,7 @@ import Toast
             return
         }
 
-        if fileParameter.fileStatus != nil && fileParameter.fileStatus?.isDownloading ?? false {
+        if NCChatFileController.isDownloading(fileId: fileParameter.parameterId) {
             print("File already downloading -> skipping new download")
             return
         }
@@ -4383,6 +4445,10 @@ import Toast
     }
 
     public func fileControllerDidFailLoadingFile(_ fileController: NCChatFileController, withFileId fileId: String, withErrorDescription errorDescription: String) {
+        if fileController.isCancelled {
+            return
+        }
+
         let alert = UIAlertController(title: NSLocalizedString("Unable to load file", comment: ""),
                                       message: errorDescription,
                                       preferredStyle: .alert)

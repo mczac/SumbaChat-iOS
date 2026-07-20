@@ -75,7 +75,7 @@ import UniformTypeIdentifiers
         } else if let legacyMBps = try c.decodeIfPresent(Double.self, forKey: .videoRateMBps) {
             videoRateMbps = legacyMBps * 8.0
         } else {
-            videoRateMbps = 3.2
+            videoRateMbps = 2.5
         }
         let videoMaxBytes = try c.decode(Int64.self, forKey: .videoMaxBytes)
         let videoMaxEdge = try c.decode(Int.self, forKey: .videoMaxEdge)
@@ -121,40 +121,43 @@ import UniformTypeIdentifiers
         Self.clampedAudioBitrateKbps(audioBitrateKbps) * 1000
     }
 
+    /// Mildest shrink: 1280 edge @ 6 Mbps (Automatic step after No Compression).
     public static var defaultLow: MediaUploadProfileConfig {
         MediaUploadProfileConfig(imageMaxDimension: 1920,
                                  imageJPEGQuality: 80,
-                                 videoRateMbps: 8.0,
-                                 videoMaxBytes: 100 * 1024 * 1024,
-                                 videoMaxEdge: 1920,
+                                 videoRateMbps: 6.0,
+                                 videoMaxBytes: 75 * 1024 * 1024,
+                                 videoMaxEdge: 1280,
                                  videoFPS: 30,
                                  exportPreset: "720p",
                                  audioBitrateKbps: 64,
                                  audioChannels: 2)
     }
 
+    /// Balanced: 960 edge @ 2.5 Mbps.
     public static var defaultMedium: MediaUploadProfileConfig {
         MediaUploadProfileConfig(imageMaxDimension: 1600,
                                  imageJPEGQuality: 50,
-                                 videoRateMbps: 3.2,
+                                 videoRateMbps: 2.5,
                                  videoMaxBytes: 40 * 1024 * 1024,
-                                 videoMaxEdge: 1280,
+                                 videoMaxEdge: 960,
                                  videoFPS: 30,
                                  exportPreset: "540p",
                                  audioBitrateKbps: 64,
                                  audioChannels: 2)
     }
 
+    /// Most aggressive: 640 edge @ 0.8 Mbps (Automatic last resort).
     public static var defaultHigh: MediaUploadProfileConfig {
         MediaUploadProfileConfig(imageMaxDimension: 1280,
                                  imageJPEGQuality: 15,
-                                 videoRateMbps: 0.96,
-                                 videoMaxBytes: 12 * 1024 * 1024,
+                                 videoRateMbps: 0.8,
+                                 videoMaxBytes: 15 * 1024 * 1024,
                                  videoMaxEdge: 640,
-                                 videoFPS: 24,
+                                 videoFPS: 30,
                                  exportPreset: "low",
                                  audioBitrateKbps: 64,
-                                 audioChannels: 1)
+                                 audioChannels: 2)
     }
 
     /// Copy with a lower encode max-edge (batch jetsam mitigation). Rate/FPS/audio unchanged.
@@ -181,9 +184,11 @@ import UniformTypeIdentifiers
     private static var cachedData: Data?
 
     /// Default Automatic estimate safety margin for photos (percent). `estimate × (1 + margin/100) < cap`.
-    public static let defaultAutomaticPhotoEstimateMarginPercent: Double = 20
+    /// Kept in code/settings for future use; currently 0% (no cushion).
+    public static let defaultAutomaticPhotoEstimateMarginPercent: Double = 0
     /// Default Automatic estimate safety margin for videos (percent).
-    public static let defaultAutomaticVideoEstimateMarginPercent: Double = 10
+    /// Kept in code/settings for future use; currently 0% (no cushion).
+    public static let defaultAutomaticVideoEstimateMarginPercent: Double = 0
 
     public var videoEngineRaw: Int
     public var perFileMaxBytes: Int64
@@ -210,7 +215,9 @@ import UniformTypeIdentifiers
         case audioSettingsVersion
     }
 
-    private static let currentAudioSettingsVersion = 2
+    /// v4: video ladder NoCompression → 1280@6 / 960@2.5 / 640@0.8 Mbps.
+    /// v5: Automatic photo/video estimate margins default to 0% (knobs remain in settings).
+    private static let currentAudioSettingsVersion = 5
 
     public var videoEngine: MediaUploadVideoEngine {
         get { MediaUploadVideoEngine(rawValue: videoEngineRaw) ?? .assetWriter }
@@ -229,7 +236,7 @@ import UniformTypeIdentifiers
                 low: MediaUploadProfileConfig = .defaultLow,
                 medium: MediaUploadProfileConfig = .defaultMedium,
                 high: MediaUploadProfileConfig = .defaultHigh,
-                audioSettingsVersion: Int = 2) {
+                audioSettingsVersion: Int = 5) {
         self.videoEngineRaw = videoEngineRaw
         self.perFileMaxBytes = perFileMaxBytes
         self.packageMaxBytes = packageMaxBytes
@@ -266,6 +273,15 @@ import UniformTypeIdentifiers
                   audioSettingsVersion: audioSettingsVersion)
         if audioSettingsVersion < Self.currentAudioSettingsVersion {
             applyDefaultAudioSettings()
+            if audioSettingsVersion < 4 {
+                applyDefaultVideoLadderSettings()
+            }
+            if audioSettingsVersion < 5 {
+                automaticPhotoEstimateMarginPercent = Self.defaultAutomaticPhotoEstimateMarginPercent
+                automaticVideoEstimateMarginPercent = Self.defaultAutomaticVideoEstimateMarginPercent
+            }
+            // Production engine is Writer for Automatic and Choose-on-upload.
+            videoEngine = .assetWriter
             self.audioSettingsVersion = Self.currentAudioSettingsVersion
         }
     }
@@ -278,6 +294,24 @@ import UniformTypeIdentifiers
         medium.audioChannels = MediaUploadProfileConfig.defaultMedium.audioChannels
         high.audioBitrateKbps = MediaUploadProfileConfig.defaultHigh.audioBitrateKbps
         high.audioChannels = MediaUploadProfileConfig.defaultHigh.audioChannels
+    }
+
+    /// One-shot migration: video edge / rate / max / fps / export preset ladder.
+    private func applyDefaultVideoLadderSettings() {
+        func applyVideo(_ target: inout MediaUploadProfileConfig, _ source: MediaUploadProfileConfig) {
+            target.videoRateMbps = source.videoRateMbps
+            target.videoMaxBytes = source.videoMaxBytes
+            target.videoMaxEdge = source.videoMaxEdge
+            target.videoFPS = source.videoFPS
+            target.exportPreset = source.exportPreset
+            target.imageMaxDimension = source.imageMaxDimension
+            target.imageJPEGQuality = source.imageJPEGQuality
+        }
+        applyVideo(&low, .defaultLow)
+        applyVideo(&medium, .defaultMedium)
+        applyVideo(&high, .defaultHigh)
+        perFileMaxBytes = 16 * 1024 * 1024
+        packageMaxBytes = 16 * 1024 * 1024
     }
 
     public func encode(to encoder: Encoder) throws {

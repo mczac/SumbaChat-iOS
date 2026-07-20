@@ -20,13 +20,13 @@ final class IntegrationUserStatus: TestBase {
         NCAPIController.sharedInstance().setUserStatus(kUserStatusOnline, forAccount: activeAccount) { error in
             XCTAssertNil(error)
 
-            NCAPIController.sharedInstance().getUserStatus(forAccount: activeAccount) { userStatus in
+            NCAPIController.sharedInstance().getUserStatus(forAccount: activeAccount) { userStatus, _ in
                 XCTAssertEqual(userStatus?.status, kUserStatusOnline)
 
                 NCAPIController.sharedInstance().setUserStatus(kUserStatusInvisible, forAccount: activeAccount) { error in
                     XCTAssertNil(error)
 
-                    NCAPIController.sharedInstance().getUserStatus(forAccount: activeAccount) { userStatus in
+                    NCAPIController.sharedInstance().getUserStatus(forAccount: activeAccount) { userStatus, _ in
                         XCTAssertEqual(userStatus?.status, kUserStatusInvisible)
 
                         exp.fulfill()

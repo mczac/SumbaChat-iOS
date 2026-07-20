@@ -47,7 +47,8 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
     private var filterButton: UIBarButtonItem?
     private var settingsButton: UIBarButtonItem!
     private var profileButton: UIButton!
-    private var activeUserStatus: NCUserStatus?
+    /// Latest status for the active account (also used to seed Settings without a “Fetching…” flash).
+    private(set) var activeUserStatus: NCUserStatus?
     private var refreshRoomsTimer: Timer?
     private var nextRoomWithMentionIndexPath: IndexPath?
     private var lastRoomWithMentionIndexPath: IndexPath?
@@ -391,6 +392,7 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
         if NCConnectionController.shared.appState == .ready {
             NCRoomsManager.shared.updateRoomsAndChats(updatingUserStatus: true, onlyLastModified: false, withCompletionBlock: nil)
             startRefreshRoomsTimer()
+            restoreOnlineStatusIfNeeded()
 
             DispatchQueue.main.async {
                 // Dispatch to main, otherwise the traitCollection is not updated yet and profile buttons shows wrong style
@@ -415,6 +417,8 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
 
     @objc private func activeAccountDidChange(_ notification: Notification) {
         DispatchQueue.main.async {
+            self.onlineStatusRestoreFailureCount = 0
+            self.lastOnlineStatusRestoreAt = nil
             self.activeFilter = .all
             self.refreshRoomList()
 
@@ -608,11 +612,26 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
         optionItems.append(openSettingsOption)
 
         let optionMenu = UIMenu(title: "", image: nil, identifier: nil, options: .displayInline, children: optionItems)
-
         accountPickerMenu.append(optionMenu)
+
+        let browseFilesOption = UIAction(
+            title: NSLocalizedString("Browse SumbaFiles", comment: "Open SumbaFiles browser from account menu"),
+            image: UIImage(systemName: "folder")?.withTintColor(.secondaryLabel, renderingMode: .alwaysOriginal),
+            identifier: nil
+        ) { [weak self] _ in
+            self?.presentSumbaFilesBrowser()
+        }
+        // Separate inline group so Browse sits below Settings with a separator.
+        accountPickerMenu.append(UIMenu(title: "", image: nil, identifier: nil, options: .displayInline, children: [browseFilesOption]))
 
         profileButton.menu = UIMenu(title: "", children: accountPickerMenu)
         profileButton.showsMenuAsPrimaryAction = true
+    }
+
+    private func presentSumbaFilesBrowser() {
+        let directoryVC = DirectoryTableViewController(browsePath: "")
+        let navigationController = NCNavigationController(rootViewController: directoryVC)
+        present(navigationController, animated: true)
     }
 
     // MARK: - Search controller
@@ -1009,6 +1028,7 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
             let isAppActive = UIApplication.shared.applicationState == .active
             NCRoomsManager.shared.updateRooms(updatingUserStatus: isAppActive, onlyLastModified: false)
             updateUserStatus()
+            restoreOnlineStatusIfNeeded()
             getUserThreads()
             startRefreshRoomsTimer()
             setupNavigationBar()
@@ -1021,6 +1041,7 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
         switch connectionState {
         case .connected:
             setOnlineAppearance()
+            restoreOnlineStatusIfNeeded()
         case .disconnected:
             setOfflineAppearance()
         default:
@@ -1181,11 +1202,119 @@ class RoomsTableViewController: UITableViewController, CCCertificateDelegate, UI
 
     private func updateUserStatus() {
         let activeAccount = NCDatabaseManager.sharedInstance().activeAccount()
-        NCAPIController.sharedInstance().getUserStatus(forAccount: activeAccount) { [weak self] userStatus in
+        NCAPIController.sharedInstance().getUserStatus(forAccount: activeAccount) { [weak self] userStatus, _ in
             if let userStatus {
                 self?.activeUserStatus = userStatus
                 self?.updateProfileButtonImage()
                 self?.updateAccountPickerMenu()
+            }
+        }
+    }
+
+    /// After sleep/disconnect the server often reports Offline. Lift only that automatic Offline
+    /// back to Online — never override Invisible, DND, Away, Busy, Online, or a user-chosen Offline.
+    /// Needed when the client UA is not in Talk-iOS’s online list: getRooms(updatingUserStatus:true) does not bump us Online
+    /// (UA not in server Talk-iOS list), unlike stock Nextcloud Talk.
+    private var lastOnlineStatusRestoreAt: Date?
+    private var onlineStatusRestoreRetryScheduled = false
+    private var onlineStatusRestoreInFlight = false
+    private var onlineStatusRestoreFailureCount = 0
+    private let onlineStatusRestoreMaxFailures = 5
+
+    private func restoreOnlineStatusIfNeeded() {
+        // Reachability may still be `.unknown` at first ready — push a sync check.
+        if NCConnectionController.shared.connectionState != .connected {
+            NCConnectionController.shared.checkConnectionState()
+        }
+
+        guard NCConnectionController.shared.appState == .ready,
+              NCConnectionController.shared.connectionState == .connected else {
+            NCLog.log("restoreOnlineStatus: skip (appState=\(NCConnectionController.shared.appState.rawValue) connection=\(NCConnectionController.shared.connectionState.rawValue))")
+            // Do not retry-loop here — `.ready` / `.connected` notifications re-enter restore.
+            return
+        }
+
+        // Debounce only successful attempts — failed GETs during reconnect must be allowed to retry.
+        if onlineStatusRestoreInFlight { return }
+        if let lastOnlineStatusRestoreAt,
+           Date().timeIntervalSince(lastOnlineStatusRestoreAt) < 5 {
+            return
+        }
+
+        let activeAccount = NCDatabaseManager.sharedInstance().activeAccount()
+        guard NCDatabaseManager.sharedInstance().serverCapabilities(forAccountId: activeAccount.accountId)?.userStatus == true else {
+            NCLog.log("restoreOnlineStatus: skip (userStatus capability off)")
+            return
+        }
+
+        onlineStatusRestoreInFlight = true
+        NCAPIController.sharedInstance().getUserStatus(forAccount: activeAccount) { [weak self] userStatus, statusCode in
+            guard let self else { return }
+            defer { self.onlineStatusRestoreInFlight = false }
+
+            // 404 = brand-new account with no oc_user_status row yet — create Online via PUT.
+            if userStatus == nil, statusCode == 404 {
+                NCLog.log("restoreOnlineStatus: no status row yet — setting online")
+                self.lastOnlineStatusRestoreAt = Date()
+                self.setOnlineStatusAfterRestore(forAccount: activeAccount)
+                return
+            }
+
+            guard let userStatus else {
+                self.onlineStatusRestoreFailureCount += 1
+                if self.onlineStatusRestoreFailureCount >= self.onlineStatusRestoreMaxFailures {
+                    NCLog.log("restoreOnlineStatus: getUserStatus failed — giving up after \(self.onlineStatusRestoreMaxFailures) attempts")
+                    return
+                }
+                NCLog.log("restoreOnlineStatus: getUserStatus failed HTTP \(statusCode) — retry \(self.onlineStatusRestoreFailureCount)/\(self.onlineStatusRestoreMaxFailures)")
+                self.scheduleOnlineStatusRestoreRetry()
+                return
+            }
+
+            self.onlineStatusRestoreFailureCount = 0
+            self.lastOnlineStatusRestoreAt = Date()
+
+            let status = userStatus.status ?? ""
+            NCLog.log("restoreOnlineStatus: server status=\(status) userDefined=\(userStatus.statusIsUserDefined)")
+
+            DispatchQueue.main.async {
+                self.activeUserStatus = userStatus
+                self.updateProfileButtonImage()
+                self.updateAccountPickerMenu()
+            }
+
+            // Only lift automatic Offline (server-set). Leave Invisible/DND/Away/Busy/Online alone.
+            guard status == kUserStatusOffline, !userStatus.statusIsUserDefined else { return }
+
+            self.setOnlineStatusAfterRestore(forAccount: activeAccount)
+        }
+    }
+
+    private func setOnlineStatusAfterRestore(forAccount activeAccount: TalkAccount) {
+        NCAPIController.sharedInstance().setUserStatus(kUserStatusOnline, forAccount: activeAccount) { [weak self] error in
+            if let error {
+                NCLog.log("restoreOnlineStatus: set online failed HTTP \(error.responseStatusCode) — \(error.underlyingError.localizedDescription)")
+                self?.lastOnlineStatusRestoreAt = nil
+                self?.onlineStatusRestoreFailureCount += 1
+                if let self, self.onlineStatusRestoreFailureCount < self.onlineStatusRestoreMaxFailures {
+                    self.scheduleOnlineStatusRestoreRetry()
+                }
+                return
+            }
+            NCLog.log("restoreOnlineStatus: set online OK")
+            self?.onlineStatusRestoreFailureCount = 0
+            self?.updateUserStatus()
+        }
+    }
+
+    private func scheduleOnlineStatusRestoreRetry() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.onlineStatusRestoreRetryScheduled else { return }
+            self.onlineStatusRestoreRetryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self else { return }
+                self.onlineStatusRestoreRetryScheduled = false
+                self.restoreOnlineStatusIfNeeded()
             }
         }
     }

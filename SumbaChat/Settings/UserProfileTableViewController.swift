@@ -50,6 +50,8 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
     var setPhoneAction = UIAlertAction()
     var editableFields = NSArray()
     var showScopes = Bool()
+    /// `nil` = still checking; drives green / orange / red on the Switch server row.
+    var serverStatus: SumbaServerConfiguration.ServerStatus?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -84,6 +86,11 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
         }
     }
 
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        refreshServerReachability()
+    }
+
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         // Workaround to fix label width
@@ -115,6 +122,10 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
         let profileSection = sections[section]
         if profileSection == ProfileSection.kProfileSectionSummary.rawValue {
             return self.rowsInSummarySection().count
+        }
+        if profileSection == ProfileSection.kProfileSectionRemoveAccount.rawValue {
+            // Switch server (keep current account) + Log out
+            return 2
         }
         return 1
     }
@@ -153,6 +164,14 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
         let profileSection = sections[section]
         if profileSection == ProfileSection.kProfileSectionEmail.rawValue {
             return NSLocalizedString("For password reset and notifications", comment: "")
+        }
+        if profileSection == ProfileSection.kProfileSectionRemoveAccount.rawValue {
+            // Always show a footer so status changes don’t insert/remove a block and shift Log out.
+            // Same copy for all statuses so orange/red keep the “account stays connected” clarity.
+            return NSLocalizedString(
+                "Tap to sign in on another server. Your current account stays connected.",
+                comment: "Footer under Switch server"
+            )
         }
         return nil
     }
@@ -202,6 +221,9 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
         case ProfileSection.kProfileSectionSummary.rawValue:
             return summaryCellForRow(row: indexPath.row)
         case ProfileSection.kProfileSectionRemoveAccount.rawValue:
+            if indexPath.row == 0 {
+                return switchServerCell()
+            }
             let actionTitle = NSLocalizedString("Log out", comment: "")
             let actionImage = UIImage(systemName: "arrow.right.square")?.applyingSymbolConfiguration(iconConfiguration)
             return actionCellWith(identifier: "RemoveAccountCellIdentifier", text: actionTitle, textColor: .systemRed, image: actionImage, tintColor: .systemRed)
@@ -215,7 +237,11 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
         let sections = getProfileSections()
         let section = sections[indexPath.section]
         if section == ProfileSection.kProfileSectionRemoveAccount.rawValue {
-            self.showLogoutConfirmationDialog()
+            if indexPath.row == 0 {
+                self.switchServer()
+            } else {
+                self.showLogoutConfirmationDialog()
+            }
         } else if section == ProfileSection.kProfileSectionPhoneNumber.rawValue {
             self.presentSetPhoneNumberDialog()
         }
@@ -327,5 +353,119 @@ extension UserProfileTableViewController {
         actionCell.imageView?.tintColor = tintColor
 
         return actionCell
+    }
+
+    func switchServerCell() -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "SwitchServerCellIdentifier")
+            ?? UITableViewCell(style: .subtitle, reuseIdentifier: "SwitchServerCellIdentifier")
+
+        cell.textLabel?.text = SumbaServerConfiguration.displayHost(fromServerURL: account.server)
+        cell.textLabel?.textColor = .label
+        cell.textLabel?.numberOfLines = 1
+        cell.textLabel?.lineBreakMode = .byTruncatingMiddle
+        cell.textLabel?.adjustsFontForContentSizeCategory = true
+        switch serverStatus {
+        case .online:
+            cell.detailTextLabel?.text = NSLocalizedString("SumbaChat server is online", comment: "")
+        case .maintenance:
+            cell.detailTextLabel?.text = NSLocalizedString("SumbaChat server is under maintenance", comment: "")
+        case .offline:
+            cell.detailTextLabel?.text = NSLocalizedString("SumbaChat server is offline", comment: "")
+        case .none:
+            cell.detailTextLabel?.text = NSLocalizedString("Checking server…", comment: "")
+        }
+        cell.detailTextLabel?.textColor = .secondaryLabel
+        cell.detailTextLabel?.numberOfLines = 1
+        cell.detailTextLabel?.adjustsFontForContentSizeCategory = true
+        cell.imageView?.subviews.forEach { $0.removeFromSuperview() }
+        // Align with Email / Log out left icons; status stays on the trailing accessory.
+        cell.imageView?.image = UIImage(systemName: "server.rack")?.applyingSymbolConfiguration(iconConfiguration)
+        cell.imageView?.tintColor = .secondaryLabel
+        cell.accessoryType = .none
+        cell.accessoryView = switchServerAccessoryView(status: serverStatus)
+
+        return cell
+    }
+
+    /// Trailing accessory: fixed-size status slot (spinner or dot) + disclosure chevron.
+    /// Fixed slot size keeps cell layout stable when status resolves.
+    private func switchServerAccessoryView(status: SumbaServerConfiguration.ServerStatus?) -> UIView {
+        let statusSlotSize: CGFloat = 20
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.alignment = .center
+        stack.spacing = 8
+
+        let statusSlot = UIView()
+        statusSlot.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            statusSlot.widthAnchor.constraint(equalToConstant: statusSlotSize),
+            statusSlot.heightAnchor.constraint(equalToConstant: statusSlotSize)
+        ])
+
+        if let status {
+            let dot = UIImageView(image: UIImage(systemName: "circle.fill"))
+            dot.translatesAutoresizingMaskIntoConstraints = false
+            switch status {
+            case .online:
+                dot.tintColor = .systemGreen
+            case .maintenance:
+                dot.tintColor = .systemOrange
+            case .offline:
+                dot.tintColor = .systemRed
+            }
+            statusSlot.addSubview(dot)
+            NSLayoutConstraint.activate([
+                dot.widthAnchor.constraint(equalToConstant: 12),
+                dot.heightAnchor.constraint(equalToConstant: 12),
+                dot.centerXAnchor.constraint(equalTo: statusSlot.centerXAnchor),
+                dot.centerYAnchor.constraint(equalTo: statusSlot.centerYAnchor)
+            ])
+        } else {
+            let spinner = UIActivityIndicatorView(style: .medium)
+            spinner.translatesAutoresizingMaskIntoConstraints = false
+            spinner.color = .secondaryLabel
+            spinner.startAnimating()
+            statusSlot.addSubview(spinner)
+            NSLayoutConstraint.activate([
+                spinner.centerXAnchor.constraint(equalTo: statusSlot.centerXAnchor),
+                spinner.centerYAnchor.constraint(equalTo: statusSlot.centerYAnchor)
+            ])
+        }
+        stack.addArrangedSubview(statusSlot)
+
+        let chevron = UIImageView(image: UIImage(systemName: "chevron.right"))
+        chevron.tintColor = .tertiaryLabel
+        chevron.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+        chevron.setContentHuggingPriority(.required, for: .horizontal)
+        stack.addArrangedSubview(chevron)
+
+        let size = stack.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize)
+        stack.bounds = CGRect(origin: .zero, size: size)
+        return stack
+    }
+
+    func reloadSwitchServerSection() {
+        guard let section = getProfileSections().firstIndex(of: ProfileSection.kProfileSectionRemoveAccount.rawValue) else {
+            return
+        }
+        // Row + footer together (footer copy changes with status; all states reserve space).
+        tableView.reloadSections(IndexSet(integer: section), with: .none)
+    }
+
+    func refreshServerReachability() {
+        let previous = serverStatus
+        // Keep last known color while re-checking to avoid spinner↔dot flicker on re-entry.
+        if previous == nil {
+            reloadSwitchServerSection()
+        }
+
+        let server = account.server
+        SumbaServerConfiguration.checkServerStatus(serverURL: server) { [weak self] status in
+            guard let self else { return }
+            guard self.serverStatus != status else { return }
+            self.serverStatus = status
+            self.reloadSwitchServerSection()
+        }
     }
 }

@@ -194,24 +194,53 @@ class NotificationService: UNNotificationServiceExtension {
             self.bestAttemptContent?.body = markdownMessage.string
         }
 
-        guard let fileDict = serverNotification.messageRichParameters["file"] as? [String: Any],
-              let file = NCMessageFileParameter(dictionary: fileDict), file.previewAvailable else {
+        self.applyAlbumNotificationBodyIfNeeded(withServerNotification: serverNotification, forAccount: account) {
+            guard let fileDict = serverNotification.messageRichParameters["file"] as? [String: Any],
+                  let file = NCMessageFileParameter(dictionary: fileDict), file.previewAvailable else {
 
-            // No file/no preview -> show notification
-            self.createAndShowConversationNotification(withPushNotification: pushNotification, serverNotification: serverNotification)
+                // No file/no preview -> show notification
+                self.createAndShowConversationNotification(withPushNotification: pushNotification, serverNotification: serverNotification)
+                return
+            }
+
+            // First try to create the conversation notification, and only afterwards try to retrieve the image preview
+            self.createConversationNotification(withPushNotification: pushNotification, serverNotification: serverNotification) {
+                SDWebImageDownloader.shared.config.downloadTimeout = 25.0
+                NCAPIController.shared.getPreviewForFile(file.parameterId, width: 0, height: 512, forAccount: account) { image, _ in
+                    if let image, let attachment = self.getNotificationAttachment(fromImage: image, forAccountId: account.accountId) {
+                        self.bestAttemptContent?.attachments = [attachment]
+                    }
+
+                    self.showBestAttemptNotification()
+                }
+            }
+        }
+    }
+
+    /// Album pushes: `Hey (4 media files)` — message first, count in brackets. Single preview image is enough (no mosaic).
+    private func applyAlbumNotificationBodyIfNeeded(withServerNotification serverNotification: NCNotification,
+                                                    forAccount account: TalkAccount,
+                                                    completion: @escaping () -> Void) {
+        guard serverNotification.messageRichParameters["file"] != nil,
+              serverNotification.messageId > 0 else {
+            completion()
             return
         }
 
-        // First try to create the conversation notification, and only afterwards try to retrieve the image preview
-        self.createConversationNotification(withPushNotification: pushNotification, serverNotification: serverNotification) {
-            SDWebImageDownloader.shared.config.downloadTimeout = 25.0
-            NCAPIController.shared.getPreviewForFile(file.parameterId, width: 0, height: 512, forAccount: account) { image, _ in
-                if let image, let attachment = self.getNotificationAttachment(fromImage: image, forAccountId: account.accountId) {
-                    self.bestAttemptContent?.attachments = [attachment]
-                }
-
-                self.showBestAttemptNotification()
+        NCAPIController.shared.getMessageContext(inRoom: serverNotification.roomToken,
+                                                 forMessageId: serverNotification.messageId,
+                                                 inThread: max(serverNotification.threadId, 0),
+                                                 withLimit: 10,
+                                                 forAccount: account) { messages, _ in
+            if let message = messages?.first(where: { $0.messageId == serverNotification.messageId }),
+               let albumRef = SumbaMediaAlbumReference.parse(message.referenceId) {
+                // Prefer live caption from the notification payload; fall back to chat message text.
+                let caption = SumbaMediaAlbumReference.cleanedUserCaption(serverNotification.message)
+                    ?? SumbaMediaAlbumReference.cleanedUserCaption(message.message as String?)
+                    ?? serverNotification.message
+                self.bestAttemptContent?.body = SumbaMediaAlbumReference.notificationBody(count: albumRef.count, caption: caption)
             }
+            completion()
         }
     }
 

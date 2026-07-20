@@ -30,6 +30,8 @@ extern NSString * const kNCPushKitTokenKey;
 - (void)logCombinedPushToken;
 - (NSString * _Nullable)combinedPushToken;
 - (void)removeAllItems;
+/// Removes app-password token and push keypair for one account (leaves other accounts intact).
+- (void)removeCredentialsForAccountId:(NSString *)accountId;
 
 @end
 

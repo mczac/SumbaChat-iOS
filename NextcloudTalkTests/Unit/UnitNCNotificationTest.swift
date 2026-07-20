@@ -116,8 +116,19 @@ final class UnitNCNotificationTest: XCTestCase {
         XCTAssertEqual(notification?.subject, "bob ABC 1234 Test hat eine Nachricht in der Unterhaltung Test gesendet")
         XCTAssertEqual(notification?.chatMessageTitle, "bob ABC 1234 Test in Test")
         XCTAssertEqual(notification?.roomToken, "5tsemb7k")
+        XCTAssertEqual(notification?.messageId, 3013)
         XCTAssertEqual(notification?.notificationType, .chat)
         XCTAssertEqual(notification?.datetime, Date(timeIntervalSince1970: 1768694302))
+    }
+
+    func testAlbumNotificationBody() throws {
+        XCTAssertEqual(SumbaMediaAlbumReference.notificationBody(count: 8, caption: nil), "8 media files")
+        XCTAssertEqual(SumbaMediaAlbumReference.notificationBody(count: 8, caption: ""), "8 media files")
+        XCTAssertEqual(SumbaMediaAlbumReference.notificationBody(count: 8, caption: "{file}"), "8 media files")
+        XCTAssertEqual(SumbaMediaAlbumReference.notificationBody(count: 8, caption: "Hello"), "Hello (8 media files)")
+        XCTAssertEqual(SumbaMediaAlbumReference.notificationBody(count: 4, caption: "4 media files\nHey"), "Hey (4 media files)")
+        XCTAssertEqual(SumbaMediaAlbumReference.cleanedUserCaption("4 media files\nHey"), "Hey")
+        XCTAssertEqual(SumbaMediaAlbumReference.cleanedUserCaption("Hey (4 media files)"), "Hey")
     }
 
     func testThreadNotification() throws {

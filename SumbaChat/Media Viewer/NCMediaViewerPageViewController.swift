@@ -50,13 +50,14 @@ import SwiftyGif
         errorImage.image = UIImage(systemName: "photo")?.withConfiguration(iconConfiguration)
         errorImage.contentMode = .scaleAspectFit
         errorImage.translatesAutoresizingMaskIntoConstraints = false
-        errorImage.tintColor = .secondaryLabel
+        errorImage.tintColor = UIColor.white.withAlphaComponent(0.55)
 
         let errorText = UILabel()
         errorText.translatesAutoresizingMaskIntoConstraints = false
         errorText.text = NSLocalizedString("An error occurred downloading the picture", comment: "")
         errorText.numberOfLines = 0
         errorText.textAlignment = .center
+        errorText.textColor = UIColor.white.withAlphaComponent(0.85)
 
         errorView.addSubview(errorImage)
         errorView.addSubview(errorText)
@@ -79,15 +80,57 @@ import SwiftyGif
     public var currentImage: UIImage?
     public var currentVideoURL: URL?
 
+    /// Used by the gallery host so chrome tap waits for zoom double-tap to fail.
+    public var doubleTapGestureRecognizer: UITapGestureRecognizer? {
+        zoomableView.doubleTapGestureRecoginzer
+    }
+
     private var playerViewController: AVPlayerViewController?
     private var muteButton: UIButton?
 
-    private lazy var activityIndicator = {
-        let indicator = NCActivityIndicator(frame: .init(x: 0, y: 0, width: 100, height: 100))
+    private lazy var activityIndicator: UIActivityIndicatorView = {
+        let indicator = UIActivityIndicatorView(style: .large)
         indicator.translatesAutoresizingMaskIntoConstraints = false
-        indicator.cycleColors = [.lightGray]
-
+        indicator.color = .white
+        indicator.hidesWhenStopped = true
         return indicator
+    }()
+
+    private lazy var downloadProgressLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .preferredFont(forTextStyle: .subheadline)
+        label.adjustsFontForContentSizeCategory = true
+        label.textColor = UIColor.white.withAlphaComponent(0.85)
+        label.textAlignment = .center
+        label.numberOfLines = 2
+        label.adjustsFontSizeToFitWidth = true
+        label.minimumScaleFactor = 0.75
+        label.setContentCompressionResistancePriority(.required, for: .vertical)
+        label.text = NSLocalizedString("Loading…", comment: "File download in progress")
+        return label
+    }()
+
+    private lazy var downloadProgressView: UIProgressView = {
+        let progress = UIProgressView(progressViewStyle: .bar)
+        progress.translatesAutoresizingMaskIntoConstraints = false
+        progress.progressTintColor = .white
+        progress.trackTintColor = UIColor.white.withAlphaComponent(0.25)
+        progress.layer.cornerRadius = 2
+        progress.clipsToBounds = true
+        progress.progress = 0
+        progress.setContentHuggingPriority(.required, for: .vertical)
+        return progress
+    }()
+
+    private lazy var downloadStatusContainer: UIStackView = {
+        let stack = UIStackView(arrangedSubviews: [activityIndicator, downloadProgressLabel, downloadProgressView])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .vertical
+        // Center keeps the spinner intrinsic; label/bar are pinned to stack width below.
+        stack.alignment = .center
+        stack.spacing = 12
+        return stack
     }()
 
     init(message: NCChatMessage, account: TalkAccount) {
@@ -104,20 +147,38 @@ import SwiftyGif
     }
 
     override func viewDidLoad() {
+        self.view.backgroundColor = .black
         self.view.addSubview(self.zoomableView)
-        self.view.addSubview(self.activityIndicator)
+        self.view.addSubview(self.downloadStatusContainer)
 
+        // Progress cluster: fills available width up to 280pt so SE / landscape / iPad all stay readable.
+        let fillWidth = downloadStatusContainer.widthAnchor.constraint(
+            equalTo: view.safeAreaLayoutGuide.widthAnchor,
+            constant: -64
+        )
+        fillWidth.priority = .defaultHigh
+
+        // Full-bleed media for immersive gallery browsing.
         NSLayoutConstraint.activate([
-            self.zoomableView.leftAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.leftAnchor),
-            self.zoomableView.rightAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.rightAnchor),
-            self.zoomableView.topAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.topAnchor),
-            self.zoomableView.bottomAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.bottomAnchor),
-            self.activityIndicator.centerXAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.centerXAnchor),
-            self.activityIndicator.centerYAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.centerYAnchor)
+            self.zoomableView.leftAnchor.constraint(equalTo: self.view.leftAnchor),
+            self.zoomableView.rightAnchor.constraint(equalTo: self.view.rightAnchor),
+            self.zoomableView.topAnchor.constraint(equalTo: self.view.topAnchor),
+            self.zoomableView.bottomAnchor.constraint(equalTo: self.view.bottomAnchor),
+
+            self.downloadStatusContainer.centerXAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.centerXAnchor),
+            self.downloadStatusContainer.centerYAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.centerYAnchor),
+            self.downloadStatusContainer.leadingAnchor.constraint(greaterThanOrEqualTo: self.view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
+            self.downloadStatusContainer.trailingAnchor.constraint(lessThanOrEqualTo: self.view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
+            self.downloadStatusContainer.widthAnchor.constraint(lessThanOrEqualToConstant: 280),
+            fillWidth,
+
+            self.downloadProgressLabel.widthAnchor.constraint(equalTo: self.downloadStatusContainer.widthAnchor),
+            self.downloadProgressView.widthAnchor.constraint(equalTo: self.downloadStatusContainer.widthAnchor),
+            self.downloadProgressView.heightAnchor.constraint(equalToConstant: 4)
         ])
 
         self.zoomableView.replaceContentView(self.imageView)
-        self.activityIndicator.startAnimating()
+        showDownloadProgressUI(progress: 0, completedBytes: 0, totalBytes: Int64(message.file()?.size ?? 0), canReportProgress: false)
 
         fileDownloader.delegate = self
         fileDownloader.downloadFile(withFileId: self.message.file().parameterId)
@@ -156,10 +217,42 @@ import SwiftyGif
         ])
     }
 
+    private func showDownloadProgressUI(progress: Float, completedBytes: Int64, totalBytes: Int64, canReportProgress: Bool) {
+        downloadStatusContainer.isHidden = false
+
+        let knownTotal = totalBytes > 0 ? totalBytes : Int64(message.file()?.size ?? 0)
+        let indeterminate = !canReportProgress || knownTotal <= 0 || progress <= 0
+
+        if indeterminate {
+            activityIndicator.startAnimating()
+            downloadProgressView.setProgress(0, animated: false)
+            downloadProgressLabel.text = NSLocalizedString("Loading…", comment: "File download in progress")
+        } else {
+            activityIndicator.stopAnimating()
+            downloadProgressView.setProgress(min(max(progress, 0), 1), animated: true)
+            let loaded = NCUtils.readableFileSize(completedBytes)
+            let total = NCUtils.readableFileSize(knownTotal)
+            if loaded.isEmpty || total.isEmpty {
+                downloadProgressLabel.text = NSLocalizedString("Loading…", comment: "File download in progress")
+            } else {
+                downloadProgressLabel.text = String(
+                    format: NSLocalizedString("Loading %@ of %@", comment: "File download progress, e.g. Loading 12 MB of 40 MB"),
+                    loaded,
+                    total
+                )
+            }
+        }
+    }
+
+    private func hideDownloadProgressUI() {
+        activityIndicator.stopAnimating()
+        downloadStatusContainer.isHidden = true
+        downloadProgressView.setProgress(0, animated: false)
+    }
+
     // MARK: - NCChatFileController delegate
     func fileControllerDidLoadFile(_ fileController: NCChatFileController, with fileStatus: NCChatFileStatus) {
-        self.activityIndicator.stopAnimating()
-        self.activityIndicator.isHidden = true
+        hideDownloadProgressUI()
 
         guard let localPath = fileStatus.fileLocalPath, let mimetype = message.file()?.mimetype else {
             self.showErrorView()
@@ -176,8 +269,7 @@ import SwiftyGif
     }
 
     func fileControllerDidFailLoadingFile(_ fileController: NCChatFileController, withFileId fileId: String, withErrorDescription errorDescription: String) {
-        self.activityIndicator.stopAnimating()
-        self.activityIndicator.isHidden = true
+        hideDownloadProgressUI()
 
         self.showErrorView()
 
@@ -186,19 +278,14 @@ import SwiftyGif
 
     func didChangeDownloadProgress(notification: Notification) {
         DispatchQueue.main.async {
-            // Make sure this notification is really for this view controller
-            guard let userInfo = notification.userInfo,
-                  let receivedStatus = userInfo["fileStatus"] as? NCChatFileStatus,
-                  let fileParameter = self.message.file(),
-                  receivedStatus.fileId == fileParameter.parameterId,
-                  receivedStatus.filePath == fileParameter.path
+            guard let fileParameter = self.message.file(),
+                  let receivedStatus = NCChatFileStatus.getStatus(from: notification, for: fileParameter)
             else { return }
 
-            // Switch to determinate mode and set the progress
-            if receivedStatus.canReportProgress {
-                self.activityIndicator.indicatorMode = .determinate
-                self.activityIndicator.setProgress(Float(receivedStatus.downloadProgress), animated: true)
-            }
+            self.showDownloadProgressUI(progress: receivedStatus.downloadProgress,
+                                        completedBytes: receivedStatus.completedBytes,
+                                        totalBytes: receivedStatus.totalBytes,
+                                        canReportProgress: receivedStatus.canReportProgress)
         }
     }
 
@@ -272,8 +359,8 @@ import SwiftyGif
         playerViewController.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         playerViewController.didMove(toParent: self)
 
-        // Start muted; user can unmute via the on-screen control.
-        player.isMuted = true
+        // Start with sound; user can mute via the on-screen control.
+        player.isMuted = false
         player.play()
         self.installMuteControl(for: player)
 

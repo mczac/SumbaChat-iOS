@@ -10,7 +10,8 @@
 
         self.interactivePopGestureRecognizer?.delegate = self
         NCAppBranding.styleViewController(self)
-        self.view.backgroundColor = .clear
+        // Opaque fill avoids the presenting VC flashing through during sheet presentation.
+        self.view.backgroundColor = .systemGroupedBackground
     }
 
     override var preferredStatusBarStyle: UIStatusBarStyle {

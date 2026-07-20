@@ -47,6 +47,9 @@ class NCConnectionController: NSObject {
             print("Reachability: \(AFStringFromNetworkReachabilityStatus(status))")
             self.checkConnectionState()
         }
+        // If monitoring already started (AppDelegate), sync immediately; otherwise
+        // the first reachability callback will update state.
+        self.checkConnectionState()
     }
 
     internal func notifyAppState() {
@@ -63,14 +66,20 @@ class NCConnectionController: NSObject {
 
     public func checkConnectionState() {
         if !AFNetworkReachabilityManager.shared().isReachable {
+            let previousState = self.connectionState
             self.connectionState = .disconnected
-            self.notifyConnectionState()
+            // Notify on unknown → disconnected as well (not only connected → disconnected).
+            if previousState != .disconnected {
+                self.notifyConnectionState()
+            }
         } else {
             let previousState = self.connectionState
             self.connectionState = .connected
             self.checkAppState()
 
-            if previousState == .disconnected {
+            // Previously only notified from .disconnected → .connected, so
+            // .unknown → .connected never fired and Online restore never ran.
+            if previousState != .connected {
                 self.notifyConnectionState()
             }
         }

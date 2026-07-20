@@ -536,13 +536,22 @@ public class NCSettingsController: NSObject {
         extSignalingController?.disconnect()
         NCAPIController.sharedInstance().removeProfileImage(forAccount: removingAccount)
         NCAPIController.sharedInstance().removeAPISessionManager(forAccount: removingAccount)
-        NCDatabaseManager.sharedInstance().removeAccount(withAccountId: removingAccount.accountId)
+
+        // Local media caches for this account only (download + convert).
+        MediaUploadDiskStore.shared.purgeLocalCaches(forAccountId: removingAccount.accountId)
         NCChatFileController(account: removingAccount).deleteDownloadDirectory()
+
+        NCDatabaseManager.sharedInstance().removeAccount(withAccountId: removingAccount.accountId)
+        NCKeyChainController.sharedInstance().removeCredentials(forAccountId: removingAccount.accountId)
         NCRoomsManager.shared.chatViewController?.leaveChat()
         self.createAccountsFile()
 
-        // Activate any of the inactive accounts
-        self.switchToAnyInactiveAccount()
+        if NCDatabaseManager.sharedInstance().numberOfAccounts() == 0 {
+            NCKeyChainController.sharedInstance().removeAllItems()
+        } else {
+            // Activate any of the inactive accounts
+            self.switchToAnyInactiveAccount()
+        }
 
         block?(nil)
     }

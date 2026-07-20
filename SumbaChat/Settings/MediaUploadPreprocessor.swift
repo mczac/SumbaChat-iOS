@@ -207,42 +207,53 @@ import UniformTypeIdentifiers
             let original = MediaUploadPreprocessor.fileSizePublic(at: url)
             let kind = isVideo ? "video" : "photo"
 
-            // High quality = Low compression level (mildest).
-            let highQualityBytes = MediaUploadPreprocessor.estimatedByteCount(at: url, level: .low)
-            if estimateFitsUnderCap(highQualityBytes, fileCap: fileCap, marginPercent: margin) {
+            // Ladder: No Compression → Low → Medium → High (first that fits under cap; High last resort).
+            if estimateFitsUnderCap(original, fileCap: fileCap, marginPercent: margin) {
+                MediaUploadTrace.log(String(format:
+                    "AUTO %@ %@ original=%@ → none (original < ceiling=%@; cap=%@ margin=%.0f%%)",
+                    kind, url.lastPathComponent,
+                    MediaUploadTrace.mb(original),
+                    MediaUploadTrace.mb(ceiling),
+                    MediaUploadTrace.mb(fileCap),
+                    margin))
+                return .none
+            }
+
+            let lowBytes = MediaUploadPreprocessor.estimatedByteCount(at: url, level: .low)
+            if estimateFitsUnderCap(lowBytes, fileCap: fileCap, marginPercent: margin) {
                 MediaUploadTrace.log(String(format:
                     "AUTO %@ %@ original=%@ → %@ (est=%@ < ceiling=%@; cap=%@ margin=%.0f%%)",
                     kind, url.lastPathComponent,
                     MediaUploadTrace.mb(original),
                     MediaUploadTrace.levelName(.low),
-                    MediaUploadTrace.mb(highQualityBytes),
+                    MediaUploadTrace.mb(lowBytes),
                     MediaUploadTrace.mb(ceiling),
                     MediaUploadTrace.mb(fileCap),
                     margin))
                 return .low
             }
 
-            let mediumQualityBytes = MediaUploadPreprocessor.estimatedByteCount(at: url, level: .medium)
-            if estimateFitsUnderCap(mediumQualityBytes, fileCap: fileCap, marginPercent: margin) {
+            let mediumBytes = MediaUploadPreprocessor.estimatedByteCount(at: url, level: .medium)
+            if estimateFitsUnderCap(mediumBytes, fileCap: fileCap, marginPercent: margin) {
                 MediaUploadTrace.log(String(format:
                     "AUTO %@ %@ original=%@ → %@ (est=%@ < ceiling=%@; cap=%@ margin=%.0f%%)",
                     kind, url.lastPathComponent,
                     MediaUploadTrace.mb(original),
                     MediaUploadTrace.levelName(.medium),
-                    MediaUploadTrace.mb(mediumQualityBytes),
+                    MediaUploadTrace.mb(mediumBytes),
                     MediaUploadTrace.mb(ceiling),
                     MediaUploadTrace.mb(fileCap),
                     margin))
                 return .medium
             }
 
-            let lowQualityBytes = MediaUploadPreprocessor.estimatedByteCount(at: url, level: .high)
+            let highBytes = MediaUploadPreprocessor.estimatedByteCount(at: url, level: .high)
             MediaUploadTrace.log(String(format:
-                "AUTO %@ %@ original=%@ → %@ (est=%@; ceiling=%@; cap=%@ margin=%.0f%%) best-effort",
+                "AUTO %@ %@ original=%@ → %@ (est=%@; ceiling=%@; cap=%@ margin=%.0f%%) last-resort",
                 kind, url.lastPathComponent,
                 MediaUploadTrace.mb(original),
                 MediaUploadTrace.levelName(.high),
-                MediaUploadTrace.mb(lowQualityBytes),
+                MediaUploadTrace.mb(highBytes),
                 MediaUploadTrace.mb(ceiling),
                 MediaUploadTrace.mb(fileCap),
                 margin))

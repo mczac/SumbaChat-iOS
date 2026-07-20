@@ -1,15 +1,14 @@
 //
 // SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+// SPDX-FileCopyrightText: 2026 Ivan Cursoroff and Peter Zakharov
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 
 import UIKit
-import QuickLook
 
-class LogfilesTableViewController: UITableViewController, QLPreviewControllerDataSource {
+class LogfilesTableViewController: UITableViewController {
 
     private var logfiles: [URL] = []
-    private var selectedLogfile: URL?
 
     private let cellIdentifier = "LogfileCellIdentifier"
 
@@ -34,11 +33,19 @@ class LogfilesTableViewController: UITableViewController, QLPreviewControllerDat
         self.tableView.register(SubtitleTableViewCell.self, forCellReuseIdentifier: cellIdentifier)
         self.tableView.allowsMultipleSelectionDuringEditing = true
 
+        // Prunes files older than NCLog.retentionDays, then lists what remains.
         self.logfiles = NCLog.getLogfiles()
 
         if !logfiles.isEmpty {
             self.navigationItem.rightBarButtonItem = selectBarButtonItem
         }
+    }
+
+    override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
+        String.localizedStringWithFormat(
+            NSLocalizedString("Logs are kept for %d days, then deleted automatically.", comment: "Diagnostics logs retention footer"),
+            NCLog.retentionDays
+        )
     }
 
     // MARK: - Editing / selection
@@ -125,29 +132,14 @@ class LogfilesTableViewController: UITableViewController, QLPreviewControllerDat
             return
         }
 
-        self.tableView.deselectRow(at: indexPath, animated: true)
-
-        selectedLogfile = logfiles[indexPath.row]
-
-        // QLPreviewController shows a built-in share button to export a single logfile
-        let previewController = QLPreviewController()
-        previewController.dataSource = self
-        self.present(previewController, animated: true)
+        tableView.deselectRow(at: indexPath, animated: true)
+        let viewer = LogfileViewerViewController(fileURL: logfiles[indexPath.row])
+        navigationController?.pushViewController(viewer, animated: true)
     }
 
     override func tableView(_ tableView: UITableView, didDeselectRowAt indexPath: IndexPath) {
         if isEditing {
             updateExportButton()
         }
-    }
-
-    // MARK: - QLPreviewControllerDataSource
-
-    func numberOfPreviewItems(in controller: QLPreviewController) -> Int {
-        return selectedLogfile != nil ? 1 : 0
-    }
-
-    func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
-        return (selectedLogfile ?? URL(fileURLWithPath: "")) as NSURL
     }
 }

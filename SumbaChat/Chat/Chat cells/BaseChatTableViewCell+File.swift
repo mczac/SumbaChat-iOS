@@ -8,6 +8,8 @@ import SDWebImage
 extension BaseChatTableViewCell {
 
     func setupForFileCell(with message: NCChatMessage, with account: TalkAccount) {
+        self.hideAlbumMosaicChrome()
+
         if self.filePreviewImageView == nil {
             // Preview image view
             let filePreviewImageView = FilePreviewImageView(frame: .init(x: 0, y: 0, width: fileMessageCellFileMaxPreviewHeight, height: fileMessageCellFileMaxPreviewWidth))
@@ -83,6 +85,8 @@ extension BaseChatTableViewCell {
               let messageTextView = self.messageTextView
         else { return }
 
+        self.rebindMessageTextViewBelowFilePreview(filePreviewImageView, messageTextView: messageTextView)
+
         messageTextView.attributedText = message.parsedMarkdownForChat()
 
         if message.message == "{file}" {
@@ -96,10 +100,14 @@ extension BaseChatTableViewCell {
         if !message.sendingFailed {
             if message.isTemporary {
                 self.addActivityIndicator(with: 0)
-            } else if let fileStatus = message.file().fileStatus {
-                if fileStatus.isDownloading, fileStatus.downloadProgress < 1 {
-                    self.addActivityIndicator(with: Float(fileStatus.downloadProgress))
-                }
+            } else if let fileId = message.file()?.parameterId,
+                      let activeStatus = NCChatFileController.activeStatus(forFileId: fileId),
+                      activeStatus.isDownloading {
+                // Re-enter chat while download still runs — restore overlay from shared registry.
+                self.updateFileDownloadProgress(with: activeStatus)
+            } else if let fileStatus = message.file().fileStatus,
+                      fileStatus.isDownloading, fileStatus.downloadProgress < 1 {
+                self.updateFileDownloadProgress(with: fileStatus)
             }
         }
 

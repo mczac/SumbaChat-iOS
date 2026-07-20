@@ -42,6 +42,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
         AFNetworkActivityIndicatorManager.shared().isEnabled = true
         #endif
         AFNetworkReachabilityManager.shared().startMonitoring()
+        // Ensure connection state leaves `.unknown` even if the first reachability
+        // callback raced ahead of NCConnectionController's observer registration.
+        NCConnectionController.shared.checkConnectionState()
 
         NCNotificationController.sharedInstance().requestAuthorization()
 
