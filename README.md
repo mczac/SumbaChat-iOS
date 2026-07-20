@@ -11,7 +11,7 @@
 
 **Chat, voice, and video for your own Nextcloud — iOS client**
 
-SumbaChat is an iOS messaging app based on [Nextcloud Talk](https://github.com/nextcloud/talk-ios). It keeps Talk’s on‑premises calls and chat, with SumbaChat branding and extras such as media albums, upload compression, SumbaFiles browsing, and account management.
+SumbaChat is an iOS messaging app based on [Nextcloud Talk](https://github.com/nextcloud/talk-ios). It keeps Talk’s on‑premises calls and chat, with SumbaChat branding and extras such as in-chat media galleries, multi-photo albums, upload compression, SumbaFiles browsing, and account management.
 
 This repository is **SumbaChat**, not the upstream Nextcloud Talk project. Upstream Talk lives at [nextcloud/talk-ios](https://github.com/nextcloud/talk-ios).
 
@@ -55,13 +55,15 @@ Pull requests should stay SwiftLint-clean.
 
 ### Media & gallery
 
-- Media albums: send a multi-photo/video selection as one gallery (chat album cell, room-list gallery icon)
+- **Media albums in chat:** send a multi-photo/video selection as one message — mosaic preview in the bubble, optional caption, gallery icon on the room list
+- **In-chat media gallery:** tap any photo, video, or album tile to open a full-screen viewer; swipe (or edge-tap) through every image and video in the room in chat order, including all members of an album
+- Gallery chrome shows sender, time, and position (`3 of 12`); tap the centre to hide chrome; footer actions: Share, Show in chat, and Mute (videos)
 - Album push notifications: only the last member notifies; body uses a single caption such as `Hey (N media files)`
 - Photo/video upload compression (None / Automatic / Manual) with in-app and Share Extension UX
 - Writer-based video encode (default): keeps audio, per-profile AAC, retains GPS/capture date when possible; Automatic ladder picks a profile
 - App Group media cache (upload / download / convert) and Settings → Caching
 - In-chat cache hit/miss indicator on file messages (local / warm cache / needs download)
-- Media viewer: plays with sound by default; mute toggle in the gallery footer
+- Video playback starts with sound; mute from the gallery footer
 - Quick Look / SumbaFiles: middle-truncated long filenames
 
 ### SumbaFiles & chat UX
