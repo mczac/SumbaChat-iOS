@@ -233,7 +233,13 @@ import UIKit
             contentType: .password
         )
         field.isSecureTextEntry = true
+        // Last field: Go submits the form (same action as the Log in button above the keyboard).
         field.returnKeyType = .go
+        field.enablesReturnKeyAutomatically = true
+        field.accessibilityHint = NSLocalizedString(
+            "Signs in to SumbaChat",
+            comment: "Password field return key (Go) accessibility hint"
+        )
 
         let container = UIView(frame: CGRect(x: 0, y: 0, width: 40, height: 52))
         passwordVisibilityButton.frame = CGRect(x: 0, y: 0, width: 36, height: 52)
@@ -261,6 +267,10 @@ import UIKit
         button.translatesAutoresizingMaskIntoConstraints = false
         button.addTarget(self, action: #selector(signIn), for: .touchUpInside)
         button.setContentCompressionResistancePriority(.required, for: .vertical)
+        button.accessibilityHint = NSLocalizedString(
+            "Signs in with the server, username, and password above",
+            comment: "Log in button accessibility hint"
+        )
         return button
     }()
 
@@ -836,13 +846,27 @@ import UIKit
     }
 
     func textFieldShouldReturn(_ textField: UITextField) -> Bool {
-        if textField === subdomainTextField {
-            // Blur triggers the status probe, then move to username.
+        switch textField {
+        case subdomainTextField:
+            guard currentNormalizedSubdomain() != nil else {
+                showValidationError(
+                    NSLocalizedString("Enter a valid server name.", comment: ""),
+                    field: subdomainTextField
+                )
+                return true
+            }
+            // Moving focus ends editing and triggers the server status probe.
             usernameTextField.becomeFirstResponder()
-        } else if textField === usernameTextField {
+
+        case usernameTextField:
             passwordTextField.becomeFirstResponder()
-        } else {
+
+        case passwordTextField:
+            // Go mirrors the Log in button (validates server, username, and password).
             signIn()
+
+        default:
+            break
         }
         return true
     }

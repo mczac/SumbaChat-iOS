@@ -139,7 +139,11 @@ import UIKit
                 identity
             )
         }
-        subtitleLabel.text = [cancelHint, SumbaDeleteAccountCopy.retentionBullet].joined(separator: "\n\n")
+        if let reminder = SumbaDeleteAccountCopy.countdownReminder {
+            subtitleLabel.text = [cancelHint, reminder].joined(separator: "\n\n")
+        } else {
+            subtitleLabel.text = cancelHint
+        }
 
         NSLayoutConstraint.activate([
             shredderView.centerXAnchor.constraint(equalTo: view.centerXAnchor),

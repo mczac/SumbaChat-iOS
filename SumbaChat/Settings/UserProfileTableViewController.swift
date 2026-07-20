@@ -74,32 +74,15 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
         let label = UILabel()
         label.font = .preferredFont(forTextStyle: .footnote)
         label.textColor = .secondaryLabel
-        label.numberOfLines = 0
+        label.numberOfLines = 2
         label.textAlignment = .center
         label.adjustsFontForContentSizeCategory = true
         label.text = SumbaDeleteAccountCopy.accountScreenFootnote
         return label
     }()
 
-    private lazy var deleteAccountPrivacyButton: UIButton = {
-        var configuration = UIButton.Configuration.plain()
-        configuration.title = SumbaDeleteAccountCopy.privacyPolicyActionTitle
-        configuration.baseForegroundColor = .link
-        configuration.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0)
-        configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
-            var attributes = attributes
-            attributes.font = .preferredFont(forTextStyle: .footnote)
-            attributes.underlineStyle = .single
-            return attributes
-        }
-        let button = UIButton(configuration: configuration)
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.addTarget(self, action: #selector(deleteAccountPrivacyTapped), for: .touchUpInside)
-        return button
-    }()
-
     private lazy var deleteAccountFooterStack: UIStackView = {
-        let stack = UIStackView(arrangedSubviews: [deleteAccountButton, deleteAccountFootnoteLabel, deleteAccountPrivacyButton])
+        let stack = UIStackView(arrangedSubviews: [deleteAccountButton, deleteAccountFootnoteLabel])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .vertical
         stack.spacing = 10
@@ -358,9 +341,6 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
         presentDeleteAccountFlow()
     }
 
-    @objc private func deleteAccountPrivacyTapped() {
-        SumbaDeleteAccountCopy.openPrivacyPolicy(from: self, userId: account.userId)
-    }
 
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         let sections = getProfileSections()

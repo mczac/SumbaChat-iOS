@@ -49,7 +49,7 @@ enum AboutSection: Int {
     case kAboutSectionSourceCode
 }
 
-class SettingsTableViewController: UITableViewController, UITextFieldDelegate, UserStatusViewDelegate, CallsFromOldAccountViewControllerDelegate, DetailedOptionsSelectorTableViewControllerDelegate {
+class SettingsTableViewController: UITableViewController, UITextFieldDelegate, UITextViewDelegate, UserStatusViewDelegate, CallsFromOldAccountViewControllerDelegate, DetailedOptionsSelectorTableViewControllerDelegate {
     let kPhoneTextFieldTag = 99
 
     var activeUserStatus: NCUserStatus?
@@ -822,6 +822,8 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         let settingsSection = sections[section]
 
         switch settingsSection {
+        case SettingsSection.kSettingsSectionUser.rawValue:
+            return NSLocalizedString("Account", comment: "Settings section header for signed-in account")
         case SettingsSection.kSettingsSectionUserStatus.rawValue:
             return NSLocalizedString("Status", comment: "Settings section header for online presence")
         case SettingsSection.kSettingsSectionOtherAccounts.rawValue:
@@ -843,19 +845,32 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         applyAppleStyleSectionHeader(view, title: self.tableView(tableView, titleForHeaderInSection: section))
     }
 
-    private func aboutCopyrightFooterText() -> String {
-        [talkAppName, licenseNotice, copyright].joined(separator: "\n")
+    private func aboutVersionBuildLine() -> String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        return String(
+            format: NSLocalizedString("Version %@ (%@)", comment: "Settings footer app version and build number"),
+            version,
+            build
+        )
     }
 
-    private func githubFooterLinkTitle() -> String {
-        guard let url = URL(string: sourceCodeURL), let host = url.host else {
-            return NSLocalizedString("Source on GitHub", comment: "Settings footer link when URL missing")
+    private func aboutCopyrightFooterAttributedText() -> NSAttributedString {
+        let baseAttributes = aboutCopyrightFooterAttributes()
+        let lines = [talkAppName, aboutVersionBuildLine(), licenseNotice, copyright]
+        let result = NSMutableAttributedString()
+
+        for (index, line) in lines.enumerated() {
+            if index > 0 {
+                result.append(NSAttributedString(string: "\n", attributes: baseAttributes))
+            }
+            var attributes = baseAttributes
+            if index == lines.count - 1, let url = URL(string: sourceCodeURL) {
+                attributes[.link] = url
+            }
+            result.append(NSAttributedString(string: line, attributes: attributes))
         }
-        let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if path.isEmpty {
-            return host
-        }
-        return "\(host)/\(path)"
+        return result
     }
 
     private func aboutCopyrightFooterAttributes() -> [NSAttributedString.Key: Any] {
@@ -875,16 +890,15 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
             return UITableView.automaticDimension
         }
 
-        let text = aboutCopyrightFooterText() as NSString
+        let text = aboutCopyrightFooterAttributedText()
         let horizontalInset: CGFloat = 32
         let width = max(tableView.bounds.width - horizontalInset, 1)
         let bounding = text.boundingRect(
             with: CGSize(width: width, height: .greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: aboutCopyrightFooterAttributes(),
             context: nil
         )
-        return ceil(bounding.height) + 24 + 28
+        return ceil(bounding.height) + 24
     }
 
     override func tableView(_ tableView: UITableView, viewForFooterInSection section: Int) -> UIView? {
@@ -900,47 +914,40 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         let container = UIView()
         container.backgroundColor = .clear
 
-        let textLabel = UILabel()
-        textLabel.translatesAutoresizingMaskIntoConstraints = false
-        textLabel.numberOfLines = 0
-        textLabel.textAlignment = .center
-        textLabel.attributedText = NSAttributedString(
-            string: aboutCopyrightFooterText(),
-            attributes: aboutCopyrightFooterAttributes()
-        )
+        let textView = UITextView()
+        textView.translatesAutoresizingMaskIntoConstraints = false
+        textView.backgroundColor = .clear
+        textView.isEditable = false
+        textView.isScrollEnabled = false
+        textView.isSelectable = true
+        textView.textAlignment = .center
+        textView.textContainerInset = .zero
+        textView.textContainer.lineFragmentPadding = 0
+        textView.delegate = self
+        textView.attributedText = aboutCopyrightFooterAttributedText()
+        textView.linkTextAttributes = [
+            .foregroundColor: UIColor.secondaryLabel,
+            .underlineStyle: 0
+        ]
 
-        var linkConfiguration = UIButton.Configuration.plain()
-        linkConfiguration.title = githubFooterLinkTitle()
-        linkConfiguration.baseForegroundColor = .link
-        linkConfiguration.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 0, bottom: 0, trailing: 0)
-        linkConfiguration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
-            var attributes = attributes
-            attributes.font = .preferredFont(forTextStyle: .footnote)
-            attributes.underlineStyle = .single
-            return attributes
-        }
-        let githubButton = UIButton(configuration: linkConfiguration)
-        githubButton.translatesAutoresizingMaskIntoConstraints = false
-        githubButton.addTarget(self, action: #selector(openSourceCodeFromFooter), for: .touchUpInside)
-
-        container.addSubview(textLabel)
-        container.addSubview(githubButton)
+        container.addSubview(textView)
 
         NSLayoutConstraint.activate([
-            textLabel.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
-            textLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            textLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-
-            githubButton.topAnchor.constraint(equalTo: textLabel.bottomAnchor, constant: 4),
-            githubButton.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-            githubButton.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12)
+            textView.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            textView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            textView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            textView.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12)
         ])
 
         return container
     }
 
-    @objc private func openSourceCodeFromFooter() {
-        openSourceCodeInBrowser()
+    func textView(_ textView: UITextView, shouldInteractWith URL: URL, in characterRange: NSRange, interaction: UITextItemInteraction) -> Bool {
+        if URL.absoluteString == sourceCodeURL {
+            openSourceCodeInBrowser()
+            return false
+        }
+        return true
     }
 
     private func openSourceCodeInBrowser() {
@@ -982,13 +989,15 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         switch settingsSection {
         case SettingsSection.kSettingsSectionUser.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "UserProfileCellIdentifier", style: .subtitle)
-            cell.textLabel?.text = NSLocalizedString("Account", comment: "Settings row title for account profile")
+            let displayName = activeAccount.userDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let user = activeAccount.user.trimmingCharacters(in: .whitespacesAndNewlines)
+            cell.textLabel?.text = displayName.isEmpty ? user : displayName
             cell.textLabel?.font = .preferredFont(forTextStyle: .body)
             cell.textLabel?.numberOfLines = 1
             let host = activeAccount.server.replacingOccurrences(of: "https://", with: "")
-            cell.detailTextLabel?.text = "\(activeAccount.userDisplayName)\n\(host)"
+            cell.detailTextLabel?.text = host
             cell.detailTextLabel?.font = .preferredFont(forTextStyle: .subheadline)
-            cell.detailTextLabel?.numberOfLines = 2
+            cell.detailTextLabel?.numberOfLines = 1
             cell.detailTextLabel?.lineBreakMode = .byTruncatingMiddle
             // Always reserve a 60pt avatar slot so text doesn’t jump when the photo loads.
             let avatarSize = CGSize(width: 60, height: 60)

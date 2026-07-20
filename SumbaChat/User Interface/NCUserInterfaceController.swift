@@ -80,6 +80,10 @@ public typealias PresentCallControllerCompletionBlock = () -> Void
     }
 
     func presentLoginViewController(forServerURL serverURL: String?, withUser user: String?) {
+        guard mainViewController != nil else {
+            return
+        }
+
         if forceDomain.boolValue {
             // Don't open a login if we're in a call
             if NCRoomsManager.shared.callViewController != nil {

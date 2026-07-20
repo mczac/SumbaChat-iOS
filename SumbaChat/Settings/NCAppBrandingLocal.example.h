@@ -9,8 +9,8 @@
 #define NC_BRANDING_DOMAIN @"https://cloud.example.com"
 /// Single Privacy Policy URL used by Settings + delete-account flows (no hostnames in committed code).
 #define NC_BRANDING_PRIVACY_URL @"https://cloud.example.com/privacy_po_example"
-#define NC_BRANDING_PUSH_SERVER @"https://push.example.com"
-#define NC_BRANDING_PUSH_SERVER_DEBUG @"https://push-dev.example.com"
+#define NC_BRANDING_PUSH_SERVER @"https://mtx-push.mysumba.com"
+#define NC_BRANDING_PUSH_SERVER_DEBUG @"https://mtx-push-dev.mysumba.com"
 
 /// DNS parent for `https://{subdomain}.{base}` login hosts (no scheme).
 #define NC_BRANDING_BASE_DOMAIN @"example.com"

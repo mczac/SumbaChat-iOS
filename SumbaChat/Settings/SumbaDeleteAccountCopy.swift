@@ -50,42 +50,44 @@ enum SumbaDeleteAccountCopy {
             .joined(separator: "\n\n")
     }
 
-    /// Footnote under the Account screen delete button (aligned with Privacy Policy).
+    /// Footnote under Delete account on the Account screen (keep to ~2 lines).
     static var accountScreenFootnote: String {
-        joinedParagraphs([
-            profileRemovalSummary,
-            archiveRetentionDetail(),
-            NSLocalizedString(
-                "See our Privacy Policy for details.",
-                comment: "Delete account footnote privacy pointer"
-            )
-        ])
+        NSLocalizedString(
+            "Permanently removes your profile and login access.\nThis cannot be undone.",
+            comment: "Delete account: short footnote under button on Account screen"
+        )
     }
 
     /// Pre-flow alert body (Settings → Account → Delete account).
     static var preflowMessage: String {
+        NSLocalizedString(
+            "This permanently deletes your account and cannot be undone.",
+            comment: "Delete account pre-flow alert (short)"
+        )
+    }
+
+    /// Full explanation on the password confirmation screen (Privacy Policy §5B/§5C).
+    static var confirmationMessage: String {
         joinedParagraphs([
             profileRemovalSummary,
             archiveRetentionDetail(),
             NSLocalizedString(
-                "This cannot be undone. See our Privacy Policy for details.",
-                comment: "Delete account pre-flow irreversibility + privacy pointer"
+                "This cannot be undone.",
+                comment: "Delete account confirmation irreversibility"
             )
         ])
     }
 
-    /// Short retention bullet for password + countdown screens (not deleted yet).
-    static var retentionBullet: String {
-        joinedParagraphs([
-            String(
-                format: NSLocalizedString(
-                    "If you continue, %@",
-                    comment: "Delete account retention lead-in; %@ is profile removal summary"
-                ),
-                profileRemovalSummary
+    /// One-line reminder during the countdown (details were on the confirmation screen).
+    static var countdownReminder: String? {
+        guard retainsProjectData else { return nil }
+        return String(
+            format: NSLocalizedString(
+                "Shared project content stays in the archive under “%@”.",
+                comment: "Delete account countdown short reminder; %@ is anonymized label prefix"
             ),
-            archiveRetentionDetail()
-        ])
+            labelPrefix
+        )
     }
 
     static var successMessage: String {

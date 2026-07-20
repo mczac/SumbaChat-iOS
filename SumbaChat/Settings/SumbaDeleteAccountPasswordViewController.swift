@@ -47,7 +47,7 @@ import UIKit
         label.textColor = .secondaryLabel
         label.textAlignment = .center
         label.numberOfLines = 0
-        label.text = SumbaDeleteAccountCopy.retentionBullet
+        label.text = SumbaDeleteAccountCopy.confirmationMessage
         return label
     }()
 
