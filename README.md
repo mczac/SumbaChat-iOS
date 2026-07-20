@@ -61,7 +61,7 @@ Pull requests should stay SwiftLint-clean.
 - Writer-based video encode (default): keeps audio, per-profile AAC, retains GPS/capture date when possible; Automatic ladder picks a profile
 - App Group media cache (upload / download / convert) and Settings → Caching
 - In-chat cache hit/miss indicator on file messages (local / warm cache / needs download)
-- Media viewer: plays with sound by default; on-screen mute control
+- Media viewer: plays with sound by default; mute toggle in the gallery footer
 - Quick Look / SumbaFiles: middle-truncated long filenames
 
 ### SumbaFiles & chat UX
