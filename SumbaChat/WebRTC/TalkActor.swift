@@ -53,7 +53,10 @@ import SwiftyAttributes
     }
 
     public var isDeleted: Bool {
-        return id == "deleted_users" && type == "deleted_users"
+        if type == "deleted_users" || id == "deleted_users" {
+            return true
+        }
+        return rawDisplayName.hasPrefix(SumbaChatClientConfig.anonymizedLabelPrefix)
     }
 
     public var isFederated: Bool {

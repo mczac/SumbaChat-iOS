@@ -19,13 +19,26 @@ enum SumbaDeleteAccountCopy {
         SumbaChatClientConfig.anonymizedLabelPrefix
     }
 
+    /// Footnote under the Account screen delete button (aligned with Privacy Policy).
+    static var accountScreenFootnote: String {
+        String(
+            format: NSLocalizedString(
+                """
+                All your personal identifiable data will be deleted immediately. Shared project messages and files stay archived under “%@”, as described in our Privacy Policy.
+                """,
+                comment: "Delete account footnote on Account screen; %@ is anonymized label prefix"
+            ),
+            labelPrefix
+        )
+    }
+
     /// Pre-flow alert body (Settings → Account → Delete account).
     static var preflowMessage: String {
         String(
             format: NSLocalizedString(
                 """
-                Deleting your account removes your personal profile (name, email, avatar) and revokes access to SumbaChat.
-                Messages and files you contributed to project repositories remain in the archive under “%@”, as described in our Privacy Policy.
+                All your personal identifiable data will be deleted immediately. Access to SumbaChat is revoked.
+                Messages and files you contributed to project repositories remain archived under “%@”, as described in our Privacy Policy.
                 """,
                 comment: "Delete account pre-flow alert; %@ is anonymized label prefix"
             ),
@@ -33,12 +46,12 @@ enum SumbaDeleteAccountCopy {
         )
     }
 
-    /// Short retention bullet for password + countdown screens.
+    /// Short retention bullet for password + countdown screens (not deleted yet).
     static var retentionBullet: String {
         String(
             format: NSLocalizedString(
-                "Your profile is removed; shared project messages and files stay archived under “%@”.",
-                comment: "Delete account short retention notice; %@ is anonymized label prefix"
+                "If you continue, all your personal identifiable data will be deleted immediately. Shared project messages and files will stay archived under “%@”.",
+                comment: "Delete account short retention notice before deletion; %@ is anonymized label prefix"
             ),
             labelPrefix
         )

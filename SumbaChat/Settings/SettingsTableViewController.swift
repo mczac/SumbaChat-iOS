@@ -926,11 +926,13 @@ class SettingsTableViewController: UITableViewController, UITextFieldDelegate, U
         switch settingsSection {
         case SettingsSection.kSettingsSectionUser.rawValue:
             let cell: SettingsTableViewCell = tableView.dequeueOrCreateCell(withIdentifier: "UserProfileCellIdentifier", style: .subtitle)
-            cell.textLabel?.text = activeAccount.userDisplayName
-            cell.textLabel?.font = .preferredFont(for: .title2, weight: .medium)
+            cell.textLabel?.text = NSLocalizedString("Account", comment: "Settings row title for account profile")
+            cell.textLabel?.font = .preferredFont(forTextStyle: .body)
             cell.textLabel?.numberOfLines = 1
-            cell.detailTextLabel?.text = activeAccount.server.replacingOccurrences(of: "https://", with: "")
-            cell.detailTextLabel?.numberOfLines = 1
+            let host = activeAccount.server.replacingOccurrences(of: "https://", with: "")
+            cell.detailTextLabel?.text = "\(activeAccount.userDisplayName)\n\(host)"
+            cell.detailTextLabel?.font = .preferredFont(forTextStyle: .subheadline)
+            cell.detailTextLabel?.numberOfLines = 2
             cell.detailTextLabel?.lineBreakMode = .byTruncatingMiddle
             // Always reserve a 60pt avatar slot so text doesn’t jump when the photo loads.
             let avatarSize = CGSize(width: 60, height: 60)

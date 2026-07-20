@@ -16,7 +16,6 @@ enum ProfileSection: Int {
     case kProfileSectionTwitter
     case kProfileSectionSummary
     case kProfileSectionRemoveAccount
-    case kProfileSectionDeleteAccount
 }
 
 enum SummaryRow: Int {
@@ -54,6 +53,60 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
     /// `nil` = still checking; drives green / orange / red on the Switch server row.
     var serverStatus: SumbaServerConfiguration.ServerStatus?
 
+    private lazy var deleteAccountButton: UIButton = {
+        var configuration = UIButton.Configuration.filled()
+        configuration.title = NSLocalizedString("Delete account", comment: "")
+        configuration.cornerStyle = .large
+        configuration.baseBackgroundColor = .systemRed
+        configuration.baseForegroundColor = .white
+        configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
+            var attributes = attributes
+            attributes.font = .systemFont(ofSize: 17, weight: .semibold)
+            return attributes
+        }
+        let button = UIButton(configuration: configuration)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.addTarget(self, action: #selector(deleteAccountButtonTapped), for: .touchUpInside)
+        return button
+    }()
+
+    private lazy var deleteAccountFootnoteLabel: UILabel = {
+        let label = UILabel()
+        label.font = .preferredFont(forTextStyle: .footnote)
+        label.textColor = .secondaryLabel
+        label.numberOfLines = 0
+        label.textAlignment = .center
+        label.adjustsFontForContentSizeCategory = true
+        label.text = SumbaDeleteAccountCopy.accountScreenFootnote
+        return label
+    }()
+
+    private lazy var deleteAccountPrivacyButton: UIButton = {
+        var configuration = UIButton.Configuration.plain()
+        configuration.title = SumbaDeleteAccountCopy.privacyPolicyActionTitle
+        configuration.baseForegroundColor = .link
+        configuration.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0)
+        configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
+            var attributes = attributes
+            attributes.font = .preferredFont(forTextStyle: .footnote)
+            attributes.underlineStyle = .single
+            return attributes
+        }
+        let button = UIButton(configuration: configuration)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.addTarget(self, action: #selector(deleteAccountPrivacyTapped), for: .touchUpInside)
+        return button
+    }()
+
+    private lazy var deleteAccountFooterStack: UIStackView = {
+        let stack = UIStackView(arrangedSubviews: [deleteAccountButton, deleteAccountFootnoteLabel, deleteAccountPrivacyButton])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .vertical
+        stack.spacing = 10
+        stack.alignment = .fill
+        return stack
+    }()
+
     override func viewDidLoad() {
         super.viewDidLoad()
 
@@ -78,6 +131,8 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
         tableView.register(TextFieldTableViewCell.self, forCellReuseIdentifier: TextFieldTableViewCell.identifier)
         NotificationCenter.default.addObserver(self, selector: #selector(userProfileImageUpdated), name: NSNotification.Name.NCUserProfileImageUpdated, object: nil)
 
+        setupDeleteAccountFooter()
+
         if navigationController?.viewControllers.first == self {
             let barButtonItem = UIBarButtonItem(title: nil, style: .plain, target: nil, action: nil)
             barButtonItem.primaryAction = UIAction(title: NSLocalizedString("Close", comment: ""), handler: { [unowned self] _ in
@@ -101,6 +156,12 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
         labelFrame.origin.x = padding
         labelFrame.size.width = self.tableView.bounds.size.width - padding * 2
         headerView.nameLabel?.frame = labelFrame
+
+        let footerHeight = deleteAccountFooterStack.bounds.height + 24
+        if abs(tableView.contentInset.bottom - footerHeight) > 0.5 {
+            tableView.contentInset.bottom = footerHeight
+            tableView.verticalScrollIndicatorInsets.bottom = footerHeight
+        }
     }
 
     init(withAccount account: TalkAccount) {
@@ -145,8 +206,6 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
             return 40
         case ProfileSection.kProfileSectionSummary.rawValue:
             return 20
-        case ProfileSection.kProfileSectionDeleteAccount.rawValue:
-            return 24
         default:
             return 0
         }
@@ -230,12 +289,32 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
             let actionTitle = NSLocalizedString("Log out", comment: "")
             let actionImage = UIImage(systemName: "arrow.right.square")?.applyingSymbolConfiguration(iconConfiguration)
             return actionCellWith(identifier: "RemoveAccountCellIdentifier", text: actionTitle, textColor: .systemRed, image: actionImage, tintColor: .systemRed)
-        case ProfileSection.kProfileSectionDeleteAccount.rawValue:
-            return deleteAccountCell()
         default:
             break
         }
         return UITableViewCell()
+    }
+
+    private func setupDeleteAccountFooter() {
+        view.addSubview(deleteAccountFooterStack)
+
+        NSLayoutConstraint.activate([
+            deleteAccountFooterStack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            deleteAccountFooterStack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
+            deleteAccountFooterStack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
+            deleteAccountButton.heightAnchor.constraint(equalToConstant: 50)
+        ])
+
+        tableView.contentInset.bottom = 140
+        tableView.verticalScrollIndicatorInsets.bottom = 140
+    }
+
+    @objc private func deleteAccountButtonTapped() {
+        presentDeleteAccountFlow()
+    }
+
+    @objc private func deleteAccountPrivacyTapped() {
+        SumbaDeleteAccountCopy.openPrivacyPolicy(from: self, userId: account.userId)
     }
 
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
@@ -247,8 +326,6 @@ class UserProfileTableViewController: UITableViewController, DetailedOptionsSele
             } else {
                 self.showLogoutConfirmationDialog()
             }
-        } else if section == ProfileSection.kProfileSectionDeleteAccount.rawValue {
-            self.presentDeleteAccountFlow()
         } else if section == ProfileSection.kProfileSectionPhoneNumber.rawValue {
             self.presentSetPhoneNumberDialog()
         }
@@ -360,28 +437,6 @@ extension UserProfileTableViewController {
         actionCell.imageView?.tintColor = tintColor
 
         return actionCell
-    }
-
-    func deleteAccountCell() -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "DeleteAccountCellIdentifier")
-            ?? UITableViewCell(style: .subtitle, reuseIdentifier: "DeleteAccountCellIdentifier")
-        cell.textLabel?.text = NSLocalizedString("Delete account", comment: "")
-        cell.textLabel?.textColor = .systemRed
-        cell.textLabel?.numberOfLines = 1
-        cell.detailTextLabel?.text = String(
-            format: NSLocalizedString(
-                "Removes your profile; shared content stays as “%@”",
-                comment: "Delete account row subtitle; %@ is anonymized label prefix"
-            ),
-            SumbaChatClientConfig.anonymizedLabelPrefix
-        )
-        cell.detailTextLabel?.textColor = .secondaryLabel
-        cell.detailTextLabel?.numberOfLines = 2
-        let image = UIImage(systemName: "person.crop.circle.badge.minus")?.applyingSymbolConfiguration(iconConfiguration)
-        cell.imageView?.image = image?.withRenderingMode(.alwaysTemplate)
-        cell.imageView?.tintColor = .systemRed
-        cell.accessoryType = .disclosureIndicator
-        return cell
     }
 
     func switchServerCell() -> UITableViewCell {

@@ -12,10 +12,17 @@ import SDWebImage
     public static let shared = AvatarManager()
 
     private let avatarDefaultSize = CGRect(x: 0, y: 0, width: 32, height: 32)
+    private static let deletedUserSymbolName = "person.fill.questionmark"
+    private static let deletedUserAvatarRenderSize = CGSize(width: 128, height: 128)
 
     // MARK: - Conversation avatars
 
     public func getAvatar(for room: NCRoom, with style: UIUserInterfaceStyle, completionBlock: @escaping (_ image: UIImage?) -> Void) -> SDWebImageCombinedOperation? {
+        if isRetiredRoom(room) {
+            completionBlock(getDeletedUserAvatar(with: style))
+            return nil
+        }
+
         if NCDatabaseManager.sharedInstance().serverHasTalkCapability(.conversationAvatars, forAccountId: room.accountId) {
             // Server supports conversation avatars -> try to get the avatar using this API.
             // Share Extension often cannot start the request (missing keychain token) — fall back locally.
@@ -105,6 +112,10 @@ import SDWebImage
         } else {
             switch room.type {
             case .oneToOne:
+                if isRetiredDisplayName(room.displayName) {
+                    completionBlock(getDeletedUserAvatar(with: style))
+                    return nil
+                }
                 guard let account = room.account else {
                     completionBlock(self.localConversationPlaceholder(for: room, with: style))
                     return nil
@@ -115,7 +126,7 @@ import SDWebImage
                 // Request never started (e.g. Share Extension without keychain token).
                 completionBlock(self.localConversationPlaceholder(for: room, with: style))
             case .formerOneToOne:
-                completionBlock(UIImage(named: "user-avatar", in: nil, compatibleWith: traitCollection))
+                completionBlock(getDeletedUserAvatar(with: style))
             case .public:
                 completionBlock(UIImage(named: "public-avatar", in: nil, compatibleWith: traitCollection))
             case .group:
@@ -133,6 +144,10 @@ import SDWebImage
     }
 
     private func localConversationPlaceholder(for room: NCRoom, with style: UIUserInterfaceStyle) -> UIImage? {
+        if isRetiredRoom(room) {
+            return getDeletedUserAvatar(with: style)
+        }
+
         let name = room.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         if name.lowercased().contains("mika"), let mika = UIImage(named: "mika-avatar") {
             return mika
@@ -150,6 +165,11 @@ import SDWebImage
     // swiftlint:disable:next function_parameter_count
     @discardableResult
     public func getActorAvatar(forId actorId: String?, withType actorType: String?, withDisplayName actorDisplayName: String?, withRoomToken roomToken: String?, withStyle style: UIUserInterfaceStyle, usingAccount account: TalkAccount, completionBlock: @escaping (_ image: UIImage?) -> Void) -> SDWebImageCombinedOperation? {
+        if isDeletedActor(actorId: actorId, actorType: actorType, actorDisplayName: actorDisplayName) {
+            completionBlock(getDeletedUserAvatar(with: style))
+            return nil
+        }
+
         if let actorId {
             if actorType == "bots" {
                 return getBotsAvatar(forId: actorId, withStyle: style, completionBlock: completionBlock)
@@ -169,7 +189,7 @@ import SDWebImage
         } else if actorType == AttendeeType.circle.rawValue || actorType == AttendeeType.teams.rawValue {
             image = self.getTeamAvatar(with: style)
         } else if actorType == "deleted_users" {
-            image = self.getDeletedUserAvatar()
+            image = self.getDeletedUserAvatar(with: style)
         } else {
             image = NCUtils.getImage(withString: "?", withBackgroundColor: .systemGray3, withBounds: self.avatarDefaultSize, isCircular: true)
         }
@@ -202,8 +222,55 @@ import SDWebImage
         return NCUtils.getImage(withString: actorDisplayName, withBackgroundColor: .systemGray3, withBounds: self.avatarDefaultSize, isCircular: true)
     }
 
-    private func getDeletedUserAvatar() -> UIImage? {
-        return NCUtils.getImage(withString: "X", withBackgroundColor: .systemGray3, withBounds: self.avatarDefaultSize, isCircular: true)
+    private func getDeletedUserAvatar(with style: UIUserInterfaceStyle) -> UIImage? {
+        let traitCollection = UITraitCollection(userInterfaceStyle: style)
+        let renderSize = Self.deletedUserAvatarRenderSize
+        let symbolConfiguration = UIImage.SymbolConfiguration(pointSize: 44, weight: .medium)
+
+        guard let symbol = UIImage(systemName: Self.deletedUserSymbolName, compatibleWith: traitCollection)?
+            .withConfiguration(symbolConfiguration)
+            .withTintColor(.secondaryLabel, renderingMode: .alwaysOriginal) else {
+            return NCUtils.getImage(withString: "?", withBackgroundColor: .systemGray3, withBounds: avatarDefaultSize, isCircular: true)
+        }
+
+        let renderer = UIGraphicsImageRenderer(size: renderSize)
+        return renderer.image { _ in
+            let circleRect = CGRect(origin: .zero, size: renderSize)
+            UIColor.systemGray3.setFill()
+            UIBezierPath(ovalIn: circleRect).fill()
+
+            let symbolRect = CGRect(
+                x: (renderSize.width - symbol.size.width) / 2,
+                y: (renderSize.height - symbol.size.height) / 2,
+                width: symbol.size.width,
+                height: symbol.size.height
+            )
+            symbol.draw(in: symbolRect)
+        }
+    }
+
+    private func isRetiredDisplayName(_ displayName: String?) -> Bool {
+        guard let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return false
+        }
+        return trimmed.hasPrefix(SumbaChatClientConfig.anonymizedLabelPrefix)
+    }
+
+    private func isDeletedActor(actorId: String?, actorType: String?, actorDisplayName: String?) -> Bool {
+        if actorType == "deleted_users" || actorId == "deleted_users" {
+            return true
+        }
+        return isRetiredDisplayName(actorDisplayName)
+    }
+
+    private func isRetiredRoom(_ room: NCRoom) -> Bool {
+        if room.type == .formerOneToOne {
+            return true
+        }
+        if room.type == .oneToOne {
+            return isRetiredDisplayName(room.displayName)
+        }
+        return false
     }
 
     private func getUserAvatar(forId actorId: String, withStyle style: UIUserInterfaceStyle, usingAccount account: TalkAccount, completionBlock: @escaping (_ image: UIImage?) -> Void) -> SDWebImageCombinedOperation? {

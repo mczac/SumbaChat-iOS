@@ -51,7 +51,6 @@ extension UserProfileTableViewController {
             sections.append(ProfileSection.kProfileSectionSummary.rawValue)
         }
         sections.append(ProfileSection.kProfileSectionRemoveAccount.rawValue)
-        sections.append(ProfileSection.kProfileSectionDeleteAccount.rawValue)
         return sections
     }
 
